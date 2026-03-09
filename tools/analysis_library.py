@@ -1,0 +1,2757 @@
+"""
+Analysis Library — pre-built, tested algorithms.
+Called by Coder Agent instead of generating from scratch.
+Every function returns a standardized result envelope.
+"""
+import pandas as pd
+import numpy as np
+import os
+from collections import Counter, defaultdict
+from typing import Optional, List
+from datetime import datetime
+from a2a_messages import AnalysisResult
+import warnings
+warnings.filterwarnings('ignore')
+
+DEFAULT_SESSION_MARKERS = {
+    "Session Started", "Journey Started", "App Installed", 
+    "User Login", "app_start", "login", "landing_page_view"
+}
+
+
+
+LIBRARY_REGISTRY = {
+    "distribution_analysis": {
+        "function":      "run_distribution_analysis",
+        "required_args": ["csv_path", "col"],
+        "col_role":      "any_numeric",
+        "description":   "Full distribution: histogram, box plot, normality, outliers.",
+    },
+    "categorical_analysis": {
+        "function":      "run_categorical_analysis",
+        "required_args": ["csv_path", "col"],
+        "col_role":      "any_categorical",
+        "description":   "Frequency table, Pareto, entropy.",
+    },
+    "correlation_matrix": {
+        "function":      "run_correlation_matrix",
+        "required_args": ["csv_path"],
+        "col_role":      None,
+        "description":   "Pearson + Spearman correlations across all numeric columns.",
+    },
+    "anomaly_detection": {
+        "function":      "run_anomaly_detection",
+        "required_args": ["csv_path", "col"],
+        "col_role":      "any_numeric",
+        "description":   "IQR + Z-score + Isolation Forest outliers.",
+    },
+    "missing_data_analysis": {
+        "function":      "run_missing_data_analysis",
+        "required_args": ["csv_path"],
+        "col_role":      None,
+        "description":   "Missingness patterns.",
+    },
+    "trend_analysis": {
+        "function":      "run_trend_analysis",
+        "required_args": ["csv_path", "time_col", "value_col"],
+        "col_role":      "time_and_value",
+        "description":   "Rolling averages, Mann-Kendall, changepoints.",
+    },
+    "time_series_decomposition": {
+        "function":      "run_time_series_decomposition",
+        "required_args": ["csv_path", "time_col", "value_col"],
+        "col_role":      "time_and_value",
+        "description":   "STL decomposition.",
+    },
+    "cohort_analysis": {
+        "function":      "run_cohort_analysis",
+        "required_args": ["csv_path", "entity_col", "time_col", "value_col"],
+        "col_role":      "entity_time_value",
+        "description":   "Cohort retention tracking.",
+    },
+    "session_detection": {
+        "function":      "run_session_detection",
+        "required_args": ["csv_path", "entity_col", "time_col"],
+        "col_role":      "entity_and_time",
+        "description":   "Session boundary detection. MUST run before all behavioral analyses.",
+    },
+    "funnel_analysis": {
+        "function":      "run_funnel_analysis",
+        "required_args": ["csv_path", "entity_col", "event_col", "time_col"],
+        "col_role":      "behavioral",
+        "description":   "Conversion rates per funnel step.",
+    },
+    "friction_detection": {
+        "function":      "run_friction_detection",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "High-repetition friction events.",
+    },
+    "survival_analysis": {
+        "function":      "run_survival_analysis",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "Kaplan-Meier session survival.",
+    },
+    "user_segmentation": {
+        "function":      "run_user_segmentation",
+        "required_args": ["csv_path", "entity_col", "event_col", "time_col"],
+        "col_role":      "behavioral",
+        "description":   "DBSCAN behavioral clustering.",
+    },
+    "sequential_pattern_mining": {
+        "function":      "run_sequential_pattern_mining",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "PrefixSpan frequent sequences.",
+    },
+    "association_rules": {
+        "function":      "run_association_rules",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "IF-THEN intervention rules.",
+    },
+    "pareto_analysis": {
+        "function":      "run_pareto_analysis",
+        "required_args": ["csv_path", "category_col", "value_col"],
+        "col_role":      "category_and_value",
+        "description":   "80/20 category contribution.",
+    },
+    "rfm_analysis": {
+        "function":      "run_rfm_analysis",
+        "required_args": ["csv_path", "entity_col", "time_col", "value_col"],
+        "col_role":      "entity_time_value",
+        "description":   "RFM segmentation.",
+    },
+    "transition_analysis": {
+        "function":      "run_transition_analysis",
+        "required_args": ["csv_path", "entity_col", "event_col", "time_col"],
+        "col_role":      "behavioral",
+        "description":   "Markov transition matrix: P(next|current), exit probabilities, dead-end events, loops.",
+    },
+    "dropout_analysis": {
+        "function":      "run_dropout_analysis",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "Last N events before session end. Common dropout sequences, early exit rates.",
+    },
+    "user_journey_analysis": {
+        "function":      "run_user_journey_analysis",
+        "required_args": ["csv_path", "entity_col", "event_col"],
+        "col_role":      "behavioral",
+        "description":   "Per-user journey progression and entry/exit patterns.",
+    },
+    "event_taxonomy": {
+        "function":      "run_event_taxonomy",
+        "required_args": ["csv_path", "event_col"],
+        "col_role":      "any_categorical",
+        "description":   "Auto-classify events into functional categories using domain-agnostic keyword matching.",
+    },
+}
+
+
+def _make_result(analysis_type: str, data: dict, 
+                  top_finding: str, severity: str,
+                  confidence: float, 
+                  chart_ready_data: dict,
+                  enables: list = None) -> dict:
+    """
+    Standard result envelope. Every library function 
+    returns this exact structure.
+    Severity: critical | high | medium | low | info
+    Confidence: 0.0 to 1.0
+    """
+    return {
+        "analysis_type": analysis_type,
+        "status": "success",
+        "data": data,
+        "top_finding": top_finding,
+        "severity": severity,
+        "confidence": confidence,
+        "chart_ready_data": chart_ready_data,
+        "enables": enables or [],
+        "insight_summary": {
+            "key_finding": top_finding,
+            "top_values": "",
+            "anomalies": "",
+            "recommendation": ""
+        }
+    }
+
+
+def run_distribution_analysis(csv_path: str, col: str) -> dict:
+    """
+    Full distribution analysis on any numeric column.
+    Histogram data, box plot stats, normality test,
+    outlier detection (IQR + Z-score).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    if col not in df.columns:
+        return {"status": "error", 
+                "error": f"Column '{col}' not found"}
+    
+    data = df[col].dropna()
+    if len(data) == 0:
+        return {"status": "insufficient_data",
+                "error": f"Column '{col}' has no non-null values"}
+    
+    stats = {
+        "count": len(data),
+        "mean": round(float(data.mean()), 4),
+        "median": round(float(data.median()), 4),
+        "std": round(float(data.std()), 4),
+        "min": float(data.min()),
+        "max": float(data.max()),
+        "q25": round(float(data.quantile(0.25)), 4),
+        "q75": round(float(data.quantile(0.75)), 4),
+        "skewness": round(float(data.skew()), 4),
+        "kurtosis": round(float(data.kurtosis()), 4),
+    }
+    
+    iqr = stats["q75"] - stats["q25"]
+    lower = stats["q25"] - 1.5 * iqr
+    upper = stats["q75"] + 1.5 * iqr
+    outliers = data[(data < lower) | (data > upper)]
+    outlier_pct = round(len(outliers) / len(data) * 100, 2)
+    
+    stats["outlier_count"] = len(outliers)
+    stats["outlier_pct"] = outlier_pct
+    stats["outlier_lower_bound"] = round(lower, 4)
+    stats["outlier_upper_bound"] = round(upper, 4)
+    
+    z_scores = np.abs((data - data.mean()) / data.std())
+    z_outliers = data[z_scores > 3]
+    stats["z_outlier_count"] = len(z_outliers)
+    
+    try:
+        from scipy import stats as scipy_stats
+        sample = data.sample(min(500, len(data)), 
+                              random_state=42)
+        stat, p_value = scipy_stats.shapiro(sample)
+        stats["normality_p_value"] = round(float(p_value), 6)
+        stats["is_normal"] = p_value > 0.05
+    except Exception:
+        stats["normality_p_value"] = None
+        stats["is_normal"] = None
+    
+    hist, bin_edges = np.histogram(data, bins=30)
+    
+    severity = "high" if outlier_pct > 10 else \
+               "medium" if outlier_pct > 5 else "low"
+    
+    top_finding = (
+        f"{col}: mean={stats['mean']}, "
+        f"median={stats['median']}, "
+        f"std={stats['std']}. "
+        f"{outlier_pct}% outliers detected "
+        f"({'not ' if stats.get('is_normal') else ''}normally distributed)."
+    )
+    
+    return _make_result(
+        analysis_type="distribution",
+        data=stats,
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.95,
+        chart_ready_data={
+            "type": "histogram_box",
+            "col": col,
+            "hist_values": hist.tolist(),
+            "bin_edges": [round(e, 4) for e in bin_edges.tolist()],
+            "box_stats": {
+                "min": stats["min"],
+                "q25": stats["q25"],
+                "median": stats["median"],
+                "q75": stats["q75"],
+                "max": stats["max"],
+                "outliers": outliers.head(50).tolist()
+            }
+        }
+    )
+
+
+def run_categorical_analysis(csv_path: str, col: str) -> dict:
+    """
+    Frequency table, Pareto analysis, entropy score.
+    Works on any categorical column.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    if col not in df.columns:
+        return {"status": "error", 
+                "error": f"Column '{col}' not found"}
+    
+    counts = df[col].value_counts()
+    total = len(df[col].dropna())
+    
+    if total == 0:
+        return {"status": "insufficient_data",
+                "error": "No non-null values"}
+    
+    top_20_pct_count = max(1, int(len(counts) * 0.20))
+    top_20_volume = counts.head(top_20_pct_count).sum()
+    pareto_ratio = round(top_20_volume / total * 100, 1)
+    
+    probs = counts / total
+    entropy = round(float(-np.sum(probs * np.log2(probs + 1e-10))), 4)
+    max_entropy = round(np.log2(len(counts)), 4)
+    entropy_ratio = round(entropy / max_entropy, 4) \
+                    if max_entropy > 0 else 0
+    
+    top_10 = {str(k): int(v) for k, v in counts.head(10).items()}
+    
+    top_finding = (
+        f"{col}: {len(counts)} unique values. "
+        f"Top 20% of categories account for {pareto_ratio}% of records. "
+        f"Distribution entropy: {entropy_ratio:.0%} "
+        f"({'evenly spread' if entropy_ratio > 0.8 else 'highly concentrated'})."
+    )
+    
+    return _make_result(
+        analysis_type="categorical",
+        data={
+            "unique_count": int(len(counts)),
+            "top_10": top_10,
+            "pareto_ratio": pareto_ratio,
+            "entropy": entropy,
+            "entropy_ratio": entropy_ratio,
+            "null_count": int(df[col].isna().sum()),
+        },
+        top_finding=top_finding,
+        severity="info",
+        confidence=0.99,
+        chart_ready_data={
+            "type": "frequency_bar",
+            "col": col,
+            "labels": list(top_10.keys()),
+            "values": list(top_10.values()),
+        }
+    )
+
+
+def run_correlation_matrix(csv_path: str, 
+                             cols: list = None) -> dict:
+    """
+    Pearson + Spearman correlation matrix.
+    Auto-selects columns if none specified.
+    Flags high correlations (>0.7) and negative correlations (<-0.5).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    if cols:
+        numeric_df = df[cols].select_dtypes(include=[np.number])
+    else:
+        numeric_df = df.select_dtypes(include=[np.number])
+    
+    if numeric_df.shape[1] < 2:
+        return {"status": "insufficient_data",
+                "error": "Need at least 2 numeric columns"}
+    
+    pearson = numeric_df.corr(method='pearson')
+    
+    notable = []
+    cols_list = list(pearson.columns)
+    for i in range(len(cols_list)):
+        for j in range(i+1, len(cols_list)):
+            val = pearson.iloc[i, j]
+            if abs(val) > 0.4:
+                notable.append({
+                    "col1": cols_list[i],
+                    "col2": cols_list[j],
+                    "pearson": round(float(val), 4),
+                    "strength": "strong" if abs(val) > 0.7 
+                                else "moderate",
+                    "direction": "positive" if val > 0 
+                                  else "negative"
+                })
+    
+    notable.sort(key=lambda x: abs(x["pearson"]), reverse=True)
+    
+    top_finding = (
+        f"Correlation analysis on {len(cols_list)} numeric columns. "
+        f"{len(notable)} notable correlations found "
+        f"(|r| > 0.4). "
+        + (f"Strongest: {notable[0]['col1']} ↔ "
+           f"{notable[0]['col2']} "
+           f"(r={notable[0]['pearson']})" 
+           if notable else "No strong correlations detected.")
+    )
+    
+    return _make_result(
+        analysis_type="correlation",
+        data={
+            "columns": cols_list,
+            "pearson_matrix": {
+                col: {c: round(float(v), 4) 
+                      for c, v in pearson[col].items()}
+                for col in pearson.columns
+            },
+            "notable_correlations": notable[:10],
+        },
+        top_finding=top_finding,
+        severity="medium" if notable else "low",
+        confidence=0.95,
+        chart_ready_data={
+            "type": "correlation_heatmap",
+            "columns": cols_list,
+            "matrix": [[round(float(pearson.iloc[i,j]), 4) 
+                        for j in range(len(cols_list))]
+                       for i in range(len(cols_list))],
+        }
+    )
+
+
+def run_anomaly_detection(csv_path: str, col: str) -> dict:
+    """
+    IQR + Z-score + Isolation Forest anomaly detection.
+    Returns anomaly indices, severity scores, and boundaries.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    if col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{col}' not found"}
+    
+    data = df[col].dropna()
+    if len(data) == 0:
+        return {"status": "insufficient_data"}
+    
+    q1 = float(data.quantile(0.25))
+    q3 = float(data.quantile(0.75))
+    iqr = q3 - q1
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    iqr_outliers = data[(data < lower) | (data > upper)]
+    
+    z_scores = np.abs((data - data.mean()) / (data.std() + 1e-10))
+    z_outliers = data[z_scores > 3]
+    
+    iso_outlier_indices = []
+    try:
+        from sklearn.ensemble import IsolationForest
+        iso = IsolationForest(contamination=0.05, 
+                               random_state=42)
+        preds = iso.fit_predict(data.values.reshape(-1, 1))
+        iso_outlier_indices = data.index[preds == -1].tolist()
+    except Exception:
+        pass
+    
+    iqr_set = set(iqr_outliers.index.tolist())
+    z_set = set(z_outliers.index.tolist())
+    iso_set = set(iso_outlier_indices)
+    
+    consensus = list(iqr_set & (z_set | iso_set))
+    
+    outlier_pct = round(len(consensus) / len(data) * 100, 2) \
+                  if len(data) > 0 else 0
+    
+    severity = "critical" if outlier_pct > 15 else \
+               "high" if outlier_pct > 8 else \
+               "medium" if outlier_pct > 3 else "low"
+    
+    top_finding = (
+        f"Anomaly detection on '{col}': "
+        f"{len(consensus)} consensus outliers "
+        f"({outlier_pct}% of data). "
+        f"Boundaries: [{round(lower,2)}, {round(upper,2)}]. "
+        f"Method agreement: IQR={len(iqr_set)}, "
+        f"Z-score={len(z_set)}, "
+        f"IsoForest={len(iso_set)}."
+    )
+    
+    return _make_result(
+        analysis_type="anomaly_detection",
+        data={
+            "col": col,
+            "total_points": len(data),
+            "iqr_outliers": len(iqr_set),
+            "z_outliers": len(z_set),
+            "iso_outliers": len(iso_set),
+            "consensus_outliers": len(consensus),
+            "outlier_pct": outlier_pct,
+            "lower_bound": round(lower, 4),
+            "upper_bound": round(upper, 4),
+            "top_outlier_values": sorted(
+                [float(data[i]) for i in consensus[:20]],
+                reverse=True
+            ) if consensus else [],
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.88,
+        chart_ready_data={
+            "type": "anomaly_scatter",
+            "col": col,
+            "all_values": data.tolist()[:2000],
+            "outlier_indices": consensus[:100],
+            "lower_bound": round(lower, 4),
+            "upper_bound": round(upper, 4),
+        }
+    )
+
+
+def run_missing_data_analysis(csv_path: str) -> dict:
+    """
+    Analyzes patterns of missingness across all columns.
+    Detects systematic vs random missing data.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    missing_stats = []
+    for col in df.columns:
+        null_count = int(df[col].isna().sum())
+        if null_count > 0:
+            missing_stats.append({
+                "column": col,
+                "null_count": null_count,
+                "null_pct": round(null_count / len(df) * 100, 2),
+                "severity": "critical" if null_count/len(df) > 0.3
+                            else "high" if null_count/len(df) > 0.1
+                            else "medium"
+            })
+    
+    missing_stats.sort(key=lambda x: x["null_pct"], reverse=True)
+    total_cells = df.shape[0] * df.shape[1]
+    total_missing = int(df.isna().sum().sum())
+    overall_pct = round(total_missing / total_cells * 100, 2)
+    
+    top_finding = (
+        f"Missing data: {overall_pct}% of all cells are null "
+        f"({total_missing:,} cells). "
+        f"{len(missing_stats)} columns have missing values. "
+        + (f"Most affected: '{missing_stats[0]['column']}' "
+           f"({missing_stats[0]['null_pct']}% missing)"
+           if missing_stats else "No missing data detected.")
+    )
+    
+    severity = "critical" if overall_pct > 20 else \
+               "high" if overall_pct > 10 else \
+               "medium" if overall_pct > 2 else "low"
+    
+    return _make_result(
+        analysis_type="missing_data",
+        data={
+            "total_cells": total_cells,
+            "total_missing": total_missing,
+            "overall_pct": overall_pct,
+            "columns_with_missing": missing_stats,
+            "complete_rows": int(df.dropna().shape[0]),
+            "complete_rows_pct": round(
+                df.dropna().shape[0] / len(df) * 100, 2
+            ),
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=1.0,
+        chart_ready_data={
+            "type": "missing_bar",
+            "columns": [s["column"] for s in missing_stats[:15]],
+            "null_pcts": [s["null_pct"] for s in missing_stats[:15]],
+        }
+    )
+
+
+def run_trend_analysis(
+    csv_path: str,
+    time_col: str,
+    value_col: str,
+) -> dict:
+    """
+    Time series trend analysis.
+    Rolling averages (7/30 period), trend direction,
+    Mann-Kendall trend test, changepoint detection.
+    Works on any datetime + numeric column pair.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if time_col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{time_col}' not found"}
+    if value_col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{value_col}' not found"}
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col, value_col])
+    df = df.sort_values(time_col)
+
+    if len(df) < 3:
+        return {"status": "insufficient_data",
+                "error": "Need at least 3 data points"}
+
+    values = df[value_col].astype(float)
+    times  = df[time_col]
+
+    w7  = min(7,  len(df))
+    w30 = min(30, len(df))
+    roll7  = values.rolling(window=w7,  min_periods=1).mean()
+    roll30 = values.rolling(window=w30, min_periods=1).mean()
+
+    x = np.arange(len(values))
+    try:
+        slope, intercept = np.polyfit(x, values, 1)
+        trend_direction = (
+            "upward"   if slope > 0 else
+            "downward" if slope < 0 else
+            "flat"
+        )
+        trend_strength = abs(slope)
+    except Exception:
+        slope = 0.0
+        trend_direction = "flat"
+        trend_strength  = 0.0
+
+    mk_result = None
+    try:
+        from scipy import stats as scipy_stats
+        tau, p_value = scipy_stats.kendalltau(x, values)
+        mk_result = {
+            "tau":         round(float(tau), 4),
+            "p_value":     round(float(p_value), 6),
+            "significant": p_value < 0.05,
+        }
+    except Exception:
+        pass
+
+    changepoints = []
+    if len(values) >= 10:
+        window = max(5, len(values) // 10)
+        for i in range(window, len(values) - window):
+            left  = values.iloc[i - window:i]
+            right = values.iloc[i:i + window]
+            if abs(right.mean() - left.mean()) > values.std():
+                changepoints.append({
+                    "index": int(i),
+                    "time":  str(times.iloc[i]),
+                    "shift": round(
+                        float(right.mean() - left.mean()), 4
+                    ),
+                })
+
+    first_val = float(values.iloc[0])
+    last_val  = float(values.iloc[-1])
+    pct_change = round(
+        (last_val - first_val) / (abs(first_val) + 1e-10) * 100,
+        2
+    )
+
+    top_finding = (
+        f"'{value_col}' shows a {trend_direction} trend "
+        f"over {len(df)} data points. "
+        f"Overall change: {pct_change:+.1f}%. "
+        f"{len(changepoints)} changepoint(s) detected. "
+        + (
+            f"Trend is statistically significant "
+            f"(p={mk_result['p_value']:.4f})."
+            if mk_result and mk_result["significant"]
+            else "Trend is not statistically significant."
+        )
+    )
+
+    severity = (
+        "high"   if abs(pct_change) > 50 else
+        "medium" if abs(pct_change) > 20 else
+        "low"
+    )
+
+    return _make_result(
+        analysis_type="trend_analysis",
+        data={
+            "value_col":      value_col,
+            "time_col":       time_col,
+            "data_points":    len(df),
+            "trend_direction": trend_direction,
+            "trend_strength": round(float(trend_strength), 6),
+            "pct_change":     pct_change,
+            "first_value":    round(first_val, 4),
+            "last_value":     round(last_val, 4),
+            "mean":           round(float(values.mean()), 4),
+            "std":            round(float(values.std()), 4),
+            "mann_kendall":   mk_result,
+            "changepoints":   changepoints[:5],
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.88,
+        chart_ready_data={
+            "type":       "trend_line",
+            "time_col":   time_col,
+            "value_col":  value_col,
+            "times":      [str(t) for t in times.tolist()],
+            "values":     values.tolist(),
+            "roll7":      roll7.tolist(),
+            "roll30":     roll30.tolist(),
+            "changepoints": changepoints[:5],
+        },
+        enables=["anomaly_detection"],
+    )
+
+
+def run_time_series_decomposition(
+    csv_path: str,
+    time_col: str,
+    value_col: str,
+) -> dict:
+    """
+    STL decomposition: trend + seasonality + residual.
+    Auto-detects period (daily=7, monthly=12).
+    Flags: trend direction, seasonality strength,
+    anomalous residuals.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if time_col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{time_col}' not found"}
+    if value_col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{value_col}' not found"}
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[time_col, value_col])
+    df = df.sort_values(time_col)
+
+    if len(df) < 14:
+        return {"status": "insufficient_data",
+                "error": "Need at least 14 data points "
+                         "for decomposition"}
+
+    values = df[value_col].astype(float)
+
+    date_diffs = df[time_col].diff().dropna()
+    median_diff = date_diffs.median()
+    if median_diff.days <= 1:
+        period = 7
+    elif median_diff.days <= 7:
+        period = 4
+    else:
+        period = 12
+
+    period = min(period, len(df) // 2)
+
+    trend_component     = []
+    seasonal_component  = []
+    residual_component  = []
+    seasonality_strength = 0.0
+    decomp_success = False
+
+    try:
+        from statsmodels.tsa.seasonal import STL
+        stl    = STL(values, period=period, robust=True)
+        result = stl.fit()
+
+        trend_component    = result.trend.tolist()
+        seasonal_component = result.seasonal.tolist()
+        residual_component = result.resid.tolist()
+
+        var_residual  = float(np.var(result.resid))
+        var_detrended = float(
+            np.var(result.seasonal + result.resid)
+        )
+        seasonality_strength = round(
+            max(0, 1 - var_residual / (var_detrended + 1e-10)),
+            4
+        )
+        decomp_success = True
+
+    except Exception:
+        window = max(3, period)
+        trend_series = values.rolling(
+            window=window, center=True, min_periods=1
+        ).mean()
+        trend_component    = trend_series.tolist()
+        residual_component = (values - trend_series).tolist()
+        seasonal_component = [0.0] * len(values)
+
+    if residual_component:
+        resid_arr  = np.array(residual_component)
+        resid_std  = resid_arr.std()
+        anomalies  = int(np.sum(np.abs(resid_arr) > 2 * resid_std))
+    else:
+        anomalies = 0
+
+    top_finding = (
+        f"Decomposition of '{value_col}' with period={period}. "
+        f"Seasonality strength: {seasonality_strength:.0%}. "
+        f"{anomalies} anomalous residuals detected. "
+        + (
+            "STL decomposition used."
+            if decomp_success
+            else "Simple moving average fallback used."
+        )
+    )
+
+    return _make_result(
+        analysis_type="time_series_decomposition",
+        data={
+            "value_col":           value_col,
+            "time_col":            time_col,
+            "period":              period,
+            "data_points":         len(df),
+            "seasonality_strength": seasonality_strength,
+            "anomalous_residuals": anomalies,
+            "decomp_method": (
+                "STL" if decomp_success else "moving_average"
+            ),
+        },
+        top_finding=top_finding,
+        severity="medium" if seasonality_strength > 0.5
+                  else "low",
+        confidence=0.82 if decomp_success else 0.65,
+        chart_ready_data={
+            "type":       "decomposition",
+            "times":      [
+                str(t) for t in df[time_col].tolist()
+            ],
+            "original":   values.tolist(),
+            "trend":      trend_component,
+            "seasonal":   seasonal_component,
+            "residual":   residual_component,
+        },
+    )
+
+
+def run_cohort_analysis(
+    csv_path: str,
+    entity_col: str,
+    time_col: str,
+    value_col: str,
+) -> dict:
+    """
+    Cohort analysis: groups entities by first appearance
+    period and tracks retention/value over time.
+    Works for any entity + datetime + value structure.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    for col in [entity_col, time_col, value_col]:
+        if col not in df.columns:
+            return {"status": "error",
+                    "error": f"Column '{col}' not found"}
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+    df = df.dropna(subset=[entity_col, time_col])
+    df["_period"] = df[time_col].dt.to_period("M")
+
+    first_period = (
+        df.groupby(entity_col)["_period"]
+          .min()
+          .rename("cohort")
+    )
+    df = df.join(first_period, on=entity_col)
+
+    df["_cohort_index"] = (
+        df["_period"] - df["cohort"]
+    ).apply(lambda x: x.n if hasattr(x, 'n') else 0)
+
+    cohort_data = (
+        df.groupby(["cohort", "_cohort_index"])[entity_col]
+          .nunique()
+          .reset_index()
+    )
+    cohort_data.columns = [
+        "cohort", "period_index", "entity_count"
+    ]
+
+    cohort_sizes = (
+        cohort_data[cohort_data["period_index"] == 0]
+        .set_index("cohort")["entity_count"]
+    )
+
+    cohort_data["retention_rate"] = cohort_data.apply(
+        lambda r: round(
+            r["entity_count"] /
+            cohort_sizes.get(r["cohort"], 1) * 100, 2
+        ),
+        axis=1,
+    )
+
+    p1 = cohort_data[cohort_data["period_index"] == 1]
+    avg_retention_p1 = round(
+        float(p1["retention_rate"].mean()), 2
+    ) if len(p1) > 0 else 0.0
+
+    cohort_count = int(cohort_sizes.shape[0])
+
+    top_finding = (
+        f"Cohort analysis across {cohort_count} cohorts. "
+        f"Average period-1 retention: {avg_retention_p1}%. "
+        f"Total entities tracked: "
+        f"{int(df[entity_col].nunique()):,}."
+    )
+
+    severity = (
+        "high"   if avg_retention_p1 < 30 else
+        "medium" if avg_retention_p1 < 60 else
+        "low"
+    )
+
+    cohort_records = []
+    for _, row in cohort_data.head(100).iterrows():
+        cohort_records.append({
+            "cohort":        str(row["cohort"]),
+            "period_index":  int(row["period_index"]),
+            "entity_count":  int(row["entity_count"]),
+            "retention_rate": float(row["retention_rate"]),
+        })
+
+    return _make_result(
+        analysis_type="cohort_analysis",
+        data={
+            "entity_col":         entity_col,
+            "time_col":           time_col,
+            "cohort_count":       cohort_count,
+            "avg_retention_p1":   avg_retention_p1,
+            "total_entities":     int(
+                df[entity_col].nunique()
+            ),
+            "cohort_data":        cohort_records,
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.87,
+        chart_ready_data={
+            "type":         "cohort_heatmap",
+            "cohort_data":  cohort_records,
+        },
+    )
+
+
+def run_session_detection(
+    csv_path: str,
+    entity_col: str,
+    time_col: str,
+    event_col: str = None,
+    marker_events: list = None,
+    gap_minutes: int = 30,
+) -> dict:
+    """
+    Detect session boundaries per entity.
+    Mode 1: marker_events provided → event-based detection.
+    Mode 2: no markers → 30-minute time-gap detection.
+
+    Returns enriched CSV path with session_id column added,
+    plus session statistics.
+
+    IMPORTANT: This must be called first (A1) for all
+    behavioral analyses. Its output (session_id column)
+    is required by funnel, friction, survival, segments.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    for col in [entity_col, time_col]:
+        if col not in df.columns:
+            return {"status": "error",
+                    "error": f"Column '{col}' not found"}
+
+    df[time_col] = pd.to_datetime(
+        df[time_col], errors="coerce"
+    )
+    df = df.dropna(subset=[time_col])
+    df = df.sort_values([entity_col, time_col])
+
+    df = df.sort_values([entity_col, time_col])
+
+    if not marker_events and event_col and event_col in df.columns:
+        found_defaults = [e for e in DEFAULT_SESSION_MARKERS if e in df[event_col].unique()]
+        if found_defaults:
+            marker_events = found_defaults
+            print(f"INFO: Auto-injected session markers: {marker_events}")
+
+    if marker_events and event_col and event_col in df.columns:
+        df['_is_marker'] = df[event_col].isin(marker_events)
+        df['_entity_changed'] = df[entity_col] != df[entity_col].shift(1)
+        df['_new_session'] = df['_is_marker'] | df['_entity_changed']
+        df['session_id'] = (
+            df[entity_col].astype(str) + '_s' +
+            df.groupby(entity_col)['_new_session'].cumsum().astype(str)
+        )
+        df = df.drop(columns=['_is_marker', '_entity_changed', '_new_session'])
+    else:
+        df['_prev_time'] = df.groupby(entity_col)[time_col].shift(1)
+        df['_prev_entity'] = df[entity_col].shift(1)
+        df['_time_diff'] = (
+            df[time_col] - df['_prev_time']
+        ).dt.total_seconds() / 60
+
+        df['_new_session'] = (
+            (df[entity_col] != df['_prev_entity']) |
+            (df['_time_diff'] > gap_minutes) |
+            (df['_time_diff'].isna())
+        )
+
+        df['session_id'] = (
+            df[entity_col].astype(str) + '_s' +
+            df.groupby(entity_col)['_new_session'].cumsum().astype(str)
+        )
+
+        df = df.drop(columns=[
+            '_prev_time', '_prev_entity',
+            '_time_diff', '_new_session'
+        ])
+
+    session_stats = (
+        df.groupby("session_id")
+          .agg(
+              entity=(entity_col, "first"),
+              event_count=(time_col, "count"),
+              start_time=(time_col, "min"),
+              end_time=(time_col, "max"),
+          )
+          .reset_index()
+    )
+    session_stats["duration_minutes"] = (
+        (session_stats["end_time"] -
+         session_stats["start_time"])
+        .dt.total_seconds() / 60
+    ).round(2)
+
+    total_sessions   = int(len(session_stats))
+    avg_events       = round(
+        float(session_stats["event_count"].mean()), 2
+    )
+    avg_duration     = round(
+        float(session_stats["duration_minutes"].mean()), 2
+    )
+    bounce_sessions  = int(
+        (session_stats["event_count"] == 1).sum()
+    )
+    bounce_rate      = round(
+        bounce_sessions / max(total_sessions, 1) * 100, 2
+    )
+
+    enriched_path = csv_path.replace(".csv", "_sessions.csv")
+    df.to_csv(enriched_path, index=False)
+
+    top_finding = (
+        f"Detected {total_sessions:,} sessions across {df[entity_col].nunique():,} unique IDs. "
+        f"The average visit lasts {avg_duration} minutes with {avg_events} interactions. "
+        f"Bounce rate is {bounce_rate}%."
+    )
+
+    severity = (
+        "high"   if bounce_rate > 40 else
+        "medium" if bounce_rate > 20 else
+        "low"
+    )
+
+    length_dist = {
+        "p25": round(float(
+            session_stats["event_count"].quantile(0.25)
+        ), 1),
+        "p50": round(float(
+            session_stats["event_count"].quantile(0.50)
+        ), 1),
+        "p75": round(float(
+            session_stats["event_count"].quantile(0.75)
+        ), 1),
+        "p90": round(float(
+            session_stats["event_count"].quantile(0.90)
+        ), 1),
+        "p95": round(float(
+            session_stats["event_count"].quantile(0.95)
+        ), 1),
+    }
+
+    return _make_result(
+        analysis_type="session_detection",
+        data={
+            "total_sessions":    total_sessions,
+            "total_entities":    int(
+                df[entity_col].nunique()
+            ),
+            "total_events":      len(df),
+            "avg_events_per_session":  avg_events,
+            "avg_duration_minutes":    avg_duration,
+            "bounce_rate":       bounce_rate,
+            "bounce_sessions":   bounce_sessions,
+            "detection_mode": (
+                "event_based"
+                if marker_events else "time_gap"
+            ),
+            "gap_minutes":       gap_minutes,
+            "session_length_distribution": length_dist,
+            "enriched_csv_path": enriched_path,
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.95,
+        chart_ready_data={
+            "type": "session_length_histogram",
+            "event_counts": session_stats[
+                "event_count"
+            ].tolist()[:500],
+            "duration_minutes": session_stats[
+                "duration_minutes"
+            ].tolist()[:500],
+        },
+        enables=[
+            "funnel_analysis",
+            "friction_detection",
+            "survival_analysis",
+            "sequential_pattern_mining",
+            "user_segmentation",
+            "association_rules",
+        ],
+    )
+
+
+def run_funnel_analysis(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    time_col: str,
+    session_col: str = "session_id",
+    funnel_steps: list = None,
+) -> dict:
+    """
+    Funnel analysis with conversion rates at each step.
+    If funnel_steps not provided, auto-detects stages
+    from event frequency + ordering patterns.
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' column not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    for col in [entity_col, event_col]:
+        if col not in df.columns:
+            return {"status": "error",
+                    "error": f"Column '{col}' not found"}
+
+    df[time_col] = pd.to_datetime(
+        df[time_col], errors="coerce"
+    )
+    df = df.sort_values([session_col, time_col])
+
+    if not funnel_steps:
+        event_counts = df[event_col].value_counts()
+        total_sessions = df[session_col].nunique()
+        common_events = [
+            e for e, c in event_counts.items()
+            if c / total_sessions > 0.05
+        ]
+        event_positions = (
+            df.groupby(event_col)
+              .apply(
+                  lambda x: x.groupby(session_col)
+                              .cumcount()
+                              .mean()
+              )
+        )
+        funnel_steps = (
+            event_positions.loc[event_positions.index.isin(common_events)]
+            .sort_values()
+            .head(8)
+            .index.tolist()
+        )
+
+    funnel_metrics = []
+    prev_count = None
+
+    for step in funnel_steps:
+        entities_at_step = df[
+            df[event_col] == step
+        ][entity_col].nunique()
+
+        conversion = None
+        if prev_count is not None and prev_count > 0:
+            conversion = round(
+                entities_at_step / prev_count * 100, 2
+            )
+
+        funnel_metrics.append({
+            "step":              step,
+            "entity_count":      entities_at_step,
+            "conversion_from_prev": conversion,
+        })
+        prev_count = entities_at_step
+
+    if funnel_metrics:
+        top_count = funnel_metrics[0]["entity_count"]
+        bot_count = funnel_metrics[-1]["entity_count"]
+        overall_conversion = round(
+            bot_count / max(top_count, 1) * 100, 2
+        )
+    else:
+        overall_conversion = 0.0
+
+    biggest_drop = None
+    biggest_drop_pct = 0.0
+    for m in funnel_metrics:
+        if m["conversion_from_prev"] is not None:
+            drop = 100 - m["conversion_from_prev"]
+            if drop > biggest_drop_pct:
+                biggest_drop_pct = drop
+                biggest_drop     = m["step"]
+
+    top_finding = (
+        f"Funnel analysis: {len(funnel_steps)} steps, "
+        f"overall conversion {overall_conversion}%. "
+        + (
+            f"Biggest drop-off at '{biggest_drop}' "
+            f"({biggest_drop_pct:.1f}% lost)."
+            if biggest_drop else ""
+        )
+        + (
+            " Steps auto-detected from event patterns."
+            if not funnel_steps else ""
+        )
+    )
+
+    severity = (
+        "critical" if overall_conversion < 20 else
+        "high"     if overall_conversion < 40 else
+        "medium"   if overall_conversion < 70 else
+        "low"
+    )
+
+    return _make_result(
+        analysis_type="funnel_analysis",
+        data={
+            "funnel_steps":        funnel_steps,
+            "funnel_metrics":      funnel_metrics,
+            "overall_conversion":  overall_conversion,
+            "biggest_drop_step":   biggest_drop,
+            "biggest_drop_pct":    round(biggest_drop_pct, 2),
+            "auto_detected":       not bool(funnel_steps),
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.88,
+        chart_ready_data={
+            "type":   "funnel_bar",
+            "steps":  funnel_steps,
+            "counts": [
+                m["entity_count"] for m in funnel_metrics
+            ],
+            "conversions": [
+                m["conversion_from_prev"]
+                for m in funnel_metrics
+            ],
+        },
+    )
+
+
+def run_friction_detection(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    session_col: str = "session_id",
+) -> dict:
+    """
+    Identify events with high repetition rates indicating
+    users are stuck.
+    Friction score = repetitions / total occurrences.
+    CRITICAL > 10%, HIGH > 5%, MEDIUM > 2%.
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' column not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    for col in [entity_col, event_col]:
+        if col not in df.columns:
+            return {"status": "error",
+                    "error": f"Column '{col}' not found"}
+
+    event_counts = (
+        df.groupby([session_col, event_col])
+          .size()
+          .reset_index(name="count")
+    )
+
+    event_counts["repetitions"] = (
+        event_counts["count"] - 1
+    ).clip(lower=0)
+
+    friction = (
+        event_counts.groupby(event_col)
+                    .agg(
+                        total_occurrences=("count", "sum"),
+                        total_repetitions=(
+                            "repetitions", "sum"
+                        ),
+                        sessions_affected=(
+                            session_col, "count"
+                        ),
+                    )
+                    .reset_index()
+    )
+
+    friction["repetition_rate"] = (
+        friction["total_repetitions"] /
+        friction["total_occurrences"].clip(lower=1)
+    ).round(4)
+
+    friction["severity"] = friction["repetition_rate"].apply(
+        lambda r:
+        "critical" if r > 0.10 else
+        "high"     if r > 0.05 else
+        "medium"   if r > 0.02 else
+        "low"
+    )
+
+    friction = friction.sort_values(
+        "repetition_rate", ascending=False
+    )
+
+    critical_count = int(
+        (friction["severity"] == "critical").sum()
+    )
+    high_count = int(
+        (friction["severity"] == "high").sum()
+    )
+
+    top_event = friction.iloc[0] if len(friction) > 0 else None
+
+    top_finding = (
+        f"Friction detection: {len(friction)} events analyzed. "
+        f"{critical_count} CRITICAL, {high_count} HIGH "
+        f"friction events. "
+        + (
+            f"Most friction: '{top_event[event_col]}' "
+            f"({top_event['repetition_rate']:.1%} "
+            f"repetition rate)."
+            if top_event is not None else ""
+        )
+    )
+
+    severity = (
+        "critical" if critical_count > 0 else
+        "high"     if high_count > 0     else
+        "medium"
+    )
+
+    friction_records = friction.head(20).to_dict("records")
+    for r in friction_records:
+        for k, v in r.items():
+            if hasattr(v, 'item'):
+                r[k] = v.item()
+
+    return _make_result(
+        analysis_type="friction_detection",
+        data={
+            "events_analyzed": len(friction),
+            "critical_events": critical_count,
+            "high_events":     high_count,
+            "top_friction_events": friction_records,
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.91,
+        chart_ready_data={
+            "type":   "friction_heatmap",
+            "events": [
+                str(r[event_col])
+                for r in friction_records
+            ],
+            "repetition_rates": [
+                float(r["repetition_rate"])
+                for r in friction_records
+            ],
+            "severities": [
+                r["severity"] for r in friction_records
+            ],
+        },
+    )
+
+
+def run_survival_analysis(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    session_col: str = "session_id",
+) -> dict:
+    """
+    Kaplan-Meier style session survival analysis.
+    Computes what % of sessions survive to each step.
+    Identifies safe (>80%), warning (50-80%),
+    and danger (<50%) zones.
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    session_lengths = (
+        df.groupby(session_col).size().values
+    )
+    total_sessions = len(session_lengths)
+
+    if total_sessions == 0:
+        return {"status": "insufficient_data",
+                "error": "No sessions found"}
+
+    max_steps = int(np.percentile(session_lengths, 95))
+    max_steps = min(max_steps, 50)
+
+    survival_curve  = []
+    dropout_rates   = []
+    prev_surviving  = total_sessions
+
+    for step in range(1, max_steps + 1):
+        surviving = int(np.sum(session_lengths >= step))
+        survival_pct = round(
+            surviving / total_sessions * 100, 2
+        )
+        dropout = round(
+            (prev_surviving - surviving) /
+            max(prev_surviving, 1) * 100, 2
+        )
+
+        zone = (
+            "safe"    if survival_pct >= 80 else
+            "warning" if survival_pct >= 50 else
+            "danger"
+        )
+
+        survival_curve.append({
+            "step":         step,
+            "surviving":    surviving,
+            "survival_pct": survival_pct,
+            "dropout_rate": dropout,
+            "zone":         zone,
+        })
+        dropout_rates.append(dropout)
+        prev_surviving = surviving
+
+    if survival_curve:
+        critical = max(
+            survival_curve, key=lambda x: x["dropout_rate"]
+        )
+    else:
+        critical = None
+
+    median_length = int(np.median(session_lengths))
+
+    reach_10 = int(np.sum(session_lengths >= 10))
+    reach_20 = int(np.sum(session_lengths >= 20))
+    pct_10   = round(reach_10 / total_sessions * 100, 1)
+    pct_20   = round(reach_20 / total_sessions * 100, 1)
+
+    top_finding = (
+        f"Session survival: {total_sessions:,} sessions. "
+        f"Median session length: {median_length} events. "
+        f"{pct_10}% reach step 10, "
+        f"{pct_20}% reach step 20. "
+        + (
+            f"Critical drop-off at step "
+            f"{critical['step']} "
+            f"({critical['dropout_rate']:.1f}% leave)."
+            if critical else ""
+        )
+    )
+
+    severity = (
+        "critical" if pct_10 < 30 else
+        "high"     if pct_10 < 50 else
+        "medium"   if pct_10 < 70 else
+        "low"
+    )
+
+    return _make_result(
+        analysis_type="survival_analysis",
+        data={
+            "total_sessions":   total_sessions,
+            "median_length":    median_length,
+            "pct_reach_step_10": pct_10,
+            "pct_reach_step_20": pct_20,
+            "critical_dropoff": critical,
+            "survival_curve":   survival_curve,
+            "max_steps_analyzed": max_steps,
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.93,
+        chart_ready_data={
+            "type":   "survival_curve",
+            "steps":  [s["step"] for s in survival_curve],
+            "survival_pcts": [
+                s["survival_pct"] for s in survival_curve
+            ],
+            "dropout_rates": [
+                s["dropout_rate"] for s in survival_curve
+            ],
+            "zones": [
+                s["zone"] for s in survival_curve
+            ],
+        },
+    )
+
+
+def run_user_segmentation(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    time_col: str = None,
+    session_col: str = "session_id",
+) -> dict:
+    """
+    DBSCAN clustering on behavioral features.
+    Features: total_events, event_diversity,
+    repetition_ratio, session_count, avg_session_length.
+    Produces segments with characteristics.
+    No hardcoded labels — inferred from cluster data.
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+
+    if len(df) > 300_000:
+        sample_frac = 300_000 / len(df)
+        df = df.groupby(entity_col, group_keys=False).apply(
+            lambda x: x.sample(frac=min(sample_frac, 1.0), random_state=42)
+        ).reset_index(drop=True)
+
+    agg_dict = {
+        "total_events": (event_col, "count"),
+        "event_diversity": (event_col, "nunique"),
+        "session_count": (session_col, "nunique")
+    }
+    if time_col and time_col in df.columns:
+        agg_dict["time_min"] = (time_col, "min")
+        agg_dict["time_max"] = (time_col, "max")
+        
+    agg_df = df.groupby(entity_col).agg(**agg_dict).reset_index()
+
+    agg_df["avg_sess_len"] = (
+        agg_df["total_events"] / agg_df["session_count"].clip(lower=1)
+    )
+
+    if time_col and time_col in df.columns:
+        agg_df["time_span"] = (
+            (agg_df["time_max"] - agg_df["time_min"])
+            .dt.total_seconds().fillna(0) / 86400
+        )
+    else:
+        agg_df["time_span"] = 0.0
+
+    rep_counts = (
+        df.groupby([entity_col, session_col, event_col])
+          .size()
+          .reset_index(name="cnt")
+    )
+    rep_counts["reps"] = (rep_counts["cnt"] - 1).clip(lower=0)
+    rep_per_entity = rep_counts.groupby(entity_col)["reps"].sum().reset_index()
+    agg_df = agg_df.merge(rep_per_entity, on=entity_col, how="left")
+    agg_df["reps"] = agg_df["reps"].fillna(0)
+    agg_df["repetition_ratio"] = (
+        agg_df["reps"] / agg_df["total_events"].clip(lower=1)
+    )
+
+    entity_ids = agg_df[entity_col].tolist()
+    feature_cols = [
+        "total_events", "event_diversity", "repetition_ratio",
+        "session_count", "avg_sess_len", "time_span",
+    ]
+    features = agg_df[feature_cols].values.tolist()
+
+    if len(features) < 5:
+        return {"status": "insufficient_data",
+                "error": "Need at least 5 entities"}
+
+    feature_matrix = np.array(features, dtype=float)
+
+    from sklearn.preprocessing import StandardScaler
+    scaler  = StandardScaler()
+    X_scaled = scaler.fit_transform(feature_matrix)
+
+    labels = np.full(len(features), -1)
+    try:
+        from sklearn.cluster import DBSCAN
+        from sklearn.neighbors import NearestNeighbors
+
+        min_samples = max(3, len(features) // 50)
+
+        k = min(min_samples, len(features) - 1)
+        nbrs = NearestNeighbors(n_neighbors=k).fit(X_scaled)
+        distances, _ = nbrs.kneighbors(X_scaled)
+        k_distances = np.sort(distances[:, -1])
+
+        if len(k_distances) >= 3:
+            d2 = np.diff(np.diff(k_distances))
+            elbow_idx = int(np.argmax(d2)) + 2
+            eps_val = float(k_distances[elbow_idx])
+            eps_val = max(0.3, min(eps_val, 2.5))
+        else:
+            eps_val = 0.8
+
+        print(f"DEBUG DBSCAN: auto-eps={eps_val:.3f} min_samples={min_samples}")
+        db = DBSCAN(eps=eps_val, min_samples=min_samples)
+        labels = db.fit_predict(X_scaled)
+
+        noise_ratio = (labels == -1).sum() / len(labels)
+        if noise_ratio > 0.5:
+            raise ValueError(f"Too much noise ({noise_ratio:.0%}) — use KMeans")
+
+    except Exception:
+        try:
+            from sklearn.cluster import KMeans
+            n_clusters = min(4, len(features) // 3)
+            km         = KMeans(
+                n_clusters=n_clusters,
+                random_state=42,
+                n_init=10,
+            )
+            labels = km.fit_predict(X_scaled)
+        except Exception:
+            labels = np.zeros(len(features), dtype=int)
+
+    feature_names = [
+        "total_events", "event_diversity",
+        "repetition_ratio", "session_count",
+        "avg_session_length", "time_span_days",
+    ]
+    segments_raw = defaultdict(list)
+    for i, label in enumerate(labels):
+        segments_raw[int(label)].append(i)
+
+    segments = []
+    for label, indices in sorted(segments_raw.items()):
+        seg_features = feature_matrix[indices]
+        means        = seg_features.mean(axis=0)
+
+        profile = {
+            f: round(float(means[j]), 3)
+            for j, f in enumerate(feature_names)
+        }
+
+        characteristics = []
+        if profile["repetition_ratio"] > 0.15:
+            characteristics.append("high friction")
+        if profile["avg_session_length"] < 3:
+            characteristics.append("quick sessions")
+        if profile["event_diversity"] > 10:
+            characteristics.append("broad exploration")
+        if profile["session_count"] > 5:
+            characteristics.append("highly engaged")
+        if label == -1:
+            characteristics.append("outliers")
+
+        segments.append({
+            "segment_id":    label,
+            "size":          len(indices),
+            "pct":           round(
+                len(indices) / len(features) * 100, 1
+            ),
+            "profile":       profile,
+            "characteristics": characteristics,
+            "is_noise":      label == -1,
+        })
+
+    segments.sort(key=lambda s: s["size"], reverse=True)
+
+    top_finding = (
+        f"User segmentation: {len(entity_ids):,} entities "
+        f"grouped into {len(segments)} segments. "
+        f"Largest segment: {segments[0]['size']} entities "
+        f"({segments[0]['pct']}%) — "
+        f"{', '.join(segments[0]['characteristics']) or 'mixed behavior'}."
+    )
+
+    return _make_result(
+        analysis_type="user_segmentation",
+        data={
+            "total_entities": len(entity_ids),
+            "segment_count":  len(segments),
+            "segments":       segments,
+            "feature_names":  feature_names,
+        },
+        top_finding=top_finding,
+        severity="medium",
+        confidence=0.82,
+        chart_ready_data={
+            "type":     "segment_donut",
+            "segments": segments,
+        },
+    )
+
+
+def run_sequential_pattern_mining(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    session_col: str = "session_id",
+    min_support: float = 0.03,
+) -> dict:
+    """
+    PrefixSpan-style frequent sequence mining.
+    Finds top behavioral pathways and repetition loops.
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    sequences = []
+    for _, grp in df.groupby(session_col):
+        seq = grp[event_col].tolist()
+        if len(seq) >= 2:
+            sequences.append(seq)
+
+    total_seqs = len(sequences)
+    if total_seqs == 0:
+        return {"status": "insufficient_data",
+                "error": "No sequences found"}
+
+    min_count = max(2, int(total_seqs * min_support))
+
+    bigram_counts  = Counter()
+    trigram_counts = Counter()
+
+    for seq in sequences:
+        for i in range(len(seq) - 1):
+            bigram_counts[(seq[i], seq[i+1])] += 1
+        for i in range(len(seq) - 2):
+            trigram_counts[(
+                seq[i], seq[i+1], seq[i+2]
+            )] += 1
+
+    frequent_bigrams = [
+        {
+            "sequence":  list(k),
+            "count":     v,
+            "support":   round(v / total_seqs, 4),
+            "length":    2,
+        }
+        for k, v in bigram_counts.most_common(20)
+        if v >= min_count
+    ]
+
+    frequent_trigrams = [
+        {
+            "sequence":  list(k),
+            "count":     v,
+            "support":   round(v / total_seqs, 4),
+            "length":    3,
+        }
+        for k, v in trigram_counts.most_common(10)
+        if v >= min_count
+    ]
+
+    all_patterns = sorted(
+        frequent_bigrams + frequent_trigrams,
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:30]
+
+    loops = [
+        p for p in frequent_bigrams
+        if p["sequence"][0] == p["sequence"][1]
+    ]
+
+    top_finding = (
+        f"Sequential mining: {total_seqs:,} sessions, "
+        f"{len(all_patterns)} frequent patterns found "
+        f"(min support {min_support:.0%}). "
+        f"{len(loops)} repetition loops detected. "
+        + (
+            f"Most common: "
+            f"{' → '.join(all_patterns[0]['sequence'])} "
+            f"({all_patterns[0]['support']:.0%} sessions)."
+            if all_patterns else ""
+        )
+    )
+
+    return _make_result(
+        analysis_type="sequential_pattern_mining",
+        data={
+            "total_sequences":   total_seqs,
+            "patterns_found":    len(all_patterns),
+            "repetition_loops":  len(loops),
+            "top_patterns":      all_patterns,
+            "loop_patterns":     loops[:5],
+            "min_support_used":  min_support,
+        },
+        top_finding=top_finding,
+        severity="medium" if loops else "low",
+        confidence=0.87,
+        chart_ready_data={
+            "type":     "sequence_bar",
+            "patterns": [
+                " → ".join(p["sequence"])
+                for p in all_patterns[:15]
+            ],
+            "counts": [
+                p["count"] for p in all_patterns[:15]
+            ],
+            "supports": [
+                p["support"] for p in all_patterns[:15]
+            ],
+        },
+    )
+
+
+def run_association_rules(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    session_col: str = "session_id",
+    outcome_events: list = None,
+    min_confidence: float = 0.70,
+) -> dict:
+    """
+    Association rule mining for intervention triggers.
+    IF [event pattern] THEN [outcome] rules.
+    If outcome_events not provided, auto-detects
+    success events from data (low-frequency, late-session).
+    Requires session_id column (from run_session_detection).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if session_col not in df.columns:
+        enriched = csv_path.replace(".csv", "_sessions.csv")
+        if os.path.exists(enriched):
+            df = pd.read_csv(enriched, low_memory=False)
+        else:
+            return {
+                "status": "error",
+                "error": (
+                    f"'{session_col}' not found. "
+                    f"Run session_detection first."
+                ),
+            }
+
+    total_sessions = df[session_col].nunique()
+
+    if not outcome_events:
+        event_session_counts = (
+            df.groupby(event_col)[session_col]
+              .nunique()
+        )
+        event_pcts = event_session_counts / total_sessions
+
+        outcome_events = event_pcts[
+            (event_pcts > 0.05) & (event_pcts < 0.40)
+        ].index.tolist()[:3]
+
+    if not outcome_events:
+        return {
+            "status": "insufficient_data",
+            "error": "Could not identify outcome events",
+        }
+
+    session_events = (
+        df.groupby(session_col)[event_col]
+          .apply(set)
+          .to_dict()
+    )
+
+    rules = []
+    all_events = df[event_col].unique().tolist()
+
+    for outcome in outcome_events:
+        sessions_with = {
+            s for s, evts in session_events.items()
+            if outcome in evts
+        }
+        sessions_without = {
+            s for s, evts in session_events.items()
+            if outcome not in evts
+        }
+
+        for event in all_events:
+            if event == outcome:
+                continue
+
+            sessions_with_antecedent = {
+                s for s, evts in session_events.items()
+                if event in evts
+            }
+
+            if not sessions_with_antecedent:
+                continue
+
+            support = len(sessions_with_antecedent) / \
+                      max(total_sessions, 1)
+            confidence = len(
+                sessions_with & sessions_with_antecedent
+            ) / max(len(sessions_with_antecedent), 1)
+
+            if (confidence >= min_confidence and
+                    support >= 0.05):
+                lift = confidence / max(
+                    len(sessions_with) / total_sessions,
+                    1e-10
+                )
+                rules.append({
+                    "antecedent":  event,
+                    "consequent":  outcome,
+                    "support":     round(support, 4),
+                    "confidence":  round(confidence, 4),
+                    "lift":        round(lift, 4),
+                    "risk_level": (
+                        "high"   if confidence > 0.90 else
+                        "medium" if confidence > 0.80 else
+                        "low"
+                    ),
+                })
+
+    rules.sort(key=lambda r: r["confidence"], reverse=True)
+    rules = rules[:20]
+
+    high_risk = [r for r in rules if r["risk_level"] == "high"]
+
+    top_finding = (
+        f"Association rules: {len(rules)} rules found "
+        f"(confidence >= {min_confidence:.0%}). "
+        f"{len(high_risk)} high-confidence rules. "
+        f"Outcome events: {outcome_events}. "
+        + (
+            f"Strongest: IF '{rules[0]['antecedent']}' "
+            f"THEN '{rules[0]['consequent']}' "
+            f"({rules[0]['confidence']:.0%} confidence)."
+            if rules else "No strong rules found."
+        )
+    )
+
+    return _make_result(
+        analysis_type="association_rules",
+        data={
+            "total_sessions":    total_sessions,
+            "outcome_events":    outcome_events,
+            "rules_found":       len(rules),
+            "high_risk_rules":   len(high_risk),
+            "min_confidence":    min_confidence,
+            "rules":             rules,
+            "auto_detected_outcomes": not bool(
+                outcome_events
+            ),
+        },
+        top_finding=top_finding,
+        severity="high" if high_risk else "medium",
+        confidence=0.84,
+        chart_ready_data={
+            "type":  "rules_card",
+            "rules": rules[:10],
+        },
+    )
+
+
+def run_rfm_analysis(
+    csv_path: str,
+    entity_col: str,
+    time_col: str,
+    value_col: str,
+) -> dict:
+    """
+    Recency, Frequency, Monetary (RFM) segmentation.
+    Rides on entity_col (e.g., user_uuid).
+    Scores 1-5 for each dimension, then defines segments
+    (Champions, At Risk, Hibernating, etc.).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    for col in [entity_col, time_col, value_col]:
+        if col not in df.columns:
+            return {"status": "error",
+                    "error": f"Column '{col}' not found"}
+
+    df[time_col] = pd.to_datetime(
+        df[time_col], errors="coerce"
+    )
+    df = df.dropna(subset=[entity_col, time_col, value_col])
+
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=[value_col])
+
+    if len(df) == 0:
+        return {"status": "insufficient_data"}
+
+    ref_date = df[time_col].max() + pd.Timedelta(days=1)
+
+    rfm = (
+        df.groupby(entity_col)
+          .agg(
+              recency=(time_col, lambda x: (ref_date - x.max()).days),
+              frequency=(time_col, "count"),
+              monetary=(value_col, "sum"),
+          )
+          .reset_index()
+    )
+
+    rfm["r_score"] = pd.qcut(
+        rfm["recency"].rank(method="first"), 5, labels=[5, 4, 3, 2, 1]
+    ).astype(int)
+
+    rfm["f_score"] = pd.qcut(
+        rfm["frequency"].rank(method="first"), 5, labels=[1, 2, 3, 4, 5]
+    ).astype(int)
+
+    rfm["m_score"] = pd.qcut(
+        rfm["monetary"].rank(method="first"), 5, labels=[1, 2, 3, 4, 5]
+    ).astype(int)
+
+    rfm["rfm_score"] = (
+        rfm["r_score"].astype(str) +
+        rfm["f_score"].astype(str) +
+        rfm["m_score"].astype(str)
+    )
+
+    def assign_segment(r, f):
+        if r >= 4 and f >= 4: return "Champions"
+        if r >= 3 and f >= 3: return "Loyal"
+        if r >= 4 and f <= 2: return "Recent/New"
+        if r == 3 and f <= 2: return "Promising"
+        if r == 2 and f >= 3: return "At Risk"
+        if r <= 2 and f <= 2: return "Hibernating/Lost"
+        return "Other"
+
+    rfm["segment"] = rfm.apply(
+        lambda row: assign_segment(
+            row["r_score"], row["f_score"]
+        ),
+        axis=1
+    )
+
+    seg_stats = (
+        rfm.groupby("segment")
+           .agg(
+               entity_count=("recency", "count"),
+               avg_recency=("recency", "mean"),
+               avg_frequency=("frequency", "mean"),
+               avg_monetary=("monetary", "mean"),
+               total_monetary=("monetary", "sum"),
+           )
+           .reset_index()
+    )
+
+    total_value = rfm["monetary"].sum()
+    seg_stats["value_pct"] = (
+        seg_stats["total_monetary"] / total_value * 100
+    ).round(1)
+    seg_stats["entity_pct"] = (
+        seg_stats["entity_count"] / len(rfm) * 100
+    ).round(1)
+
+    seg_stats = seg_stats.sort_values(
+        "total_monetary", ascending=False
+    )
+
+    seg_stats["avg_recency"]   = seg_stats["avg_recency"].round(1)
+    seg_stats["avg_frequency"] = seg_stats["avg_frequency"].round(2)
+    seg_stats["avg_monetary"]  = seg_stats["avg_monetary"].round(2)
+    seg_stats["total_monetary"]= seg_stats["total_monetary"].round(2)
+
+    champions_val_pct = float(
+        seg_stats.loc[
+            seg_stats["segment"] == "Champions",
+            "value_pct"
+        ].sum()
+    )
+    at_risk_count = int(
+        seg_stats.loc[
+            seg_stats["segment"] == "At Risk",
+            "entity_count"
+        ].sum()
+    )
+
+    top_finding = (
+        f"RFM Analysis on {len(rfm):,} entities. "
+        f"Champions drive {champions_val_pct}% of total value. "
+        f"{at_risk_count} valuable entities act '{at_risk_count}'. "
+    )
+
+    return _make_result(
+        analysis_type="rfm_analysis",
+        data={
+            "total_entities":  len(rfm),
+            "total_monetary":  round(float(total_value), 2),
+            "segment_stats":   seg_stats.to_dict("records"),
+        },
+        top_finding=top_finding,
+        severity="medium" if at_risk_count > (len(rfm)*0.2) else "low",
+        confidence=0.92,
+        chart_ready_data={
+            "type": "rfm_scatter",
+            "r_scores": rfm["r_score"].tolist()[:1000],
+            "f_scores": rfm["f_score"].tolist()[:1000],
+            "m_scores": rfm["m_score"].tolist()[:1000],
+            "segments": rfm["segment"].tolist()[:1000],
+        },
+    )
+
+
+def run_pareto_analysis(
+    csv_path: str,
+    entity_col: str,
+    value_col: str,
+) -> dict:
+    """
+    80/20 Rule Analysis: identifies the minority of entities
+    driving the majority of value (revenue/monetary).
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    for col in [entity_col, value_col]:
+        if col not in df.columns:
+            return {"status": "error", "error": f"Missing {col}"}
+
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    df = df.dropna(subset=[entity_col, value_col])
+
+    if len(df) == 0:
+        return {"status": "insufficient_data"}
+
+    entity_value = df.groupby(entity_col)[value_col].sum().sort_values(ascending=False).reset_index()
+    total_value = entity_value[value_col].sum()
+    
+    if total_value <= 0:
+        return {"status": "insufficient_data", "error": "Total value is zero or negative"}
+
+    entity_value["cum_value_pct"] = entity_value[value_col].cumsum() / total_value
+    entity_value["cum_entity_pct"] = (entity_value.index + 1) / len(entity_value)
+
+    target_idx = (entity_value["cum_entity_pct"] - 0.2).abs().idxmin()
+    value_at_20 = round(float(entity_value.loc[target_idx, "cum_value_pct"] * 100), 1)
+
+    target_val_idx = (entity_value["cum_value_pct"] - 0.8).abs().idxmin()
+    entities_at_80 = round(float(entity_value.loc[target_val_idx, "cum_entity_pct"] * 100), 1)
+
+    top_finding = (
+        f"Pareto Analysis: Top 20% of entities drive {value_at_20}% of total {value_col}. "
+        f"80% of value is generated by {entities_at_80}% of entities."
+    )
+
+    severity = "high" if value_at_20 > 90 else "medium" if value_at_20 > 70 else "low"
+
+    return _make_result(
+        analysis_type="pareto_analysis",
+        data={
+            "total_entities": len(entity_value),
+            "total_value": round(float(total_value), 2),
+            "top_20_pct_value": value_at_20,
+            "entities_for_80_pct": entities_at_80,
+            "entity_value_top_10": entity_value.head(10).to_dict("records"),
+        },
+        top_finding=top_finding,
+        severity=severity,
+        confidence=0.98,
+        chart_ready_data={
+            "type": "pareto_curve",
+            "entity_pct": entity_value["cum_entity_pct"].tolist(),
+            "value_pct": entity_value["cum_value_pct"].tolist(),
+        }
+    )
+
+
+
+
+def run_transition_analysis(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    time_col: str = None,
+) -> dict:
+    """
+    Markov Transition Matrix — domain-agnostic.
+
+    For each entity's time-sorted event sequence, computes
+    P(next_event | current_event) across the entire dataset.
+    Also computes exit probabilities (session-end after event).
+
+    Produces:
+    - Full NxN transition probability matrix (top 30 events)
+    - Top transitions by volume and probability
+    - Dead-end events (high exit probability)
+    - Loop detection (self-transitions)
+    - Absorbing states (events rarely followed by others)
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    required_cols = [entity_col, event_col]
+    for col in required_cols:
+        if col not in df.columns:
+            return {"status": "error", "error": f"Column '{col}' not found"}
+
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        df = df.dropna(subset=[entity_col, event_col, time_col])
+        df = df.sort_values([entity_col, time_col])
+    else:
+        df = df.dropna(subset=[entity_col, event_col])
+        df = df.sort_values([entity_col])
+
+    if len(df) < 10:
+        return {"status": "insufficient_data",
+                "error": "Need at least 10 rows"}
+
+    session_col = "session_id" if "session_id" in df.columns else None
+
+    transition_counts = defaultdict(lambda: defaultdict(int))
+    exit_counts = defaultdict(int)
+    total_from = defaultdict(int)
+
+    if session_col:
+        groups = df.groupby([entity_col, session_col])
+    else:
+        groups = df.groupby(entity_col)
+
+    for _, group in groups:
+        events = group[event_col].tolist()
+        for i in range(len(events) - 1):
+            src, dst = str(events[i]), str(events[i + 1])
+            transition_counts[src][dst] += 1
+            total_from[src] += 1
+        if events:
+            last_evt = str(events[-1])
+            exit_counts[last_evt] += 1
+            total_from[last_evt] += 1
+
+    event_freq = Counter()
+    for evt in df[event_col].astype(str):
+        event_freq[evt] += 1
+    top_events = [e for e, _ in event_freq.most_common(30)]
+
+    matrix = []
+    for src in top_events:
+        row = []
+        denom = total_from.get(src, 1)
+        for dst in top_events:
+            prob = round(transition_counts[src][dst] / denom, 4) if denom else 0
+            row.append(prob)
+        matrix.append(row)
+
+    all_transitions = []
+    for src in transition_counts:
+        denom = total_from.get(src, 1)
+        for dst, count in transition_counts[src].items():
+            all_transitions.append({
+                "from": src,
+                "to": dst,
+                "count": count,
+                "probability": round(count / denom, 4),
+            })
+    all_transitions.sort(key=lambda x: x["count"], reverse=True)
+
+    exit_probs = {}
+    for evt in top_events:
+        denom = total_from.get(evt, 1)
+        exit_probs[evt] = round(exit_counts.get(evt, 0) / denom, 4) if denom else 0
+
+    dead_ends = [
+        {"event": evt, "exit_prob": prob}
+        for evt, prob in sorted(exit_probs.items(), key=lambda x: -x[1])
+        if prob > 0.3
+    ][:10]
+
+    loops = []
+    for evt in top_events:
+        denom = total_from.get(evt, 1)
+        self_count = transition_counts[evt].get(evt, 0)
+        self_prob = round(self_count / denom, 4) if denom else 0
+        if self_prob > 0.1:
+            loops.append({
+                "event": evt,
+                "self_prob": self_prob,
+                "self_count": self_count,
+            })
+    loops.sort(key=lambda x: -x["self_prob"])
+
+    n_unique = len(event_freq)
+    n_transitions = sum(
+        c for src in transition_counts
+        for c in transition_counts[src].values()
+    )
+
+    stationary_distribution = {}
+    try:
+        n = len(top_events)
+        if n > 1 and matrix:
+            P = np.array(matrix[:n], dtype=float)
+            row_sums = P.sum(axis=1, keepdims=True)
+            zero_rows = (row_sums == 0).flatten()
+            P[zero_rows] = 1.0 / n
+            row_sums[zero_rows] = 1.0
+            P = P / row_sums
+
+            pi = np.ones(n) / n
+            for _ in range(200):
+                pi_new = pi @ P
+                if np.max(np.abs(pi_new - pi)) < 1e-8:
+                    break
+                pi = pi_new
+            pi = pi_new / pi_new.sum()
+
+            stationary_distribution = {
+                top_events[i]: round(float(pi[i]), 4)
+                for i in range(n)
+            }
+    except Exception:
+        stationary_distribution = {}
+
+    top_pooling = sorted(
+        stationary_distribution.items(), key=lambda x: -x[1]
+    )[:5]
+
+    top_finding = (
+        f"Transition analysis: {n_unique} unique events, "
+        f"{n_transitions:,} transitions observed. "
+        f"{len(dead_ends)} dead-end events with >30% exit probability. "
+        f"{len(loops)} events show significant self-looping (>10%). "
+        + (
+            f"Highest exit: {dead_ends[0]['event']} ({dead_ends[0]['exit_prob']:.0%}). "
+            if dead_ends else ""
+        )
+        + (
+            f"Traffic pools at: {', '.join(e for e, _ in top_pooling[:3])}."
+            if top_pooling else ""
+        )
+    )
+
+    return _make_result(
+        analysis_type="transition_analysis",
+        data={
+            "unique_events": n_unique,
+            "total_transitions": n_transitions,
+            "top_transitions": all_transitions[:20],
+            "dead_ends": dead_ends,
+            "self_loops": loops[:10],
+            "exit_probabilities": exit_probs,
+            "stationary_distribution": stationary_distribution,
+            "top_pooling_events": [{
+                "event": e, "steady_state_pct": round(p * 100, 2)
+            } for e, p in top_pooling],
+        },
+        top_finding=top_finding,
+        severity="high" if len(dead_ends) > 3 else "medium",
+        confidence=0.88,
+        chart_ready_data={
+            "type": "transition_heatmap",
+            "events": top_events[:20],
+            "matrix": [row[:20] for row in matrix[:20]],
+            "top_transitions": all_transitions[:15],
+        },
+    )
+
+
+def run_dropout_analysis(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    time_col: str = None,
+) -> dict:
+    """
+    Dropout Sequence Analysis — domain-agnostic.
+
+    Identifies what events commonly occur right before
+    a session ends (user drops off). Analyzes:
+    - Last 1, 2, and 3 events before session end
+    - Common dropout sequences (bigrams/trigrams)
+    - Dropout rate per event (% of time an event is the last)
+    - Early vs late session dropouts
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    required_cols = [entity_col, event_col]
+    for col in required_cols:
+        if col not in df.columns:
+            return {"status": "error", "error": f"Column '{col}' not found"}
+
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        df = df.dropna(subset=[entity_col, event_col, time_col])
+        df = df.sort_values([entity_col, time_col])
+    else:
+        df = df.dropna(subset=[entity_col, event_col])
+        df = df.sort_values([entity_col])
+
+    if len(df) < 10:
+        return {"status": "insufficient_data",
+                "error": "Need at least 10 rows"}
+
+    session_col = "session_id" if "session_id" in df.columns else None
+
+    if session_col:
+        groups = df.groupby([entity_col, session_col])
+    else:
+        df["_time_diff"] = df.groupby(entity_col)[time_col].diff()
+        df["_new_session"] = (
+            df["_time_diff"] > pd.Timedelta(minutes=30)
+        ).fillna(True)
+        df["_synth_session"] = df.groupby(entity_col)["_new_session"].cumsum()
+        groups = df.groupby([entity_col, "_synth_session"])
+
+    last_1_events = []
+    last_2_seqs = []
+    last_3_seqs = []
+    session_lengths = []
+    dropout_positions = []
+
+    for _, group in groups:
+        events = group[event_col].astype(str).tolist()
+        if not events:
+            continue
+        session_lengths.append(len(events))
+
+        last_1_events.append(events[-1])
+
+        if len(events) >= 2:
+            last_2_seqs.append(
+                f"{events[-2]} → {events[-1]}"
+            )
+
+        if len(events) >= 3:
+            last_3_seqs.append(
+                f"{events[-3]} → {events[-2]} → {events[-1]}"
+            )
+
+        dropout_positions.append(len(events))
+
+    total_sessions = len(last_1_events)
+    if total_sessions == 0:
+        return {"status": "insufficient_data",
+                "error": "No sessions found"}
+
+    last_1_counter = Counter(last_1_events)
+    last_2_counter = Counter(last_2_seqs)
+    last_3_counter = Counter(last_3_seqs)
+
+    event_total_counts = Counter(df[event_col].astype(str))
+    dropout_rate = {}
+    for evt, last_count in last_1_counter.items():
+        total = event_total_counts.get(evt, 1)
+        dropout_rate[evt] = {
+            "event": evt,
+            "times_last": last_count,
+            "total_occurrences": total,
+            "dropout_rate": round(last_count / total, 4),
+        }
+
+    dropout_rate_sorted = sorted(
+        dropout_rate.values(),
+        key=lambda x: -x["dropout_rate"]
+    )
+
+    median_len = float(np.median(session_lengths)) if session_lengths else 1
+    early_dropouts = sum(1 for l in session_lengths if l <= max(2, median_len * 0.3))
+    early_pct = round(early_dropouts / total_sessions * 100, 1)
+
+    top_last = last_1_counter.most_common(15)
+    top_last_2 = last_2_counter.most_common(10)
+    top_last_3 = last_3_counter.most_common(10)
+
+    highest_dropout = dropout_rate_sorted[0] if dropout_rate_sorted else {}
+
+    top_finding = (
+        f"Dropout analysis across {total_sessions:,} sessions. "
+        f"Most common last event: '{top_last[0][0]}' "
+        f"({top_last[0][1]} times, "
+        f"{round(top_last[0][1]/total_sessions*100,1)}% of exits). "
+        f"Highest dropout rate: '{highest_dropout.get('event','')}' "
+        f"({highest_dropout.get('dropout_rate',0):.0%} of its occurrences end sessions). "
+        f"{early_pct}% of sessions are early dropouts."
+    )
+
+    return _make_result(
+        analysis_type="dropout_analysis",
+        data={
+            "total_sessions": total_sessions,
+            "median_session_length": round(median_len, 1),
+            "early_dropout_pct": early_pct,
+            "top_last_events": [
+                {"event": e, "count": c,
+                 "pct": round(c / total_sessions * 100, 1)}
+                for e, c in top_last
+            ],
+            "top_last_2_sequences": [
+                {"sequence": s, "count": c} for s, c in top_last_2
+            ],
+            "top_last_3_sequences": [
+                {"sequence": s, "count": c} for s, c in top_last_3
+            ],
+            "dropout_rate_by_event": dropout_rate_sorted[:20],
+        },
+        top_finding=top_finding,
+        severity="high" if early_pct > 30 else "medium",
+        confidence=0.86,
+        chart_ready_data={
+            "type": "dropout_bar",
+            "events": [e for e, _ in top_last],
+            "counts": [c for _, c in top_last],
+            "dropout_rates": [
+                dropout_rate.get(e, {}).get("dropout_rate", 0)
+                for e, _ in top_last
+            ],
+        },
+    )
+
+
+def run_event_taxonomy(
+    csv_path: str,
+    event_col: str,
+) -> dict:
+    """
+    Event Taxonomy Classifier — domain-agnostic.
+
+    Auto-classifies events into functional categories using
+    keyword pattern matching. NOT hardcoded to any domain.
+    Uses common software/UX patterns to infer:
+    - authentication (login, register, verify, otp, password)
+    - search (search, query, filter, find, browse, discover)
+    - selection (select, view, click, tap, open, detail, item)
+    - transaction (pay, purchase, buy, checkout, cart, order, book, reserve)
+    - navigation (back, home, menu, settings, navigate, page, tab)
+    - error (error, fail, crash, retry, timeout, exception)
+    - notification (push, notification, alert, remind, message)
+    - onboarding (welcome, tutorial, intro, setup, first, install)
+    - social (share, like, comment, follow, invite, refer)
+    - other (everything else)
+
+    Returns category distribution, event-to-category mapping,
+    and the taxonomy itself for downstream synthesis.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+
+    if event_col not in df.columns:
+        return {"status": "error",
+                "error": f"Column '{event_col}' not found"}
+
+    events = df[event_col].dropna().astype(str)
+    if len(events) == 0:
+        return {"status": "insufficient_data",
+                "error": "No events found"}
+
+    TAXONOMY = [
+        ("authentication", [
+            "login", "log_in", "log in", "signin", "sign_in",
+            "sign in", "register", "signup", "sign_up", "sign up",
+            "verify", "otp", "password", "auth", "credential",
+            "logout", "log_out", "log out", "signout", "sign_out",
+            "token", "2fa", "mfa",
+        ]),
+        ("search", [
+            "search", "query", "filter", "find", "browse",
+            "discover", "explore", "lookup", "look_up",
+            "autocomplete", "suggest",
+        ]),
+        ("selection", [
+            "select", "view", "click", "tap", "open",
+            "detail", "item", "product", "choose", "pick",
+            "expand", "preview", "inspect", "read",
+        ]),
+        ("transaction", [
+            "pay", "purchase", "buy", "checkout", "check_out",
+            "cart", "order", "book", "reserve", "confirm",
+            "invoice", "receipt", "billing", "subscribe",
+            "redeem", "coupon", "promo",
+        ]),
+        ("navigation", [
+            "back", "home", "menu", "settings", "navigate",
+            "page", "tab", "scroll", "swipe", "drawer",
+            "close", "dismiss", "return", "exit", "leave",
+        ]),
+        ("error", [
+            "error", "fail", "crash", "retry", "timeout",
+            "exception", "denied", "reject", "invalid",
+            "404", "500", "unauthorized", "forbidden",
+        ]),
+        ("notification", [
+            "push", "notification", "alert", "remind",
+            "message", "inbox", "bell", "badge", "toast",
+        ]),
+        ("onboarding", [
+            "welcome", "tutorial", "intro", "setup",
+            "first", "install", "permission", "grant",
+            "walkthrough", "tour", "getting_started",
+        ]),
+        ("social", [
+            "share", "like", "comment", "follow", "invite",
+            "refer", "review", "rate", "rating", "feedback",
+            "recommend", "post",
+        ]),
+    ]
+
+    def classify_event(event_name: str) -> str:
+        """Classify a single event by keyword matching."""
+        lower = event_name.lower().replace("-", "_").replace(" ", "_")
+        for category, keywords in TAXONOMY:
+            for kw in keywords:
+                if kw in lower:
+                    return category
+        return "other"
+
+    event_counts = events.value_counts()
+    unique_events = event_counts.index.tolist()
+
+    event_categories = {}
+    for evt in unique_events:
+        event_categories[evt] = classify_event(evt)
+
+    event_counts = df[event_col].value_counts().to_dict()
+
+    mapping = {}
+    category_counts = defaultdict(int)
+
+    for evt, count in event_counts.items():
+        cat = classify_event(evt)
+        mapping[evt] = cat
+        category_counts[cat] += count
+
+    total_events = sum(category_counts.values())
+    cat_distribution = {
+        cat: {"count": cnt, "pct": round((cnt / total_events) * 100, 2)}
+        for cat, cnt in category_counts.items()
+    }
+
+    top_events_by_cat = defaultdict(list)
+    for evt, count in sorted(event_counts.items(), key=lambda x: -x[1]):
+        cat = mapping[evt]
+        if len(top_events_by_cat[cat]) < 10:
+            top_events_by_cat[cat].append({"event": evt, "count": count})
+
+    top_finding = (
+        f"Event Taxonomy: Classified {len(mapping)} unique events. "
+        f"Top category is '{max(category_counts, key=category_counts.get)}' "
+        f"({max(category_counts.values()) / total_events:.1%} of events). "
+        f"{cat_distribution.get('other', {}).get('pct', 0)}% of events remained unclassified ('other')."
+    )
+
+    return _make_result(
+        analysis_type="event_taxonomy",
+        data={
+            "total_unique_events": len(mapping),
+            "category_distribution": cat_distribution,
+            "top_events_by_category": dict(top_events_by_cat),
+            "event_category_mapping": {k: mapping[k] for k in list(mapping.keys())[:100]}
+        },
+        top_finding=top_finding,
+        severity="info",
+        confidence=0.95,
+        chart_ready_data={
+            "type": "horizontal_bar",
+            "labels": list(category_counts.keys()),
+            "values": list(category_counts.values()),
+            "title": "Event Volume by Functional Category",
+        },
+    )
+
+def run_user_journey_analysis(
+    csv_path: str,
+    entity_col: str,
+    event_col: str,
+    time_col: str = None,
+) -> dict:
+    """
+    Per-User Journey Tracking.
+    Analyzes specific sequential journeys taken by individual users.
+    Identifies common entry/exit points and average session sizes per user.
+    """
+    df = pd.read_csv(csv_path, low_memory=False)
+    
+    if entity_col not in df.columns or event_col not in df.columns:
+        return {"status": "error", "error": f"Missing required columns"}
+    
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        df = df.sort_values([entity_col, time_col])
+    else:
+        df = df.sort_values([entity_col])
+        
+    journey_stats = []
+    
+    for entity, group in df.groupby(entity_col):
+        events = group[event_col].tolist()
+        if not events: continue
+        
+        journey_stats.append({
+            "user_id": str(entity),
+            "step_count": len(events),
+            "entry_event": str(events[0]),
+            "exit_event": str(events[-1]),
+            "unique_events": len(set(events))
+        })
+        
+    if not journey_stats:
+        return {"status": "error", "error": "No valid journeys found"}
+        
+    journey_df = pd.DataFrame(journey_stats)
+    
+    common_entries = journey_df["entry_event"].value_counts().head(5).to_dict()
+    common_exits = journey_df["exit_event"].value_counts().head(5).to_dict()
+    avg_steps = round(journey_df["step_count"].mean(), 2)
+    max_steps = int(journey_df["step_count"].max())
+    
+    top_finding = f"Analyzed journeys for {len(journey_df):,} users. Average steps per journey: {avg_steps}. Most common entry: {list(common_entries.keys())[0] if common_entries else 'N/A'}."
+    
+    return _make_result(
+        analysis_type="user_journey_analysis",
+        data={
+            "total_users_tracked": len(journey_df),
+            "avg_steps_per_user": avg_steps,
+            "max_steps_per_user": max_steps,
+            "common_entry_events": common_entries,
+            "common_exit_events": common_exits,
+            "sample_journeys": journey_stats[:10]
+        },
+        top_finding=top_finding,
+        severity="info",
+        confidence=0.90,
+        chart_ready_data={
+            "type": "bar_chart",
+            "labels": list(common_entries.keys()),
+            "values": list(common_entries.values()),
+            "title": "Top Journey Entry Points"
+        }
+    )
