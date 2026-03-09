@@ -8,59 +8,87 @@
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
     <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 
 <body>
-    <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="logo">
                 <div class="logo-mark">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-                        <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.9"/>
-                        <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.4"/>
-                        <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.4"/>
-                        <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.7"/>
+                        <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.9" />
+                        <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
+                        <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
+                        <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.7" />
                     </svg>
                 </div>
                 <span class="logo-text">ADK Analytics</span>
             </div>
             <button class="sidebar-collapse-btn" id="sidebar-toggle" title="Toggle sidebar">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M15 18l-6-6 6-6" />
+                </svg>
             </button>
         </div>
 
         <nav class="sidebar-nav">
             <div class="nav-section-label">PIPELINE</div>
             <div class="stage-item" id="stage-1" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="17 8 12 3 7 8" />
+                        <line x1="12" y1="3" x2="12" y2="15" />
+                    </svg></div>
                 <span class="stage-label">Upload</span>
                 <span class="stage-dot"></span>
             </div>
             <div class="stage-item" id="stage-2" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <polyline points="14 2 14 8 20 8" />
+                    </svg></div>
                 <span class="stage-label">Profile</span>
                 <span class="stage-dot"></span>
             </div>
             <div class="stage-item" id="stage-3" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8" />
+                        <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    </svg></div>
                 <span class="stage-label">Discover</span>
                 <span class="stage-dot"></span>
             </div>
             <div class="stage-item" id="stage-4" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                    </svg></div>
                 <span class="stage-label">Analyze</span>
                 <span class="stage-dot"></span>
             </div>
             <div class="stage-item" id="stage-5" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                        <path d="M2 17l10 5 10-5" />
+                        <path d="M2 12l10 5 10-5" />
+                    </svg></div>
                 <span class="stage-label">Synthesize</span>
                 <span class="stage-dot"></span>
             </div>
             <div class="stage-item" id="stage-6" data-status="pending">
-                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div>
+                <div class="stage-icon-wrap"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+                    </svg></div>
                 <span class="stage-label">Report</span>
                 <span class="stage-dot"></span>
             </div>
@@ -71,41 +99,48 @@
         </div>
     </aside>
 
-    <!-- Sidebar expand button (visible only when sidebar is collapsed) -->
+
     <button class="sidebar-expand-btn hidden" id="sidebar-expand" title="Show sidebar">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 18l6-6-6-6" />
+        </svg>
     </button>
 
-    <!-- Main Chat Area -->
+
     <main class="chat-main">
-        <!-- Messages -->
+
         <div class="chat-scroll" id="chat-scroll">
             <div class="chat-container" id="chat-container">
 
-                <!-- Welcome State (shown before upload) -->
+
                 <div class="welcome-state" id="welcome-state">
                     <div class="welcome-icon">
                         <svg width="48" height="48" viewBox="0 0 24 24" fill="none">
-                            <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.8"/>
-                            <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.35"/>
-                            <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.35"/>
-                            <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6"/>
+                            <rect x="3" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.8" />
+                            <rect x="14" y="3" width="7" height="7" rx="2" fill="currentColor" opacity="0.35" />
+                            <rect x="3" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.35" />
+                            <rect x="14" y="14" width="7" height="7" rx="2" fill="currentColor" opacity="0.6" />
                         </svg>
                     </div>
                     <h1 class="welcome-title">What would you like to analyze?</h1>
-                    <p class="welcome-sub">Upload a data file and I'll run a full multi-agent analysis pipeline on it.</p>
+                    <p class="welcome-sub">Upload a data file and I'll run a full multi-agent analysis pipeline on it.
+                    </p>
                 </div>
 
             </div>
         </div>
 
-        <!-- Input Area (always visible at bottom) -->
+
         <div class="input-area">
             <div class="input-wrapper" id="input-wrapper">
-                <!-- File attachment preview (shown when file selected) -->
+
                 <div class="file-attach hidden" id="file-attach">
                     <div class="file-attach-icon">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <polyline points="14 2 14 8 20 8" />
+                        </svg>
                     </div>
                     <div class="file-attach-info">
                         <span class="file-attach-name" id="file-attach-name"></span>
@@ -114,14 +149,23 @@
                     <button class="file-attach-remove" id="file-attach-remove">&times;</button>
                 </div>
 
-                <!-- Text Input Row -->
+
                 <div class="input-row">
                     <button class="input-attach-btn" id="attach-btn" title="Attach data file">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path
+                                d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                        </svg>
                     </button>
-                    <textarea id="chat-input" class="chat-input" placeholder="Upload a CSV file to start, or type a message..." rows="1"></textarea>
+                    <textarea id="chat-input" class="chat-input"
+                        placeholder="Upload a CSV file to start, or type a message..." rows="1"></textarea>
                     <button class="input-send-btn" id="send-btn" title="Send">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <line x1="22" y1="2" x2="11" y2="13" />
+                            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                        </svg>
                     </button>
                 </div>
                 <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.json,.jsonl,.parquet" hidden>
@@ -130,7 +174,7 @@
         </div>
     </main>
 
-    <!-- Drop overlay (shown when dragging file over the page) -->
+
     <div class="drop-overlay hidden" id="drop-overlay">
         <div class="drop-overlay-content">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">

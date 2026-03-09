@@ -901,5 +901,4 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 if __name__ == "__main__":
     import uvicorn
     print("Analytics Server starting...")
-    print("Open http://localhost:8000 in your browser")
     uvicorn.run(app, host="127.0.0.1", port=8000)

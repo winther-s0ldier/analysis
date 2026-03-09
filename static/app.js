@@ -1,10 +1,3 @@
-/**
- * ADK Analytics — Chat-First Frontend
- * Everything happens as a conversation. Upload, profile, discovery,
- * analysis, and results all appear as messages in a chat flow.
- */
-
-// ─── State ──────────────────────────────────
 let sessionId = null;
 let outputFolder = null;
 let pendingFile = null;
@@ -13,38 +6,32 @@ let pollInterval = null;
 let pollStartTime = 0;
 const MAX_POLL_TIME = 10 * 60 * 1000;
 
-// ─── DOM ────────────────────────────────────
 const $ = sel => document.querySelector(sel);
-const chatScroll   = $('#chat-scroll');
+const chatScroll = $('#chat-scroll');
 const chatContainer = $('#chat-container');
 const welcomeState = $('#welcome-state');
-const chatInput    = $('#chat-input');
-const sendBtn      = $('#send-btn');
-const attachBtn    = $('#attach-btn');
-const fileInput    = $('#file-input');
-const fileAttach   = $('#file-attach');
+const chatInput = $('#chat-input');
+const sendBtn = $('#send-btn');
+const attachBtn = $('#attach-btn');
+const fileInput = $('#file-input');
+const fileAttach = $('#file-attach');
 const fileAttachName = $('#file-attach-name');
 const fileAttachSize = $('#file-attach-size');
 const fileAttachRemove = $('#file-attach-remove');
-const dropOverlay  = $('#drop-overlay');
-const sessionIdEl  = $('#session-id');
+const dropOverlay = $('#drop-overlay');
+const sessionIdEl = $('#session-id');
 
-// ─── Init ───────────────────────────────────
-
-// File attach button
 attachBtn.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', () => {
     if (fileInput.files.length > 0) attachFile(fileInput.files[0]);
 });
 
-// Remove attached file
 fileAttachRemove.addEventListener('click', () => {
     pendingFile = null;
     fileAttach.classList.add('hidden');
     fileInput.value = '';
 });
 
-// Drag and drop on entire page
 document.addEventListener('dragover', e => { e.preventDefault(); dropOverlay.classList.remove('hidden'); });
 document.addEventListener('dragleave', e => {
     if (e.relatedTarget === null) dropOverlay.classList.add('hidden');
@@ -58,7 +45,6 @@ dropOverlay.addEventListener('drop', e => {
 });
 dropOverlay.addEventListener('dragover', e => e.preventDefault());
 
-// Send
 sendBtn.addEventListener('click', handleSend);
 chatInput.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -67,13 +53,11 @@ chatInput.addEventListener('keydown', e => {
     }
 });
 
-// Auto-resize textarea
 chatInput.addEventListener('input', () => {
     chatInput.style.height = 'auto';
     chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + 'px';
 });
 
-// Sidebar toggle
 const sidebarEl = $('#sidebar');
 const sidebarExpand = $('#sidebar-expand');
 
@@ -87,10 +71,8 @@ sidebarExpand?.addEventListener('click', () => {
     sidebarExpand.classList.add('hidden');
 });
 
-// Restore session
 restoreSession();
 
-// ─── File Attach ────────────────────────────
 function attachFile(file) {
     pendingFile = file;
     fileAttachName.textContent = file.name;
@@ -100,29 +82,23 @@ function attachFile(file) {
     chatInput.focus();
 }
 
-// ─── Send Handler ───────────────────────────
 async function handleSend() {
     const text = chatInput.value.trim();
     const file = pendingFile;
 
-    // Need either text or file
     if (!text && !file) return;
 
-    // Clear input
     chatInput.value = '';
     chatInput.style.height = 'auto';
 
-    // Hide welcome
     if (welcomeState) welcomeState.remove();
 
     if (file) {
-        // Upload flow
         pendingFile = null;
         fileAttach.classList.add('hidden');
         fileInput.value = '';
         chatInput.placeholder = 'Ask anything about your data...';
 
-        // Show user message
         if (text) {
             addUserMessage(text);
         }
@@ -130,7 +106,6 @@ async function handleSend() {
 
         await uploadAndAnalyze(file, text);
     } else if (sessionId) {
-        // Chat with existing session
         addUserMessage(text);
         await sendChatMessage(text);
     } else {
@@ -139,7 +114,6 @@ async function handleSend() {
     }
 }
 
-// ─── Upload + Pipeline ──────────────────────
 async function uploadAndAnalyze(file, instructions) {
     const statusEl = addStatusMessage('Uploading file...');
 
@@ -156,7 +130,6 @@ async function uploadAndAnalyze(file, instructions) {
         sessionIdEl.textContent = `Session: ${sessionId.substring(0, 8)}`;
         saveSession();
 
-        // Store instructions if any
         if (instructions) {
             try {
                 await fetch(`/instructions/${sessionId}`, {
@@ -164,13 +137,12 @@ async function uploadAndAnalyze(file, instructions) {
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ instructions })
                 });
-            } catch (e) { /* endpoint may not exist yet, that's ok */ }
+            } catch (e) { }
         }
 
         updateStage(1, 'complete');
         removeStatusMessage(statusEl);
 
-        // Phase 1: Profile
         updateStage(2, 'active');
         const profStatus = addStatusMessage('Profiling dataset structure...');
 
@@ -181,10 +153,8 @@ async function uploadAndAnalyze(file, instructions) {
         removeStatusMessage(profStatus);
         updateStage(2, 'complete');
 
-        // Show profile as AI message with cards
         addProfileMessage(profileData);
 
-        // Phase 2: Discover
         updateStage(3, 'active');
         const discStatus = addStatusMessage('Building analytical roadmap...');
 
@@ -195,7 +165,6 @@ async function uploadAndAnalyze(file, instructions) {
         removeStatusMessage(discStatus);
         updateStage(3, 'complete');
 
-        // Show discovery roadmap
         addDiscoveryMessage(discoverData.discovery);
 
     } catch (err) {
@@ -205,7 +174,6 @@ async function uploadAndAnalyze(file, instructions) {
     }
 }
 
-// ─── Run Analysis ───────────────────────────
 async function runAnalysis() {
     updateStage(4, 'active');
     const statusEl = addStatusMessage('Running analysis pipeline...');
@@ -217,7 +185,6 @@ async function runAnalysis() {
         body: JSON.stringify({ request: 'Analyze all discovered metrics.', custom_metrics: [] })
     });
 
-    // Start polling
     pollStartTime = Date.now();
     if (pollInterval) clearInterval(pollInterval);
 
@@ -234,11 +201,8 @@ async function runAnalysis() {
             if (!res.ok) return;
             const status = await res.json();
 
-            // Update sidebar stages
             updateStageFromStatus(status);
-            // Update metric cards
             updateMetricCards(status.pipeline?.node_statuses || {});
-            // Render new charts
             await renderNewCharts();
 
             if (status.session_status === 'complete') {
@@ -291,7 +255,6 @@ async function renderNewCharts() {
                 renderedCharts.add(result.analysis_id);
                 addChartMessage(result);
 
-                // Update metric card finding text
                 const card = $(`[data-node-id="${result.analysis_id}"]`);
                 if (card) {
                     const finding = card.querySelector('.card-metric-finding');
@@ -318,7 +281,6 @@ async function finishPipeline() {
             addExecutiveSummaryMessage(synthesis.executive_summary);
         }
 
-        // Report buttons
         addAIMessageHTML(`
             <p>Analysis complete! You can view the full report or continue asking questions.</p>
             <div class="card-actions" style="margin-top: 10px;">
@@ -336,7 +298,6 @@ async function finishPipeline() {
     chatInput.placeholder = 'Ask about the analysis results...';
 }
 
-// ─── Chat with Session ──────────────────────
 async function sendChatMessage(text) {
     const typing = addTypingIndicator();
 
@@ -354,8 +315,6 @@ async function sendChatMessage(text) {
         addAIMessage('Error: ' + err.message);
     }
 }
-
-// ─── Message Builders ───────────────────────
 
 function addUserMessage(text, isFileMsg = false) {
     const el = document.createElement('div');
@@ -513,8 +472,6 @@ function removeElement(el) {
     if (el && el.parentNode) el.parentNode.removeChild(el);
 }
 
-// ─── Helpers ────────────────────────────────
-
 function createAIMessageEl() {
     const el = document.createElement('div');
     el.className = 'msg msg-ai';
@@ -577,16 +534,13 @@ function restoreSession() {
     }
 }
 
-// Custom analysis — adds to discovery roadmap + executes via API
 async function addCustomAnalysis() {
     const text = prompt('Describe the custom analysis you want to run:');
     if (!text) return;
     if (!sessionId) { addAIMessage('No active session. Upload a file first.'); return; }
 
-    // 1. Show user message in chat
     addUserMessage(text);
 
-    // 2. Add a metric card to the discovery roadmap
     const customId = 'C' + (document.querySelectorAll('.card-metric[data-custom]').length + 1);
     const roadmap = document.querySelector('.card-roadmap');
     if (roadmap) {
@@ -611,7 +565,6 @@ async function addCustomAnalysis() {
         scrollToBottom();
     }
 
-    // 3. Call the /add-metric API
     try {
         const res = await fetch(`/add-metric/${sessionId}`, {
             method: 'POST',
@@ -620,11 +573,9 @@ async function addCustomAnalysis() {
         });
         const data = await res.json();
 
-        // Update the metric card status
         const card = document.querySelector(`[data-node-id="${customId}"]`);
 
         if (data.status === 'success') {
-            // Update card to complete
             if (card) {
                 card.dataset.status = 'complete';
                 const finding = card.querySelector('.card-metric-finding');
@@ -633,7 +584,6 @@ async function addCustomAnalysis() {
                     finding.classList.add('visible');
                 }
             }
-            // Show chart in chat
             if (data.chart_path) {
                 addChartMessage({
                     analysis_id: data.analysis_id,
@@ -646,7 +596,6 @@ async function addCustomAnalysis() {
                 addAIMessage(data.top_finding || 'Custom analysis completed.');
             }
         } else if (data.status === 'invalid') {
-            // Validation failed — can't run this analysis
             if (card) {
                 card.dataset.status = 'failed';
                 const finding = card.querySelector('.card-metric-finding');
@@ -657,7 +606,6 @@ async function addCustomAnalysis() {
             }
             addAIMessage(`Can't run that analysis: ${data.reason || 'The data doesn\'t support this analysis.'}`);
         } else {
-            // Error
             if (card) {
                 card.dataset.status = 'failed';
                 const finding = card.querySelector('.card-metric-finding');
@@ -679,8 +627,7 @@ async function addCustomAnalysis() {
     }
 }
 
-// Report download
-window.downloadReport = async function() {
+window.downloadReport = async function () {
     try {
         const res = await fetch(`/report/${sessionId}`);
         if (!res.ok) return;
