@@ -4,7 +4,7 @@ All agent files import get_model() from here.
 """
 import os
 
-MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 _AGENT_MODELS = {
     "orchestrator": MODEL,

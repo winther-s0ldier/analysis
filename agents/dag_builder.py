@@ -239,7 +239,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             import markdown
             conv_h = markdown.markdown(conv_rep, extensions=['tables'])
         except ImportError:
-            conv_h = f'<div style="white-space: pre-wrap; font-family: monospace; background:
+            conv_h = f'<div style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 20px;">{conv_rep}</div>'
     else:
         conv_h = ""
 

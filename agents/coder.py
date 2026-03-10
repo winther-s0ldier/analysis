@@ -51,12 +51,11 @@ def get_coder_agent():
                 "```python\n"
                 "from tools.analysis_library import run_funnel_analysis\n\n"
                 "def analyze(csv_path: str) -> dict:\n"
-                "
                 "    return run_funnel_analysis(\n"
                 "        csv_path=csv_path,\n"
-                "        entity_col='user_id',
-                "        event_col='event_name',
-                "        time_col='timestamp',
+                "        entity_col='user_id',\n"
+                "        event_col='event_name',\n"
+                "        time_col='timestamp',\n"
                 "    )\n"
                 "```\n\n"
 
@@ -88,7 +87,6 @@ def get_coder_agent():
                 "import pandas as pd\n"
                 "import numpy as np\n\n"
                 "def analyze(csv_path: str) -> dict:\n"
-                "
                 "    return {\n"
                 "        'status': 'success',\n"
                 "        'analysis_type': '<type>',\n"
