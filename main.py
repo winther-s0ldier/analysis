@@ -8,13 +8,9 @@ load_dotenv(dotenv_path=env_path)
 
 api_key = os.getenv("GEMINI_API_KEY")
 if api_key:
-<<<<<<< HEAD
     # Strip quotes if present
-    os.environ["OPENAI_API_KEY"] = api_key.strip('"\'')
-    print(f"INFO: OpenAI API Key loaded: {api_key[:4]}...")
-=======
+    os.environ["GEMINI_API_KEY"] = api_key.strip('"\'')
     print(f"INFO: Gemini API Key loaded: {api_key[:4]}...")
->>>>>>> 579f7d57b9da95b1bfd3c4b1022131f2d3830b99
 else:
     print("WARNING: Gemini API Key NOT found in environment!")
 

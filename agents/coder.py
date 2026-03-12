@@ -49,15 +49,7 @@ def get_coder_agent():
                 "Every function MUST be named `analyze` and accept only `csv_path: str`:\n"
                 "```python\n"
                 "def analyze(csv_path: str) -> dict:\n"
-<<<<<<< HEAD
                 "    # Your code here\n"
-=======
-                "    return run_funnel_analysis(\n"
-                "        csv_path=csv_path,\n"
-                "        entity_col='user_id',\n"
-                "        event_col='event_name',\n"
-                "        time_col='timestamp',\n"
-                "    )\n"
                 "```\n\n"
 
                 "## AVAILABLE LIBRARY FUNCTIONS (use these first)\n"
@@ -88,7 +80,6 @@ def get_coder_agent():
                 "import pandas as pd\n"
                 "import numpy as np\n\n"
                 "def analyze(csv_path: str) -> dict:\n"
->>>>>>> 579f7d57b9da95b1bfd3c4b1022131f2d3830b99
                 "    return {\n"
                 "        'status': 'success',\n"
                 "        'analysis_type': '<type>',\n"
