@@ -1,0 +1,13 @@
+{
+  "event_log": {
+    "fingerprint": {
+      "user_uuid": "object",
+      "event_name": "object",
+      "category": "object",
+      "event_time": "object"
+    },
+    "hash": "b669860d7e82dd7f",
+    "last_successful_run": "2026-03-12T04:04:28.712046",
+    "csv_path": "Z:\\ADK\\uploads\\Commuter_Users_Event_data_2f9392_normalized.csv"
+  }
+}

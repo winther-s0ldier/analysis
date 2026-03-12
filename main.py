@@ -8,9 +8,18 @@ load_dotenv(dotenv_path=env_path)
 
 api_key = os.getenv("OPENAI_API_KEY")
 if api_key:
+    # Strip quotes if present
+    os.environ["OPENAI_API_KEY"] = api_key.strip('"\'')
     print(f"INFO: OpenAI API Key loaded: {api_key[:4]}...")
 else:
     print("WARNING: OpenAI API Key NOT found in environment!")
+
+gemini_key = os.getenv("GOOGLE_API_KEY")
+if gemini_key:
+    os.environ["GOOGLE_API_KEY"] = gemini_key.strip('"\'')
+    print(f"INFO: Google API Key loaded: {gemini_key[:4]}...")
+else:
+    print("WARNING: Google API Key NOT found in environment!")
 
 import uuid
 import json
@@ -74,10 +83,11 @@ class SessionState:
         self.discovery: dict = {}
         
         self.results: dict = {}
+        self.failed_nodes: set = set()   # node IDs where status=error
         self.precomputed: dict = {}
         self.synthesis: dict = {}
         self.artifacts: list = []
-        
+
         self.message_log: list = []
         self.normalization: dict = {}
 
@@ -94,6 +104,8 @@ class SessionState:
     
     def store_result(self, analysis_id: str, result: dict) -> None:
         self.results[analysis_id] = result
+        if isinstance(result, dict) and result.get("status") == "error":
+            self.failed_nodes.add(analysis_id)
     
     def get_result(self, analysis_id: str) -> dict | None:
         return self.results.get(analysis_id)
@@ -129,6 +141,7 @@ async def run_agent_pipeline(
     prompt: str,
     agent_getter: str = "root",
     max_turns: int = 15,
+    image_paths: List[str] = None,
 ) -> str:
     """Run an agent with a user message and return the response.
 
@@ -138,6 +151,7 @@ async def run_agent_pipeline(
         agent_getter: Which agent to use.
         max_turns: Maximum number of LLM round-trips before
             giving up. Prevents small models from looping forever.
+        image_paths: Optional list of local file paths to images.
     """
     APP_NAME = "Analytics_analytics"
     USER_ID = "user_1"
@@ -169,9 +183,29 @@ async def run_agent_pipeline(
         session_service=session_service,
     )
 
+    parts = [types.Part.from_text(text=prompt)]
+    if image_paths:
+        for img_path in image_paths:
+            if os.path.exists(img_path):
+                try:
+                    with open(img_path, "rb") as f:
+                        img_bytes = f.read()
+                    
+                    mime_type = "image/png"
+                    if img_path.lower().endswith(".html"):
+                        continue
+                    elif img_path.lower().endswith(".jpg") or img_path.lower().endswith(".jpeg"):
+                        mime_type = "image/jpeg"
+                        
+                    parts.append(
+                        types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
+                    )
+                except Exception as e:
+                    print(f"WARNING: Could not load image {img_path}: {e}")
+
     content = types.Content(
         role="user",
-        parts=[types.Part.from_text(text=prompt)]
+        parts=parts
     )
 
     max_retries = 3
@@ -301,6 +335,17 @@ async def upload_csv(file: UploadFile = File(...)):
 
     csv_path = norm_result["csv_path"]
 
+    # --- Pre-Flight Data Quality Gate ---
+    from tools.data_gate import run_preflight_check
+    dataset_type = norm_result["original_filename"].split(".")[0]
+    gate_result = run_preflight_check(csv_path, dataset_type)
+
+    if gate_result["gate_result"] == "block":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Data Quality Gate BLOCKED the file:\n" + "\n".join(gate_result["errors"])
+        )
+
     (OUTPUT_DIR / output_folder).mkdir(exist_ok=True)
 
     state = SessionState(session_id)
@@ -310,19 +355,21 @@ async def upload_csv(file: UploadFile = File(...)):
     state.normalization = {
         "original_filename": norm_result["original_filename"],
         "original_format":   norm_result["original_format"],
-        "warnings":          norm_result["warnings"],
-        "row_count":         norm_result["row_count"],
-        "col_count":         norm_result["col_count"],
+        "warnings":          norm_result["warnings"] + gate_result["warnings"],
+        "row_count":         gate_result["row_count"],
+        "col_count":         gate_result["col_count"],
     }
+    state.gate_result = gate_result
     sessions[session_id] = state
 
     return {
         "session_id":   session_id,
         "filename":     norm_result["original_filename"],
         "format":       norm_result["original_format"],
-        "rows":         norm_result["row_count"],
-        "columns":      norm_result["col_count"],
-        "warnings":     norm_result["warnings"],
+        "rows":         gate_result["row_count"],
+        "columns":      gate_result["col_count"],
+        "Gate":         gate_result["gate_result"],
+        "warnings":     state.normalization["warnings"],
         "status":       "uploaded",
     }
 
@@ -630,13 +677,23 @@ async def get_status(session_id: str):
             status_code=404,
             detail="Session not found"
         )
-    pipeline_status = get_pipeline_status(
-        session_id
-    )
+    # Build inline — calling get_pipeline_status() without await returns a coroutine, not data
+    node_statuses = {}
+    failed = getattr(state, "failed_nodes", set())
+    if hasattr(state, "dag") and state.dag:
+        for node in state.dag:
+            nid = node.get("id", "")
+            if nid in failed:
+                node_statuses[nid] = "failed"
+            elif nid in state.results:
+                node_statuses[nid] = "complete"
+            else:
+                node_statuses[nid] = "pending"
+
     return {
         "session_id":     session_id,
         "session_status": state.status,
-        "pipeline":       pipeline_status,
+        "pipeline":       {"node_statuses": node_statuses},
         "result_count":   len(state.results),
         "has_synthesis":  bool(state.synthesis),
         "has_report": any(
@@ -884,6 +941,73 @@ async def list_sessions():
             for sid, info in sessions.items()
         ]
     }
+
+
+@app.get("/api/session/{session_id}/status")
+async def get_pipeline_status(session_id: str):
+    """
+    Returns real-time pipeline status for the frontend grid panel.
+    Includes node pass/fail states, gate results, and monitor alerts.
+    """
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    from tools.monitor import get_session_events
+    raw_events = get_session_events(session_id, min_severity="warning")
+    
+    events = []
+    for e in raw_events:
+        events.append({
+            "event": e.get("type", "unknown"),
+            "data": e.get("payload", {})
+        })
+    
+    node_status_list = []
+    if hasattr(state, "dag") and state.dag:
+        for node in state.dag:
+            nid = node["id"]
+            if nid in state.results:
+                status = "success"
+                error = ""
+            elif hasattr(state, "failed_nodes") and nid in state.failed_nodes:
+                status = "failed"
+                error = "Execution failed"
+            else:
+                status = "pending"
+                error = ""
+                
+            node_status_list.append({
+                "id": nid,
+                "type": node.get("analysis_type", "unknown"),
+                "status": status,
+                "error": error
+            })
+            
+    import json as _json
+
+    raw_response = {
+        "session_id": session_id,
+        "pipeline_status": state.status,
+        "gate_result": getattr(state, "gate_result", {}),
+        "alerts": events,
+        "nodes": node_status_list,
+    }
+
+    # Sanitize the entire response in one pass — catches numpy.float64, datetime,
+    # coroutine objects, or any other non-JSON-serializable type via default=str.
+    try:
+        return _json.loads(_json.dumps(raw_response, default=str))
+    except Exception as _e:
+        # Absolute fallback — return minimal safe response
+        return {
+            "session_id": session_id,
+            "pipeline_status": state.status,
+            "gate_result": {},
+            "alerts": [],
+            "nodes": [],
+        }
+
 
 
 def _get_file_type(filename: str) -> str:

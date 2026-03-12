@@ -79,6 +79,12 @@ async def run_full_pipeline(
     
     print(f"INFO: run_full_pipeline session found: {session_id}")
     print(f"INFO: session status before: {state.status}")
+    
+    # --- Phase 3 / Group D: Inject custom external analyses into registry
+    from tools.analysis_library import LIBRARY_REGISTRY
+    from tools.workflow_loader import register_custom_analyses
+    register_custom_analyses(LIBRARY_REGISTRY)
+    
     """
     Run the complete analysis pipeline for a session.
 
@@ -161,13 +167,38 @@ async def run_full_pipeline(
             profiler_data, csv_path
         )
 
+        # Load policy and build context for Discovery agent
+        try:
+            from tools.data_policy import get_active_policy, build_policy_context_for_discovery
+            active_policy = get_active_policy()
+            
+            # --- Group D: Workflow Overrides ---
+            from tools.workflow_loader import get_dataset_profile
+            wf_profile = get_dataset_profile(state.dataset_type)
+            if wf_profile:
+                if "force_analyses" in wf_profile:
+                    active_policy["required_analyses"] = wf_profile["force_analyses"]
+                if "exclude_analyses" in wf_profile:
+                    active_policy["excluded_analyses"] = wf_profile["exclude_analyses"]
+                if "max_nodes" in wf_profile:
+                    active_policy["max_nodes"] = wf_profile["max_nodes"]
+
+            classification = profiler_data.get("classification", {})
+            col_roles_for_policy = classification.get("column_roles", {})
+            policy_context = build_policy_context_for_discovery(active_policy, col_roles_for_policy)
+        except Exception as e:
+            print(f"Policy load Error: {e}")
+            active_policy = {}
+            policy_context = ""
+
         discovery_prompt = (
             f"Session ID: {session_id}\n"
             f"CSV file path: {csv_path}\n"
             f"Output folder: {output_folder}\n\n"
             f"PROFILER OUTPUT:\n{profile_summary}\n\n"
+            + (f"{policy_context}\n\n" if policy_context else "") +
             f"INSTRUCTIONS:\n"
-            f"1. Reason about the data and the user's request.\n"
+            f"1. Reason about the data and the policy context above.\n"
             f"2. Construct a JSON DAG of MetricSpec nodes (id, name, analysis_type, library_function, column_roles, depends_on).\n"
             f"3. Call tool_submit_analysis_plan(session_id, dag_json_str) with your JSON result.\n"
         )
@@ -189,6 +220,22 @@ async def run_full_pipeline(
 
         dag  = plan["dag"]
         state.dag = dag
+
+        # Apply active policy to filter/prioritise/cap the DAG
+        # Explicit bool + parentheses prevents Python and/or precedence bug
+        _should_apply_policy = bool(active_policy) and (
+            active_policy.get("focus", "none") != "none"
+            or bool(active_policy.get("excluded_analyses"))
+            or bool(active_policy.get("required_analyses"))
+            or active_policy.get("max_nodes", 10) < len(dag)
+        )
+        if _should_apply_policy:
+            try:
+                from tools.data_policy import apply_policy_to_dag
+                dag = apply_policy_to_dag(dag, active_policy, col_roles_for_policy)
+                print(f"[Policy] DAG after policy: {len(dag)} nodes")
+            except Exception as policy_err:
+                print(f"[Policy] apply_policy_to_dag failed (non-fatal): {policy_err}")
 
         if approved_metrics:
             dag = [
@@ -218,6 +265,9 @@ async def run_full_pipeline(
             run_agent_pipeline=run_agent_pipeline,
         )
 
+        from tools.monitor import check_failure_threshold
+        check_failure_threshold(session_id, results["total"], len(results["failed"]))
+
         _rich_results = []
         for _nid, _res in state.results.items():
             _rich_results.append({
@@ -229,7 +279,22 @@ async def run_full_pipeline(
                 "data":           _res.get("data", {}),
                 "insight_summary": _res.get("insight_summary", {}),
             })
-        _rich_summary = json.dumps(_rich_results, indent=2) if _rich_results else "[]"
+        import math
+        def _clean_data(obj):
+            if isinstance(obj, dict):
+                return {k: _clean_data(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_clean_data(x) for x in obj]
+            elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+            elif hasattr(obj, "item"): # Handle numpy types
+                return _clean_data(obj.item())
+            elif isinstance(obj, (bool, int, float, str)) or obj is None:
+                return obj
+            else:
+                return str(obj)
+
+        _rich_summary = json.dumps(_clean_data(_rich_results), indent=2) if _rich_results else "[]"
 
         synthesis_prompt = (
             f"Session ID: {session_id}\n"
@@ -240,20 +305,42 @@ async def run_full_pipeline(
             f"INSTRUCTIONS:\n"
             f"1. Call tool_aggregate_results(session_id) to also get column_roles context.\n"
             f"2. Reason across ALL findings above — cite analysis_id and specific numbers in every insight.\n"
-            f"3. Build the required JSON schema and call tool_submit_synthesis(session_id, synthesis_json_str)."
+            f"3. Look closely at the provided chart images. Describe visual trends natively (e.g. drop-offs, clusters) in your analysis.\n"
+            f"4. Build the required JSON schema and call tool_submit_synthesis(session_id, synthesis_json_str)."
         )
+
+        image_paths = []
+        for _res in state.results.values():
+            chart_path = _res.get("chart_file_path")
+            if chart_path:
+                png_path = chart_path.replace(".html", ".png")
+                if os.path.exists(png_path):
+                    image_paths.append(png_path)
 
         try:
             await run_agent_pipeline(
                 f"{session_id}_synthesis",
                 synthesis_prompt,
                 agent_getter="synthesis",
+                image_paths=image_paths,
             )
         except Exception as e:
             msg = f"ERROR: Synthesis agent failed for session {session_id}: {e}"
             print(msg)
             logging.error(msg)
 
+        # Wait for state.synthesis to be populated before building the report.
+        # The synthesis LLM may need 2 turns (first call fails, retries succeed),
+        # and run_agent_pipeline returns after the first final response — which may
+        # be the failed call. This poll ensures we capture the successful retry.
+        _synthesis_wait_secs = 0
+        while not bool(state.synthesis) and _synthesis_wait_secs < 8:
+            await asyncio.sleep(0.5)
+            _synthesis_wait_secs += 0.5
+        if bool(state.synthesis):
+            print(f"INFO: Synthesis ready after {_synthesis_wait_secs}s wait.")
+        else:
+            print("WARNING: Synthesis not stored after 8s wait — report will have no insights.")
 
         _update_session_status(
             state, "building_report"
@@ -283,6 +370,13 @@ async def run_full_pipeline(
         ) if report else None
 
         _update_session_status(state, "complete")
+        
+        # Group A: Register the schema fingerprint so drift detection works on next run
+        try:
+            from tools.data_gate import register_schema
+            register_schema(csv_path, state.dataset_type or None)
+        except Exception as _rs_err:
+            print(f"[DataGate] register_schema non-fatal: {_rs_err}")
 
         _post_message(
             state, "orchestrator", "frontend",
@@ -351,6 +445,9 @@ async def _execute_dag(
         node = pipeline.nodes[node_id]
         pipeline.mark_running(node_id)
         
+        from tools.monitor import emit
+        emit(session_id, "node_started", {"node_id": node_id, "analysis_type": node.get("analysis_type")})
+        
         result = await _execute_single_node(
             session_id=session_id,
             node=node,
@@ -367,6 +464,9 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id}: chart={result.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
+            
+            emit(session_id, "node_succeeded", {"node_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path'))})
+            
             _post_message(
                 state, "coder_agent", "orchestrator",
                 Intent.ANALYSIS_COMPLETE, session_id,
@@ -384,10 +484,21 @@ async def _execute_dag(
                f"error={last_error}")
         print(msg)
         logging.error(msg)
+        emit(session_id, "node_failed_retry_pending", {"node_id": node_id, "error": last_error})
+
+        # ── Stage 4: Self-Correction Hook ──────────────────────────────────
+        # Before blind retry, attempt to auto-correct column role mismatches.
+        # Detects TypeError / KeyError patterns and rewrites column_roles
+        # using the LIBRARY_REGISTRY schema — zero extra LLM calls needed.
+        corrected_node = _attempt_column_role_correction(node, last_error)
+        if corrected_node is not node:
+            print(f"[Self-Correction] Node {node_id}: column_roles auto-corrected. Retrying with fixed roles.")
+            logging.info(f"[Self-Correction] {node_id}: corrected column_roles={corrected_node.get('column_roles')}")
+        # ───────────────────────────────────────────────────────────────────
 
         retry = await _execute_single_node(
             session_id=session_id,
-            node=node,
+            node=corrected_node,
             csv_path=csv_path,
             output_folder=output_folder,
             state=state,
@@ -402,6 +513,9 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id} (retry): chart={retry.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
+            
+            emit(session_id, "node_succeeded", {"node_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path'))})
+            
             _post_message(
                 state, "coder_agent", "orchestrator",
                 Intent.ANALYSIS_COMPLETE, session_id,
@@ -421,6 +535,9 @@ async def _execute_dag(
                    f"error={retry.get('error', 'no error field')}")
             print(msg)
             logging.error(msg)
+            
+            emit(session_id, "node_failed", {"node_id": node_id, "error": retry.get('error', 'no error field')}, severity="error")
+            
             pipeline.mark_failed(node_id)
             failed.add(node_id)
             for other_node in dag:
@@ -525,7 +642,7 @@ async def _execute_single_node(
             f"Analysis ID: {analysis_id}\n"
             f"Analysis Type: {analysis_type}\n"
             f"CSV Path: {effective_csv}\n"
-            f"Column Roles: {json.dumps(column_roles)}\n"
+            f"Column Roles: {json.dumps(column_roles, default=str)}\n"
             f"Description: {description}\n"
             + (f"Library Function: {library_fn}\n" if library_fn else "") +
             (f"PREVIOUS ERROR: {last_error}\n" if last_error else "") +
@@ -615,6 +732,82 @@ def _build_library_call_code(analysis_type: str, column_roles: dict) -> str:
     return code
 
 
+def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
+    """
+    Stage 4: Self-Correction Engine.
+
+    Detects column_roles argument mismatches from error messages and
+    auto-corrects the node's column_roles using the LIBRARY_REGISTRY schema.
+
+    Patterns handled:
+    - TypeError: missing required argument 'col' / 'entity_col' / etc.
+    - TypeError: got an unexpected keyword argument 'target_col'
+    - KeyError: 'column_name' (column not in DataFrame)
+
+    Returns a corrected node dict (copy) if a fix was found,
+    or the original node object if no correction could be determined.
+    """
+    import copy, re
+
+    analysis_type = node.get("analysis_type", "")
+    column_roles = node.get("column_roles", {})
+    entry = LIBRARY_REGISTRY.get(analysis_type, {})
+    required_args = [a for a in entry.get("required_args", []) if a != "csv_path"]
+
+    if not required_args or not error_str:
+        return node
+
+    corrected_roles = dict(column_roles)
+    fix_applied = False
+
+    # Pattern 1: Missing required argument (TypeError: missing required argument 'X')
+    missing_match = re.search(
+        r"missing\s+(?:required\s+)?(?:keyword\s+)?argument[:\s'\"]+([a-z_]+)", error_str, re.IGNORECASE
+    )
+    if missing_match:
+        missing_arg = missing_match.group(1)
+        if missing_arg in required_args and missing_arg not in corrected_roles:
+            # Try to infer the value from existing column_roles
+            # Check if there's a value that matches a similar semantic role
+            existing_values = list(corrected_roles.values())
+            if existing_values:
+                corrected_roles[missing_arg] = existing_values[0]
+                fix_applied = True
+                print(f"[Self-Correction] Fixed missing arg '{missing_arg}' → '{existing_values[0]}'")
+
+    # Pattern 2: Unexpected keyword argument (wrong role key name)
+    unexpected_match = re.search(
+        r"unexpected\s+keyword\s+argument[:\s'\"]+([a-z_]+)", error_str, re.IGNORECASE
+    )
+    if unexpected_match:
+        bad_key = unexpected_match.group(1)
+        if bad_key in corrected_roles:
+            value = corrected_roles.pop(bad_key)
+            # Assign to the first missing required_arg
+            for req_arg in required_args:
+                if req_arg not in corrected_roles:
+                    corrected_roles[req_arg] = value
+                    fix_applied = True
+                    print(f"[Self-Correction] Remapped '{bad_key}' → '{req_arg}' = '{value}'")
+                    break
+
+    # Pattern 3: Ensure all required args are present (fill from existing values)
+    for req_arg in required_args:
+        if req_arg not in corrected_roles or not corrected_roles[req_arg]:
+            existing_values = [v for v in corrected_roles.values() if v]
+            if existing_values:
+                corrected_roles[req_arg] = existing_values[0]
+                fix_applied = True
+                print(f"[Self-Correction] Filled missing key '{req_arg}' with '{existing_values[0]}'")
+
+    if not fix_applied:
+        return node
+
+    corrected = copy.deepcopy(node)
+    corrected["column_roles"] = corrected_roles
+    return corrected
+
+
 def _update_session_status(state, status: str):
     """Update session state status."""
     try:
@@ -667,9 +860,9 @@ def _build_profile_summary(
         f"dataset_type: {dataset_type}\n"
         f"row_count: {row_count}\n"
         f"col_count: {col_count}\n"
-        f"column_roles: {json.dumps(column_roles)}\n"
+        f"column_roles: {json.dumps(column_roles, default=str)}\n"
         f"recommended_analyses: "
-        f"{json.dumps(recommended)}\n"
+        f"{json.dumps(recommended, default=str)}\n"
         f"csv_path: {csv_path}\n"
     )
 

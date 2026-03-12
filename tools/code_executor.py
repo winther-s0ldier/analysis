@@ -707,6 +707,9 @@ def generate_chart(
                 )
 
         if fig is None:
+            print(f"WARNING: generate_chart — no handler for chart_type='{chart_type}' "
+                  f"(analysis_id={analysis_id}, analysis_type={analysis_type}). "
+                  f"Add a branch in code_executor.generate_chart() for this type.")
             return None
 
         a_title = str(analysis_type or "Analysis").replace('_', ' ').title()
@@ -720,7 +723,15 @@ def generate_chart(
         chart_path = os.path.join(output_folder, chart_filename)
         fig.write_html(chart_path)
 
+        try:
+            png_path = chart_path.replace(".html", ".png")
+            fig.write_image(png_path)
+        except Exception as img_e:
+            print(f"DEBUG: Could not generate PNG chart (Kaleido/Orca may be missing): {img_e}")
+
         return chart_path
 
-    except Exception:
+    except Exception as chart_exc:
+        print(f"ERROR: generate_chart crashed for {analysis_id} ({analysis_type}): "
+              f"{type(chart_exc).__name__}: {chart_exc}\n{traceback.format_exc()[-600:]}")
         return None

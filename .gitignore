@@ -12,9 +12,14 @@ output/
 outputs/
 uploads/
 *.log
+data/log/
+
+# Test data files
+test_data*.csv
 
 # OS
 .DS_Store
 Thumbs.db
 nul
 null
+data/log/cleaning/ARCHITECTURE.md

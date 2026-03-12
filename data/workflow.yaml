@@ -1,0 +1,28 @@
+# Declarative Workflow Definition
+# Place this file in the `data/` directory to customize pipeline behavior without writing code.
+
+# 1. Custom Analyses
+# Register your own Python scripts as new pipeline modules.
+custom_analyses:
+  # Example:
+  # - name: "my_custom_metric"
+  #   description: "Calculates a bespoke metric for our internal dashboard."
+  #   col_role: "category_and_value"
+  #   required_args: ["csv_path", "group_col", "value_col"]
+  #   script_path: "scripts/my_custom_metric.py"
+  #   function_name: "run_my_metric"
+
+# 2. Dataset Profiles
+# Force or exclude specific analyses based on the Profiler's inferred dataset_type.
+# This acts as an override layer on top of the Discovery agent's dynamic reasoning.
+dataset_profiles:
+  ecommerce_orders:
+    force_analyses: ["contribution_analysis", "pareto_analysis"]
+    exclude_analyses: ["event_taxonomy"]
+    max_nodes: 8
+
+  # Example:
+  # b2b_saas_events:
+  #   force_analyses: ["session_detection", "funnel_analysis", "survival_analysis"]
+  #   exclude_analyses: []
+  #   max_nodes: 10

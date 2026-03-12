@@ -35,7 +35,23 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
             dataset_type = getattr(state, "dataset_type", "")
             csv_filename = getattr(state, "csv_filename", "")
             synthesis = getattr(state, "synthesis", {}) or {}
+
+            # Fallback: also check _synthesis_store directly in case state.synthesis
+            # wasn't populated yet due to timing between synthesis agent and dag_builder
+            if not synthesis:
+                try:
+                    from agents.synthesis import get_synthesis_result
+                    stored = get_synthesis_result(session_id)
+                    if stored:
+                        synthesis = stored
+                        state.synthesis = stored   # backfill for consistency
+                        print(f"INFO: dag_builder recovered synthesis from _synthesis_store for {session_id}")
+                except Exception:
+                    pass
+
             for aid, result in state.results.items():
+                if not isinstance(result, dict):
+                    continue
                 chart_path = result.get("chart_file_path")
                 if chart_path and os.path.exists(chart_path):
                     charts.append({
@@ -45,8 +61,11 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
                         "top_finding": result.get("top_finding", ""),
                         "severity": result.get("severity", "info"),
                         "confidence": result.get("confidence", 0.0),
+                        "narrative": result.get("data", {}).get("narrative", {}),
                     })
-    except Exception: pass
+    except Exception as e:
+        print(f"WARNING: dag_builder state read failed: {e}")
+        pass
 
     if os.path.exists(output_folder):
         for fname in os.listdir(output_folder):
@@ -217,6 +236,8 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         a_type = c.get("analysis_type", "").replace("_", " ").title()
         sev = c.get("severity", "info")
         html_content = c.get("_embedded_html", "")
+        narrative = c.get("narrative", {})
+        top_finding = c.get("top_finding", "")
         safe_html = (
             html_content
             .replace("&", "&amp;")
@@ -224,10 +245,50 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             .replace("<", "&lt;")
             .replace(">", "&gt;")
         )
+
+        # Build the narrative block
+        what_it_means = narrative.get("what_it_means", "")
+        proposed_fix = narrative.get("proposed_fix", "")
+        narr_severity = narrative.get("severity", sev)
+        if narr_severity not in ["critical", "high", "medium", "low", "info"]:
+            narr_severity = "info"
+
+        narrative_html = ""
+        if what_it_means or proposed_fix:
+            narrative_html = (
+                f'<div class="narrative-block">'
+                f'<div class="narrative-what">'
+                f'<span class="narrative-icon">&#128269;</span>'
+                f'<strong>WHAT IT MEANS</strong>'
+                f'<p>{what_it_means}</p>'
+                f'</div>'
+                + (
+                    f'<div class="narrative-fix">'
+                    f'<span class="narrative-icon">&#9889;</span>'
+                    f'<strong>PROPOSED FIX</strong>'
+                    f'<span class="badge {narr_severity}" style="float:right;margin-top:-2px">{narr_severity.upper()}</span>'
+                    f'<p>{proposed_fix}</p>'
+                    f'</div>'
+                    if proposed_fix else ""
+                )
+                + f'</div>'
+            )
+        elif top_finding:
+            narrative_html = (
+                f'<div class="narrative-block">'
+                f'<div class="narrative-what">'
+                f'<span class="narrative-icon">&#128269;</span>'
+                f'<strong>KEY FINDING</strong>'
+                f'<p>{top_finding}</p>'
+                f'</div>'
+                f'</div>'
+            )
+
         ch_chunks.append(
             f'<div class="chart-container">'
             f'<div class="chart-header"><span>{a_type}</span><span class="badge {sev}">{sev}</span></div>'
             f'<iframe srcdoc="{safe_html}" width="100%" height="500" frameborder="0"></iframe>'
+            + narrative_html +
             f'</div>'
         )
     ch_h = "".join(ch_chunks)
@@ -239,36 +300,52 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             import markdown
             conv_h = markdown.markdown(conv_rep, extensions=['tables'])
         except ImportError:
-            conv_h = f'<div style="white-space: pre-wrap; font-family: monospace; background:
+            conv_h = f'<div style="white-space: pre-wrap; font-family: monospace; background: #fff; padding: 15px; border-radius: 8px;">{conv_rep}</div>'
     else:
         conv_h = ""
 
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>{title}</title>
     <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; background:
-        .header {{ background:
+        body {{ font-family: system-ui, -apple-system, sans-serif; background: #f5f6fa; color: #333; }}
+        .header {{ background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
         .section {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
-        h2 {{ border-bottom: 2px solid
-        .insight-block {{ background:
+        h2 {{ border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0; }}
+        .insight-block {{ background: #f8f9fa; border-left: 4px solid #3498db; padding: 10px 15px; margin-bottom: 10px; border-radius: 4px; }}
         .insight-block p {{ margin: 5px 0 0 0; }}
         .badge {{ padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; }}
-        .critical {{ color:
-        .high {{ color:
-        .medium {{ color:
-        .low {{ color:
-        .info {{ color:
-        .strategy-card {{ border: 1px solid
-        .strat-header {{ padding: 12px; font-weight: bold; background:
+        .critical {{ color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; }}
+        .high {{ color: #856404; background-color: #fff3cd; border: 1px solid #ffeeba; }}
+        .medium {{ color: #004085; background-color: #cce5ff; border: 1px solid #b8daff; }}
+        .low {{ color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb; }}
+        .info {{ color: #383d41; background-color: #e2e3e5; border: 1px solid #d6d8db; }}
+        .strategy-card {{ border: 1px solid #eee; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
+        .strat-header {{ padding: 12px; font-weight: bold; background: #fafafa; border-bottom: 1px solid #eee; }}
         .strat-body {{ padding: 15px; }}
         .persona-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }}
-        .persona-card {{ border: 1px solid
-        .chart-container {{ border: 1px solid
-        .chart-header {{ background:
+        .persona-card {{ border: 1px solid #eee; border-radius: 6px; padding: 15px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
+        .chart-container {{ border: 1px solid #ddd; border-radius: 8px; margin-bottom: 20px; overflow: hidden; background: white; }}
+        .chart-header {{ background: #f8f9fa; padding: 10px 15px; font-weight: 600; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }}
         /* Markdown generated table styles */
-        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem; color:
-        th, td {{ padding: 0.75rem; vertical-align: top; border-top: 1px solid
-        thead th {{ vertical-align: bottom; border-bottom: 2px solid
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem; color: #212529; }}
+        th, td {{ padding: 0.75rem; vertical-align: top; border-top: 1px solid #dee2e6; }}
+        thead th {{ vertical-align: bottom; border-bottom: 2px solid #dee2e6; }}
         tbody tr:nth-of-type(odd) {{ background-color: rgba(0,0,0,.05); }}
+        /* Narrative blocks */
+        .narrative-block {{ margin-top: 0; border-top: 1px solid #eee; display: flex; gap: 0; }}
+        .narrative-what {{
+            flex: 1; padding: 14px 18px; background: #f0f4ff;
+            border-left: 4px solid #3498db;
+        }}
+        .narrative-fix {{
+            flex: 1; padding: 14px 18px; background: #fff9f0;
+            border-left: 4px solid #e67e22;
+        }}
+        .narrative-what strong, .narrative-fix strong {{
+            display: block; font-size: 11px; letter-spacing: .05em;
+            text-transform: uppercase; color: #666; margin-bottom: 6px;
+        }}
+        .narrative-what p, .narrative-fix p {{ margin: 0; font-size: 13px; line-height: 1.55; }}
+        .narrative-icon {{ margin-right: 5px; }}
     </style></head><body>
     <div class="header"><h1 style="margin:0 0 10px 0;">{title}</h1><p style="margin:0;opacity:0.8;">Dataset: {dataset_type} | Generated: {generated}</p></div>
     {get_sect("conversational_report", conv_h)}
@@ -292,8 +369,37 @@ def get_dag_builder_agent():
         _dag_builder_instance = Agent(
             name="dag_builder_agent",
             model=get_model("dag_builder"),
-            description="Report assembly specialist. Pure formatting.",
-            instruction="You are a report assembly specialist. Your ONLY job is to call tool_build_report(session_id, output_folder) and return the result.",
+            description="Report assembly specialist. Collects charts and synthesis narrative, assembles the final standalone HTML report.",
+            instruction=(
+                "You are the Report Assembly Specialist — the final agent in the analytics pipeline. "
+                "Your SOLE responsibility is to call one tool correctly and return the result. "
+                "You do NOT interpret data. You do NOT write insights. You do NOT modify any analysis results. "
+                "You are a PURE FORMATTER.\n\n"
+
+                "## WORKFLOW\n"
+                "1. Receive `session_id` and `output_folder` from the Orchestrator.\n"
+                "2. Call `tool_build_report(session_id, output_folder)` ONCE.\n"
+                "3. Return the result from the tool call verbatim. Your job is done.\n\n"
+
+                "## WHAT tool_build_report DOES (for your awareness — do NOT replicate manually)\n"
+                "- Reads all `AnalysisResult` objects from session state\n"
+                "- Collects all `.html` chart files from `output_folder`\n"
+                "- Reads the `synthesis` dict from session state\n"
+                "- Assembles a standalone `report.html` with all charts embedded as iframes\n"
+                "- Writes `synthesis.json` alongside the report\n"
+                "- Posts a REPORT_READY A2A message to the Orchestrator\n\n"
+
+                "## DO's\n"
+                "- DO call `tool_build_report(session_id, output_folder)` immediately with the exact arguments provided.\n"
+                "- DO return the tool result to the Orchestrator as-is.\n"
+                "- DO call the tool even if you suspect synthesis is empty — the tool handles missing synthesis gracefully.\n\n"
+
+                "## DON'Ts\n"
+                "- DON'T attempt to read files manually, construct HTML yourself, or call any other functions.\n"
+                "- DON'T call `tool_build_report` more than once — it is idempotent but wasteful.\n"
+                "- DON'T wait for additional data or request clarification — if session_id and output_folder are provided, act immediately.\n"
+                "- DON'T output any text after the tool call — the tool return value is your complete response.\n"
+            ),
             tools=[tool_build_report],
         )
     return _dag_builder_instance

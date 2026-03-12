@@ -12,6 +12,15 @@ const chatContainer = $('#chat-container');
 const welcomeState = $('#welcome-state');
 const chatInput = $('#chat-input');
 const sendBtn = $('#send-btn');
+
+// Pipeline Status Panel Elements
+const statusPanel = $('#pipeline-status-panel');
+const panelStatusBadge = $('#panel-status-badge');
+const panelGateWarnings = $('#panel-gate-warnings');
+const gateWarningsList = $('#gate-warnings-list');
+const panelMonitorAlerts = $('#panel-monitor-alerts');
+const monitorAlertsList = $('#monitor-alerts-list');
+const statusNodeGrid = $('#node-grid');
 const attachBtn = $('#attach-btn');
 const fileInput = $('#file-input');
 const fileAttach = $('#file-attach');
@@ -178,6 +187,15 @@ async function runAnalysis() {
     updateStage(4, 'active');
     const statusEl = addStatusMessage('Running analysis pipeline...');
     renderedCharts.clear();
+    
+    if (statusPanel) {
+        statusPanel.classList.remove('hidden');
+        statusNodeGrid.innerHTML = '';
+        gateWarningsList.innerHTML = '';
+        monitorAlertsList.innerHTML = '';
+        panelGateWarnings.classList.add('hidden');
+        panelMonitorAlerts.classList.add('hidden');
+    }
 
     fetch(`/analyze/${sessionId}`, {
         method: 'POST',
@@ -204,6 +222,7 @@ async function runAnalysis() {
             updateStageFromStatus(status);
             updateMetricCards(status.pipeline?.node_statuses || {});
             await renderNewCharts();
+            await updatePipelineStatusPanel();
 
             if (status.session_status === 'complete') {
                 clearInterval(pollInterval);
@@ -226,6 +245,52 @@ function updateStageFromStatus(status) {
     for (let i = 1; i <= 6; i++) {
         if (i <= 3 || i < active) updateStage(i, 'complete');
         else if (i === active) updateStage(i, 'active');
+    }
+}
+
+async function updatePipelineStatusPanel() {
+    if (!statusPanel) return;
+    try {
+        const res = await fetch(`/api/session/${sessionId}/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        
+        // Update badge
+        panelStatusBadge.textContent = (data.pipeline_status || 'UNKNOWN').toUpperCase();
+        if (data.pipeline_status === 'complete') {
+            panelStatusBadge.className = 'badge success';
+        } else if (data.pipeline_status === 'error') {
+            panelStatusBadge.className = 'badge critical';
+        } else {
+            panelStatusBadge.className = 'badge info';
+        }
+        
+        // Update nodes grid
+        if (data.nodes && data.nodes.length > 0) {
+            statusNodeGrid.innerHTML = data.nodes.map(n => `
+                <div class="grid-node" data-status="${n.status}">
+                    <div class="grid-node-id">${n.id}</div>
+                    <div class="grid-node-type" title="${n.type}">${n.type.replace(/_/g, ' ')}</div>
+                </div>
+            `).join('');
+        }
+        
+        // Update Gate Warnings (once available from API if they exist)
+        const warnings = data.gate_result?.warnings || [];
+        if (warnings.length > 0) {
+            panelGateWarnings.classList.remove('hidden');
+            gateWarningsList.innerHTML = warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('');
+        }
+        
+        // Update Monitor Alerts
+        const alerts = data.alerts || [];
+        if (alerts.length > 0) {
+            panelMonitorAlerts.classList.remove('hidden');
+            monitorAlertsList.innerHTML = alerts.map(a => `<li>[${a.event}] ${escapeHtml(JSON.stringify(a.data))}</li>`).join('');
+        }
+        
+    } catch (e) {
+        console.error('Failed to update pipeline panel', e);
     }
 }
 

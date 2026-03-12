@@ -108,6 +108,30 @@
 
 
     <main class="chat-main">
+        
+        <!-- --- NEW: Pipeline Status Panel --- -->
+        <div class="pipeline-status-panel hidden" id="pipeline-status-panel">
+            <div class="panel-header">
+                <h3>Pipeline Status</h3>
+                <span class="badge info" id="panel-status-badge">CONNECTING</span>
+            </div>
+            
+            <div class="panel-section warning-section hidden" id="panel-gate-warnings">
+                <h4>DATA GATE WARNINGS</h4>
+                <ul id="gate-warnings-list"></ul>
+            </div>
+            
+            <div class="panel-section alerts-section hidden" id="panel-monitor-alerts">
+                <h4>MONITOR ALERTS</h4>
+                <ul id="monitor-alerts-list"></ul>
+            </div>
+
+            <div class="panel-section">
+                <h4>NODE EXECUTION GRID</h4>
+                <div class="node-grid" id="node-grid"></div>
+            </div>
+        </div>
+        <!-- --- END NEW --- -->
 
         <div class="chat-scroll" id="chat-scroll">
             <div class="chat-container" id="chat-container">

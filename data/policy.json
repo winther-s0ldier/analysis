@@ -1,0 +1,8 @@
+{
+  "_comment": "ADK Pipeline Policy Configuration — Edit this file to control analysis behaviour.",
+  "focus": "none",
+  "max_nodes": 10,
+  "required_analyses": [],
+  "excluded_analyses": [],
+  "outcome_col_override": null
+}

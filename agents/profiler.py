@@ -26,68 +26,17 @@ def tool_profile_and_classify(
     session_id: str,
 ) -> dict:
     """
-    Full profiling pipeline in one call.
     Step 1: Raw profile — column stats, types, correlations.
-    Step 2: Semantic inference — what each column represents.
-    Step 3: Dataset classification — what type of data is this.
-
-    Returns everything the Discovery Agent needs to build
-    the analysis plan. Never suggests analyses itself.
-
-    Args:
-        csv_path: Absolute path to the CSV file.
-        session_id: Current session ID.
-
-    Returns:
-        dict with status, raw_profile, semantic_map,
-        classification, intent=PROFILE_COMPLETE.
+    Returns the raw profile to the LLM. The LLM then must reason
+    about this profile to create the semantic map and classification.
     """
     raw_profile = profile_csv(csv_path)
     if "error" in raw_profile:
-        return {
-            "status": "error",
-            "error": raw_profile["error"],
-            "intent": Intent.ERROR,
-            "session_id": session_id,
-        }
+        return {"error": raw_profile["error"]}
 
-    semantic_map = infer_column_semantics(raw_profile)
-    classification = classify_dataset(raw_profile, semantic_map)
-
-    result = {
-        "status": "success",
-        "session_id": session_id,
-        "intent": Intent.PROFILE_COMPLETE,
-        "raw_profile": {
-            "filename":     raw_profile["filename"],
-            "row_count":    raw_profile["row_count"],
-            "column_count": raw_profile["column_count"],
-            "columns":      raw_profile["columns"],
-            "correlations": raw_profile["correlations"],
-            "memory_mb":    raw_profile["memory_mb"],
-            "sample_rows":  raw_profile.get(
-                                "sample_rows", []
-                            )[:3],
-        },
-        "semantic_map":       semantic_map,
-        "classification":     classification,
-        "ready_for_discovery": True,
+    return {
+        "raw_profile": raw_profile
     }
-
-    if classification["needs_clarification"]:
-        ambiguous = classification["ambiguous_columns"][:3]
-        result["clarification_needed"] = True
-        result["clarification_message"] = (
-            f"Some columns have ambiguous names "
-            f"({', '.join(ambiguous)}). "
-            f"Analysis will proceed with best-guess "
-            f"interpretation. You can specify column roles "
-            f"in a custom request if needed."
-        )
-
-    _profile_store[session_id] = result
-
-    return result
 
 
 from tools.model_config import get_model
@@ -102,30 +51,76 @@ def get_profiler_agent():
             name="profiler_agent",
             model=get_model("profiler"),
             description=(
-                "Data profiling specialist. I examine CSV files and "
-                "return raw facts about structure, column semantics, "
-                "and dataset type. I make no analysis decisions."
+                "Data profiling specialist. I examine raw CSV statistics and "
+                "reason about column semantics and dataset type."
             ),
             instruction=(
-                "You are a data profiling specialist. "
-                "Your ONLY job is to understand the data "
-                "you have been given.\n\n"
+                "You are an Elite Data Profiling Specialist operating within a dynamic, domain-agnostic analytics pipeline. "
+                "Your sole responsibility is to examine raw statistical facts about a dataset and produce a precise, semantically-grounded classification. "
+                "You do NOT invent analyses, do NOT make assumptions about the business domain, and do NOT suggest solutions. "
+                "You are a sensor — you report ONLY what the data tells you.\n\n"
 
-                "## YOUR ONE TASK\n"
-                "Call tool_profile_and_classify with the csv_path "
-                "and session_id from your prompt. "
-                "Return the result immediately. Nothing else.\n\n"
+                "## WORKFLOW\n"
+                "1. Call `tool_profile_and_classify(csv_path, session_id)` to receive raw statistical facts (column types, value samples, ranges, distributions).\n"
+                "2. Reason about the STRUCTURE of the data, not its domain. A column named '顧客ID' and a column named 'customer_id' may both be entity identifiers — reason from data type and uniqueness, not from keywords.\n"
+                "3. Assign column roles based on the EVIDENCE in the raw profile.\n"
+                "4. Output the EXACT JSON schema defined below. No extra text.\n\n"
 
-                "## STRICT RULES\n"
-                "- Call the tool EXACTLY ONCE\n"
-                "- Do NOT suggest any analyses\n"
-                "- Do NOT decide what to compute\n"
-                "- Do NOT add commentary to the result\n"
-                "- Do NOT call any other tools\n"
-                "- If the tool returns an error, return it as-is\n\n"
+                "## COLUMN ROLE DEFINITIONS (Infer from data shape, NOT column names)\n"
+                "- `entity_col`: High-cardinality column of identifiers (UUIDs, IDs, hashes). Evidence: high unique count, string or int type.\n"
+                "- `time_col`: Temporal column. Evidence: datetime dtype, or string parseable as ISO8601 / epoch.\n"
+                "- `event_col`: Categorical column describing what happened. Evidence: low-to-medium cardinality, string type, repeating values per entity.\n"
+                "- `outcome_col`: Numeric column representing a measurable result (revenue, score, duration). Evidence: numeric dtype, non-trivial variance.\n"
+                "- `funnel_col`: Ordered categorical column representing progression stages. Evidence: small cardinality, values suggest an ordered journey.\n\n"
 
-                "Your output feeds directly into the Discovery Agent. "
-                "Accuracy and brevity are required."
+                "## DATASET TYPE RULES\n"
+                "Assign `dataset_type` based on the PRESENCE of required columns:\n"
+                "- `event_log`: Has `entity_col` + `time_col` + `event_col`. The most structured behavioral dataset.\n"
+                "- `transactional`: Has `entity_col` + `time_col` + `outcome_col`. No event action column.\n"
+                "- `time_series`: Has `time_col` + `outcome_col`. No entity column (aggregate over time).\n"
+                "- `funnel`: Has `entity_col` + `funnel_col`. No raw event column.\n"
+                "- `tabular_generic`: Does not fit any of the above. Treat as a static cross-sectional table.\n\n"
+
+                "## CONFIDENCE SCORING\n"
+                "Set `confidence` between 0.0 and 1.0 based on how clearly the data fits the assigned type:\n"
+                "- 0.9+: All required columns are unambiguously present with strong data distributions.\n"
+                "- 0.7-0.89: Columns are likely present but column name or dtype is ambiguous.\n"
+                "- 0.5-0.69: Best guess — data partially fits the assigned type.\n"
+                "- Below 0.5: Assign `tabular_generic`.\n\n"
+
+                "## DO's\n"
+                "- DO infer column roles from data distributions and uniqueness ratios, not from column name patterns.\n"
+                "- DO set `outcome_col` or `funnel_col` to `null` if no clear evidence exists.\n"
+                "- DO embed the FULL `raw_profile` dict from the tool call into your output — do not truncate or summarise it.\n"
+                "- DO produce `recommended_analyses` that are appropriate for the assigned dataset_type only.\n\n"
+
+                "## DON'Ts\n"
+                "- DON'T hardcode English keywords (e.g., never rely on 'user_id', 'timestamp' matching as strings).\n"
+                "- DON'T assign a column role based purely on column name without cross-checking data statistics.\n"
+                "- DON'T suggest more than 6 recommended analyses — keep to the most relevant.\n"
+                "- DON'T fabricate statistics or sample values that were not returned by the tool.\n"
+                "- DON'T output any text outside the JSON block.\n\n"
+
+                "## OUTPUT SCHEMA (Strict JSON — no deviations)\n"
+                "```json\n"
+                "{\n"
+                "  \"status\": \"success\",\n"
+                "  \"raw_profile\": { <inject EXACTLY what the tool returned, unmodified> },\n"
+                "  \"classification\": {\n"
+                "    \"dataset_type\": \"event_log\",\n"
+                "    \"confidence\": 0.92,\n"
+                "    \"reasoning\": \"One sentence explaining WHY this dataset_type was chosen, referencing specific column names and their data characteristics.\",\n"
+                "    \"column_roles\": {\n"
+                "      \"entity_col\": \"<actual_column_name or null>\",\n"
+                "      \"time_col\": \"<actual_column_name or null>\",\n"
+                "      \"event_col\": \"<actual_column_name or null>\",\n"
+                "      \"outcome_col\": \"<actual_column_name or null>\",\n"
+                "      \"funnel_col\": \"<actual_column_name or null>\"\n"
+                "    },\n"
+                "    \"recommended_analyses\": [\"session_detection\", \"funnel_analysis\", \"dropout_analysis\"]\n"
+                "  }\n"
+                "}\n"
+                "```\n"
             ),
             tools=[tool_profile_and_classify],
         )
