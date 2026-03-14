@@ -641,7 +641,7 @@ async def analyze(
         )
     
     metrics = req_body.approved_metrics or req_body.custom_metrics
-    output_folder_path = f"output/{state.output_folder}"
+    output_folder_path = str(OUTPUT_DIR / state.output_folder)
 
     if req_body.user_instructions:
         state.user_instructions = req_body.user_instructions
@@ -671,7 +671,6 @@ async def get_status(session_id: str):
             status_code=404,
             detail="Session not found"
         )
-    # Build inline — calling get_pipeline_status() without await returns a coroutine, not data
     node_statuses = {}
     failed = getattr(state, "failed_nodes", set())
     if hasattr(state, "dag") and state.dag:

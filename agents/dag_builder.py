@@ -34,21 +34,41 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
         if state:
             dataset_type = getattr(state, "dataset_type", "")
             csv_filename = getattr(state, "csv_filename", "")
+
+        # Source 1: _synthesis_store is the most reliable — read it FIRST.
+        # state.synthesis may be empty if the background thread's state reference
+        # differs from what synthesis agent wrote, so don't rely on it alone.
+        try:
+            from agents.synthesis import get_synthesis_result
+            synthesis = get_synthesis_result(session_id) or {}
+            if synthesis:
+                print(f"INFO: dag_builder got synthesis from _synthesis_store for {session_id}")
+        except Exception:
+            synthesis = {}
+
+        # Source 2: fall back to state.synthesis if store was empty
+        if not synthesis and state:
             synthesis = getattr(state, "synthesis", {}) or {}
+            if synthesis:
+                print(f"INFO: dag_builder got synthesis from state.synthesis for {session_id}")
 
-            # Fallback: also check _synthesis_store directly in case state.synthesis
-            # wasn't populated yet due to timing between synthesis agent and dag_builder
-            if not synthesis:
-                try:
-                    from agents.synthesis import get_synthesis_result
-                    stored = get_synthesis_result(session_id)
-                    if stored:
-                        synthesis = stored
-                        state.synthesis = stored   # backfill for consistency
-                        print(f"INFO: dag_builder recovered synthesis from _synthesis_store for {session_id}")
-                except Exception:
-                    pass
+        # Source 3: file-based cache (output_folder is now an absolute path)
+        if not synthesis:
+            try:
+                _cache_path = os.path.join(output_folder, "_synthesis_cache.json")
+                if os.path.exists(_cache_path):
+                    with open(_cache_path, "r", encoding="utf-8") as _cf:
+                        _file_synth = json.load(_cf)
+                    if _file_synth:
+                        synthesis = _file_synth
+                        print(f"INFO: dag_builder recovered synthesis from file cache for {session_id}")
+            except Exception:
+                pass
 
+        if not synthesis:
+            print(f"WARNING: dag_builder found no synthesis for {session_id} — report will have no insights.")
+
+        if state:
             for aid, result in state.results.items():
                 if not isinstance(result, dict):
                     continue
@@ -139,6 +159,8 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         return f'<section class="section {name}"><h2>{display_name}</h2>{content}</section>'
 
     ex = synthesis.get("executive_summary", {})
+    if not isinstance(ex, dict):
+        ex = {}
     ex_h = ""
     if ex:
         health = ex.get("overall_health", "")
@@ -156,7 +178,13 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         ex_h += f'<div class="insight-block"><strong>Timeline:</strong> <p>{timeline}</p></div>' if timeline else ""
 
     di = synthesis.get("detailed_insights", {})
-    insights_list = di.get("insights", [])
+    # LLM sometimes returns detailed_insights as a flat list instead of {"insights": [...]}
+    if isinstance(di, list):
+        insights_list = di
+    elif isinstance(di, dict):
+        insights_list = di.get("insights", [])
+    else:
+        insights_list = []
     di_chunks = []
     for ins in insights_list:
         i_title = ins.get("title", "Insight")
@@ -169,9 +197,10 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         causes = ins.get("possible_causes", [])
         causes_html = "".join([f'<li>{c}</li>' for c in causes])
         
+        downstream = ins.get("downstream_implications", "")
         sols = ins.get("how_to_fix", ins.get("recommended_solutions", []))
         sols_html = "".join([f'<li>{s}</li>' for s in sols])
-        
+
         di_chunks.append(
             f'<div class="strategy-card {sev}">'
             f'<div class="strat-header"><span class="badge {sev}">{sev.upper()}</span> {i_title}</div>'
@@ -180,13 +209,19 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             f'<p><b>Root Cause Hypothesis:</b> {rc}</p>'
             f'<p><b>Possible Causes:</b></p><ul style="margin-top:4px;">{causes_html}</ul>'
             f'<p><b>UX Implications:</b> {ux}</p>'
+            + (f'<p><b>Downstream Impact:</b> {downstream}</p>' if downstream else '') +
             f'<p><b>How to Fix:</b></p><ul style="margin-top:4px;">{sols_html}</ul>'
             f'</div></div>'
         )
     di_h = "".join(di_chunks)
 
     st = synthesis.get("intervention_strategies", {})
-    strategies_list = st.get("strategies", [])
+    if isinstance(st, list):
+        strategies_list = st
+    elif isinstance(st, dict):
+        strategies_list = st.get("strategies", [])
+    else:
+        strategies_list = []
     st_chunks = []
     for s in strategies_list:
         sev = s.get("severity", "info").lower()
@@ -209,7 +244,12 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     st_h = "".join(st_chunks)
 
     pe = synthesis.get("personas", {})
-    personas_list = pe.get("personas", [])
+    if isinstance(pe, list):
+        personas_list = pe
+    elif isinstance(pe, dict):
+        personas_list = pe.get("personas", [])
+    else:
+        personas_list = []
     pe_chunks = []
     for p in personas_list:
         p_name = p.get("name", "User Segment")

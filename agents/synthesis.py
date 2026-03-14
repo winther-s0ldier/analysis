@@ -186,13 +186,13 @@ def _extract_node_facts(node_id: str, analysis_id: str, result: dict) -> dict:
             "dominant_category": dominant,
         }
     elif atype in ("user_journey_analysis",):
-        # Actual keys: avg_steps_per_user, common_entry_events, common_exit_events
+        # Actual keys: avg_steps_per_entity, common_entry_events, common_exit_events
         facts["key_metrics"] = {
-            "total_users_tracked": data.get("total_users_tracked"),
-            "avg_steps_per_user": data.get("avg_steps_per_user"),
-            "max_steps_per_user": data.get("max_steps_per_user"),
-            "common_entry_events": data.get("common_entry_events", {}),
-            "common_exit_events": data.get("common_exit_events", {}),
+            "total_entities_tracked": data.get("total_entities_tracked"),
+            "avg_steps_per_entity":   data.get("avg_steps_per_entity"),
+            "max_steps_per_entity":   data.get("max_steps_per_entity"),
+            "common_entry_events":    data.get("common_entry_events", {}),
+            "common_exit_events":     data.get("common_exit_events", {}),
         }
     elif atype in ("intervention_triggers",):
         rules = data.get("rules", [])
@@ -443,6 +443,58 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str) -> str:
 
         synthesis = json.loads(synthesis_json_str)
 
+        # --- MINIMUM QUALITY GUARD ---
+        # Reject synthesis that is too shallow and force a retry.
+        # This prevents the pipeline accepting one-liner summaries as complete output.
+        _quality_failures = []
+
+        _exec = synthesis.get("executive_summary", {})
+        _overall_health = str(_exec.get("overall_health", ""))
+        if len(_overall_health) < 150:
+            _quality_failures.append(
+                f"executive_summary.overall_health is too short ({len(_overall_health)} chars, minimum 150). "
+                "Re-write with 3+ specific stats citing node IDs."
+            )
+
+        _insights = synthesis.get("detailed_insights", {})
+        if isinstance(_insights, dict):
+            _insights = _insights.get("insights", [])
+        if len(_insights) == 0:
+            _quality_failures.append("detailed_insights.insights is empty — must have one card per analysis node.")
+        else:
+            for _i, _ins in enumerate(_insights):
+                _summary = str(_ins.get("ai_summary", ""))
+                if len(_summary) < 80:
+                    _quality_failures.append(
+                        f"detailed_insights.insights[{_i}].ai_summary is too short ({len(_summary)} chars, minimum 80). "
+                        "Must include: (a) the key metric with [NodeID], (b) what it means, (c) an internal comparison to another node finding. Do NOT invent benchmarks."
+                    )
+                _rc = str(_ins.get("root_cause_hypothesis", ""))
+                if len(_rc) < 60:
+                    _quality_failures.append(
+                        f"detailed_insights.insights[{_i}].root_cause_hypothesis is too short ({len(_rc)} chars, minimum 60). "
+                        "Must cite at least two node IDs in a causal chain."
+                    )
+
+        _conv = str(synthesis.get("conversational_report", ""))
+        if len(_conv) < 800:
+            _quality_failures.append(
+                f"conversational_report is too short ({len(_conv)} chars, minimum 800). "
+                "Must be a full narrative section covering all major findings with cited metrics."
+            )
+
+        if _quality_failures:
+            _msg = (
+                "SYNTHESIS REJECTED — quality below minimum standards. "
+                "Do NOT store this synthesis. Revise and resubmit:\n"
+                + "\n".join(f"  • {f}" for f in _quality_failures)
+            )
+            print(f"[Synthesis QA] REJECTED for {session_id}: {len(_quality_failures)} issue(s)")
+            return _msg
+
+        print(f"[Synthesis QA] Passed for {session_id} — {len(_insights)} insights, "
+              f"conv_report={len(_conv)} chars")
+
         # Run DataLog grounding validation
         try:
             from main import sessions
@@ -469,6 +521,22 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str) -> str:
         state = sessions.get(session_id)
         if state:
             state.synthesis = synthesis
+            # File-based backup: write to absolute output path so dag_builder can recover.
+            # state.output_folder is just the folder name (e.g. "Commuter_Users_Event_data"),
+            # so resolve it against the ADK root rather than the process CWD.
+            try:
+                _out = getattr(state, "output_folder", None)
+                if _out:
+                    import os as _os
+                    _adk_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+                    _abs_out = _os.path.join(_adk_root, "output", _out)
+                    _tmp = _os.path.join(_abs_out, "_synthesis_cache.json")
+                    _os.makedirs(_abs_out, exist_ok=True)
+                    with open(_tmp, "w", encoding="utf-8") as _f:
+                        json.dump(synthesis, _f)
+                    print(f"INFO: synthesis cache written to {_tmp}")
+            except Exception as _ce:
+                print(f"WARNING: synthesis cache write failed: {_ce}")
             msg = create_message(
                 sender="synthesis_agent",
                 recipient="orchestrator",
@@ -513,7 +581,7 @@ def get_synthesis_agent():
             instruction=(
                 "You are a Senior Data Intelligence Analyst operating as the final interpretation layer of a multi-agent analytics pipeline. "
                 "You receive structured, pre-computed analysis results from up to 20 analysis nodes and transform them into a single, definitive intelligence report. "
-                "Your output will be read by product managers, CTOs, and business stakeholders — it must be SPECIFIC, EVIDENCE-BACKED, and ACTIONABLE.\n\n"
+                "Your output will be read by decision-makers and business stakeholders — it must be SPECIFIC, EVIDENCE-BACKED, and ACTIONABLE.\n\n"
 
                 "## CORE MANDATE: THE DATALOG STANDARD\n"
                 "Every claim you make MUST be traceable to data. You are NOT a language model generating generic business advice. "
@@ -522,8 +590,11 @@ def get_synthesis_agent():
 
                 "## WORKFLOW\n"
                 "1. Call `tool_aggregate_results(session_id)` to receive ALL completed analysis results, grouped by node ID and analysis type.\n"
-                "2. Study the results. For each analysis node, extract: the key metric, the most surprising finding, and any numbers that have business impact.\n"
-                "3. Identify cross-analysis patterns (e.g., if funnel [A2] shows drop-off at step X AND friction_detection [A3] shows high repetition at step X, these two findings AMPLIFY each other).\n"
+                "2. Study the results. For EACH node ask yourself: what is the single most important number? What is surprising or unexpected? What would a decision-maker urgently need to know?\n"
+                "3. Identify cross-analysis patterns using the DAG DEPENDENCY GRAPH provided in the prompt:\n"
+                "   - DEPENDENT nodes (has depends_on): a child node result is caused or constrained by its parent — reason causally, not just correlationally.\n"
+                "   - AMPLIFYING pairs: two independent nodes that converge on the same entity stage — both findings reinforce the same conclusion.\n"
+                "   - CONTRADICTING signals: one node shows critical severity but a related node shows low impact — explain the discrepancy, do not ignore it.\n"
                 "4. Build your synthesis JSON and call `tool_submit_synthesis(session_id, synthesis_json_str)` with the complete result.\n\n"
 
                 "## EVIDENCE CITATION RULES (Non-Negotiable)\n"
@@ -536,10 +607,10 @@ def get_synthesis_agent():
                 "These are the boundaries of what you are allowed to state:\n"
                 "- ALLOWED: Stating a number that appears verbatim in a tool result.\n"
                 "- ALLOWED: Inferring a trend direction (e.g., 'retention declines') if the tool result shows consecutive decreasing values.\n"
-                "- ALLOWED: Estimating business impact IF you show your calculation (e.g., 'Estimated $X = affected_users × average_outcome_value').\n"
+                "- ALLOWED: Estimating business impact IF you show your calculation (e.g., 'Estimated impact = affected_entities × average_outcome_value').\n"
                 "- FORBIDDEN: Stating a specific percentage that is not in any tool result.\n"
                 "- FORBIDDEN: Claiming a correlation between two metrics unless the `correlation_matrix` analysis [AX] was run and shows r > 0.5.\n"
-                "- FORBIDDEN: Naming a specific user as a persona archetype unless `user_segmentation` was run and returned cluster labels.\n\n"
+                "- FORBIDDEN: Naming a specific entity as a persona archetype unless `user_segmentation` was run and returned cluster labels.\n\n"
 
                 "## DOMAIN-AGNOSTIC REASONING\n"
                 "You do NOT know the industry. You do NOT know what the product, service, or system is. You reason ONLY from DATA SHAPES:\n"
@@ -566,7 +637,7 @@ def get_synthesis_agent():
                 "  'insights': [\n"
                 "    {\n"
                 "      'title': 'Must include the key numeric metric in the title (e.g., 32.3% Drop-off at Checkout)',\n"
-                "      'ai_summary': '2-3 sentences. Must include: (a) exact number with [NodeID], (b) what it means for users, (c) benchmark comparison if inferable from data.',\n"
+                "      'ai_summary': '2-3 sentences. Must include: (a) exact number with [NodeID], (b) what it means for the entities in this dataset, (c) internal comparison — is this metric high/low relative to other nodes, worsening per trend data, or amplified by a related finding? Only state comparisons that another node result directly supports. NEVER invent an industry benchmark.',\n"
                 "      'root_cause_hypothesis': 'A causal chain citing at least 2 data signals. e.g., [A2] shows X → because [A4] shows Y → which implies Z.',\n"
                 "      'possible_causes': [\n"
                 "        'Cause grounded in a SPECIFIC data field from the result dict',\n"
@@ -638,9 +709,9 @@ def get_synthesis_agent():
                 "  'connection_count': 2,\n"
                 "  'connections': [\n"
                 "    {\n"
-                "      'finding_a': '[A1] 38% of sessions end after 1 event',\n"
-                "      'finding_b': '[A3] Highest friction at event login_attempt',\n"
-                "      'synthesized_meaning': 'Single-event sessions are predominantly caused by login friction — fixing auth reduces churn.'\n"
+                "      'finding_a': '[A1] 38% of sequences end after 1 step',\n"
+                "      'finding_b': '[A3] Highest friction at the first recorded event',\n"
+                "      'synthesized_meaning': 'Short sequences are correlated with high friction at the first recorded step.'\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
@@ -676,6 +747,16 @@ def get_synthesis_agent():
                 "- DON'T name a correlation without the `correlation_matrix` result supporting it.\n"
                 "- DON'T write placeholder text like 'N/A', 'See data', or 'Data not available' — write instead what IS known.\n"
                 "- DON'T output raw JSON with unescaped newlines — the JSON must be parseable by Python's `json.loads()`.\n"
+                "- DON'T invent industry benchmarks. You have no external knowledge of what is 'normal' — only compare within the data.\n\n"
+
+                "## MANDATORY SELF-REVIEW BEFORE CALLING tool_submit_synthesis\n"
+                "Before submitting, verify each point — a rejected synthesis wastes a full LLM retry:\n"
+                "- [ ] Every quantitative claim in detailed_insights cites a [NodeID] with the exact number from the fact sheet.\n"
+                "- [ ] Every root_cause_hypothesis is a causal chain citing at least 2 different [NodeIDs].\n"
+                "- [ ] cross_metric_connections has at least 2 entries, each linking 2 DIFFERENT node IDs.\n"
+                "- [ ] conversational_report contains all required headers: '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
+                "- [ ] Every critical/high insight has at least 2 specific how_to_fix steps naming the exact event/metric from [NodeID].\n"
+                "- [ ] All estimated figures are labeled 'estimated' with the formula shown.\n"
             ),
             tools=[tool_aggregate_results, tool_submit_synthesis],
         )

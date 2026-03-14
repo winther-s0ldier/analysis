@@ -15,14 +15,10 @@ custom_analyses:
 # 2. Dataset Profiles
 # Force or exclude specific analyses based on the Profiler's inferred dataset_type.
 # This acts as an override layer on top of the Discovery agent's dynamic reasoning.
+# The key must exactly match the dataset_type string returned by the Profiler agent.
 dataset_profiles:
-  ecommerce_orders:
-    force_analyses: ["contribution_analysis", "pareto_analysis"]
-    exclude_analyses: ["event_taxonomy"]
-    max_nodes: 8
-
-  # Example:
-  # b2b_saas_events:
-  #   force_analyses: ["session_detection", "funnel_analysis", "survival_analysis"]
+  # Example — uncomment and rename to match your dataset_type:
+  # my_dataset_type:
+  #   force_analyses: ["distribution_analysis", "correlation_matrix"]
   #   exclude_analyses: []
-  #   max_nodes: 10
+  #   max_nodes: 8

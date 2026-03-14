@@ -202,20 +202,33 @@ async def run_full_pipeline(
             f"3. Call tool_submit_analysis_plan(session_id, dag_json_str) with your JSON result.\n"
         )
 
-        discovery_response = await run_agent_pipeline(
-            f"{session_id}_discovery",
-            discovery_prompt,
-            agent_getter="discovery",
-        )
-
-        from agents.discovery import get_analysis_plan
-        plan = get_analysis_plan(session_id)
-
-        if not plan or not plan.get("dag"):
-            return {
-                "status": "error",
-                "error":  "Discovery produced no DAG",
+        # Reuse the plan already set on state.dag by the /discover endpoint.
+        # get_analysis_plan() uses .pop() so it is consumed after the /discover
+        # call — reading it again here would return None. state.dag is the
+        # correct source of truth: set at main.py:/discover after the agent runs.
+        if getattr(state, "dag", None):
+            plan = {
+                "dag":        state.dag,
+                "metrics":    getattr(state, "discovery", {}).get("metrics", []),
+                "node_count": len(state.dag),
             }
+            print(f"INFO: Reusing /discover plan with {len(state.dag)} nodes for {session_id}")
+        else:
+            # No prior plan — run discovery from scratch (e.g. direct /analyze call)
+            from agents.discovery import get_analysis_plan
+            discovery_response = await run_agent_pipeline(
+                f"{session_id}_discovery",
+                discovery_prompt,
+                agent_getter="discovery",
+            )
+
+            plan = get_analysis_plan(session_id)
+
+            if not plan or not plan.get("dag"):
+                return {
+                    "status": "error",
+                    "error":  "Discovery produced no DAG",
+                }
 
         dag  = plan["dag"]
 
@@ -298,17 +311,84 @@ async def run_full_pipeline(
 
         _rich_summary = json.dumps(_clean_data(_rich_results), indent=2) if _rich_results else "[]"
 
+        # --- Pre-build fact_sheet so synthesis has verified numbers before reasoning begins ---
+        # This means the LLM doesn't need a tool call to know what to cite.
+        try:
+            from agents.synthesis import _extract_node_facts as _efs
+            _fact_sheet_for_prompt = {}
+            _dag_atype_to_id = {
+                n.get("analysis_type"): n.get("id")
+                for n in dag
+                if n.get("id") and n.get("analysis_type")
+            }
+            for _aid, _res in state.results.items():
+                if not isinstance(_res, dict):
+                    continue
+                _atype = _res.get("analysis_type", "unknown")
+                _nid = _dag_atype_to_id.get(_atype, _aid)
+                _fact_sheet_for_prompt[_nid] = _efs(_nid, _aid, _res)
+            _fact_sheet_json = json.dumps(_clean_data(_fact_sheet_for_prompt), indent=2)
+        except Exception as _fse:
+            _fact_sheet_json = "{}"
+            print(f"WARNING: fact_sheet pre-build failed: {_fse}")
+
+        # DAG dependency map — lets synthesis reason causally (child depends on parent)
+        _dag_dep_lines = []
+        for _n in dag:
+            _deps = _n.get("depends_on", [])
+            _dep_str = f" -> depends on {_deps}" if _deps else " -> root node"
+            _dag_dep_lines.append(
+                f"  {_n.get('id')} [{_n.get('analysis_type')}]{_dep_str}"
+            )
+        _dag_graph_str = "\n".join(_dag_dep_lines) if _dag_dep_lines else "  (no DAG available)"
+
+        # User goal — focus the synthesis on what the user actually wants answered
+        _user_goal_block = ""
+        if getattr(state, "user_instructions", ""):
+            _user_goal_block = (
+                f"\n== USER GOAL / STAKEHOLDER QUESTION ==\n"
+                f"{state.user_instructions}\n"
+                f"Your synthesis MUST directly address this. "
+                f"top_priorities and the Action Roadmap must map to this goal.\n"
+            )
+
+        # Dataset description
+        _profile_block = ""
+        _raw = getattr(state, "raw_profile", {}) or {}
+        if _raw:
+            _col_roles = (getattr(state, "semantic_map", {}) or {}).get("column_roles", {})
+            _profile_block = (
+                f"\n== DATASET DESCRIPTION ==\n"
+                f"Rows: {_raw.get('row_count', 'unknown')} | "
+                f"Columns: {_raw.get('column_count', 'unknown')} | "
+                f"Type: {state.dataset_type}\n"
+                f"Column roles: {json.dumps(_col_roles, default=str)}\n"
+            )
+
         synthesis_prompt = (
             f"Session ID: {session_id}\n"
             f"Dataset type: {state.dataset_type}\n"
-            f"Total analyses completed: {len(state.results)}\n\n"
-            f"== FULL ANALYSIS RESULTS (with raw data) ==\n"
+            f"Total analyses completed: {len(state.results)}\n"
+            f"{_profile_block}"
+            f"{_user_goal_block}"
+            f"\n== DAG DEPENDENCY GRAPH (use this to reason causally) ==\n"
+            f"{_dag_graph_str}\n"
+            f"\n== PRE-EXTRACTED FACT SHEET (cite ONLY these numbers — do not invent) ==\n"
+            f"{_fact_sheet_json}\n\n"
+            f"== FULL ANALYSIS RESULTS (raw — for additional context) ==\n"
             f"{_rich_summary}\n\n"
             f"INSTRUCTIONS:\n"
-            f"1. Call tool_aggregate_results(session_id) to also get column_roles context.\n"
-            f"2. Reason across ALL findings above — cite analysis_id and specific numbers in every insight.\n"
-            f"3. Look closely at the provided chart images. Describe visual trends natively (e.g. drop-offs, clusters) in your analysis.\n"
-            f"4. Build the required JSON schema and call tool_submit_synthesis(session_id, synthesis_json_str)."
+            f"1. Call tool_aggregate_results(session_id) to get column_roles context (required).\n"
+            f"2. Before writing anything, reason step-by-step: what did each node find? "
+            f"What is surprising? What connects across nodes? THEN build your synthesis.\n"
+            f"3. Use the DAG DEPENDENCY GRAPH to identify causal chains "
+            f"(child node results are constrained by their parent — reason causally, not just correlationally).\n"
+            f"4. Look closely at the provided chart images. Describe visual trends natively in your analysis.\n"
+            f"5. SELF-REVIEW before calling tool_submit_synthesis: "
+            f"(a) every insight cites a [NodeID] with a specific number, "
+            f"(b) cross_metric_connections has entries citing 2 different node pairs, "
+            f"(c) conversational_report contains '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
+            f"6. Call tool_submit_synthesis(session_id, synthesis_json_str)."
         )
 
         image_paths = []
@@ -337,6 +417,16 @@ async def run_full_pipeline(
         # be the failed call. This poll ensures we capture the successful retry.
         _synthesis_wait_secs = 0
         while not bool(state.synthesis) and _synthesis_wait_secs < 8:
+            # Also try to recover from _synthesis_store directly on each tick
+            try:
+                from agents.synthesis import get_synthesis_result
+                _stored = get_synthesis_result(session_id)
+                if _stored:
+                    state.synthesis = _stored
+                    print(f"INFO: Orchestrator recovered synthesis from _synthesis_store after {_synthesis_wait_secs}s")
+                    break
+            except Exception:
+                pass
             await asyncio.sleep(0.5)
             _synthesis_wait_secs += 0.5
         if bool(state.synthesis):

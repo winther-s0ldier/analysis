@@ -14,8 +14,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 DEFAULT_SESSION_MARKERS = {
-    "Session Started", "Journey Started", "App Installed", 
-    "User Login", "app_start", "login", "landing_page_view"
+    # Generic process / sequence starters (domain-agnostic)
+    "started", "start", "begin", "initiated", "opened",
+    "created", "initialized", "launched", "connected", "activated",
+    # Digital product / web app (kept as fallback for app event logs)
+    "Session Started", "Journey Started", "App Installed",
+    "User Login", "app_start", "login", "landing_page_view",
 }
 
 
@@ -121,7 +125,7 @@ LIBRARY_REGISTRY = {
         "function":      "run_rfm_analysis",
         "required_args": ["csv_path", "entity_col", "time_col", "value_col"],
         "col_role":      "entity_time_value",
-        "description":   "RFM (Recency, Frequency, Monetary) segmentation classifying users into tiers: Champions, Loyal, At-Risk, and Churned. Each tier gets a tailored intervention strategy. Translates raw event data directly into a CRM-ready user value ranking.",
+        "description":   "RFM (Recency, Frequency, Monetary) segmentation classifying entities into value tiers based on how recently, how often, and how much they engage. Each tier highlights distinct engagement patterns and intervention opportunities.",
     },
     "transition_analysis": {
         "function":      "run_transition_analysis",
@@ -2242,12 +2246,12 @@ def run_rfm_analysis(
     )
 
     def assign_segment(r, f):
-        if r >= 4 and f >= 4: return "Champions"
-        if r >= 3 and f >= 3: return "Loyal"
-        if r >= 4 and f <= 2: return "Recent/New"
-        if r == 3 and f <= 2: return "Promising"
-        if r == 2 and f >= 3: return "At Risk"
-        if r <= 2 and f <= 2: return "Hibernating/Lost"
+        if r >= 4 and f >= 4: return "High Value"
+        if r >= 3 and f >= 3: return "Core"
+        if r >= 4 and f <= 2: return "Recent"
+        if r == 3 and f <= 2: return "Emerging"
+        if r == 2 and f >= 3: return "Declining"
+        if r <= 2 and f <= 2: return "Inactive"
         return "Other"
 
     rfm["segment"] = rfm.apply(
@@ -2286,23 +2290,23 @@ def run_rfm_analysis(
     seg_stats["avg_monetary"]  = seg_stats["avg_monetary"].round(2)
     seg_stats["total_monetary"]= seg_stats["total_monetary"].round(2)
 
-    champions_val_pct = float(
+    high_value_pct = float(
         seg_stats.loc[
-            seg_stats["segment"] == "Champions",
+            seg_stats["segment"] == "High Value",
             "value_pct"
         ].sum()
     )
-    at_risk_count = int(
+    declining_count = int(
         seg_stats.loc[
-            seg_stats["segment"] == "At Risk",
+            seg_stats["segment"] == "Declining",
             "entity_count"
         ].sum()
     )
 
     top_finding = (
         f"RFM Analysis on {len(rfm):,} entities. "
-        f"Champions drive {champions_val_pct}% of total value. "
-        f"{at_risk_count} valuable entities act '{at_risk_count}'. "
+        f"High Value entities drive {high_value_pct}% of total value. "
+        f"{declining_count} previously active entities are now Declining. "
     )
 
     return _make_result(
@@ -2974,7 +2978,7 @@ def run_user_journey_analysis(
         if not events: continue
         
         journey_stats.append({
-            "user_id": str(entity),
+            "entity_id": str(entity),
             "step_count": len(events),
             "entry_event": str(events[0]),
             "exit_event": str(events[-1]),
@@ -2991,14 +2995,14 @@ def run_user_journey_analysis(
     avg_steps = round(journey_df["step_count"].mean(), 2)
     max_steps = int(journey_df["step_count"].max())
     
-    top_finding = f"Analyzed journeys for {len(journey_df):,} users. Average steps per journey: {avg_steps}. Most common entry: {list(common_entries.keys())[0] if common_entries else 'N/A'}."
-    
+    top_finding = f"Analyzed journeys for {len(journey_df):,} entities. Average steps per journey: {avg_steps}. Most common entry: {list(common_entries.keys())[0] if common_entries else 'N/A'}."
+
     return _make_result(
         analysis_type="user_journey_analysis",
         data={
-            "total_users_tracked": len(journey_df),
-            "avg_steps_per_user": avg_steps,
-            "max_steps_per_user": max_steps,
+            "total_entities_tracked": len(journey_df),
+            "avg_steps_per_entity": avg_steps,
+            "max_steps_per_entity": max_steps,
             "common_entry_events": common_entries,
             "common_exit_events": common_exits,
             "sample_journeys": journey_stats[:10]
@@ -3010,7 +3014,7 @@ def run_user_journey_analysis(
             "type": "bar_chart",
             "labels": list(common_entries.keys()),
             "values": list(common_entries.values()),
-            "title": "Top Journey Entry Points"
+            "title": "Top Entry Points"
         }
     )
 

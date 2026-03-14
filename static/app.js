@@ -973,6 +973,8 @@ function addDetailedInsightsMessage(detailedInsights) {
                     ${ins.ai_summary ? `<p class="synthesis-body">${escapeHtml(ins.ai_summary)}</p>` : ''}
                     ${ins.root_cause_hypothesis ? `<div class="synthesis-detail-row"><span class="synthesis-label">Root Cause</span><span>${escapeHtml(ins.root_cause_hypothesis)}</span></div>` : ''}
                     ${ins.ux_implications ? `<div class="synthesis-detail-row"><span class="synthesis-label">UX Impact</span><span>${escapeHtml(ins.ux_implications)}</span></div>` : ''}
+                    ${ins.possible_causes?.length ? `<div class="synthesis-detail-row"><span class="synthesis-label">Possible Causes</span><ul class="synthesis-list">${ins.possible_causes.map(c => `<li>${escapeHtml(c)}</li>`).join('')}</ul></div>` : ''}
+                    ${ins.downstream_implications ? `<div class="synthesis-detail-row"><span class="synthesis-label">Downstream Impact</span><span>${escapeHtml(ins.downstream_implications)}</span></div>` : ''}
                     ${ins.how_to_fix?.length ? `
                         <div class="synthesis-detail-row"><span class="synthesis-label">How to Fix</span>
                             <ol class="synthesis-list">${ins.how_to_fix.map(f => `<li>${escapeHtml(f)}</li>`).join('')}</ol>
