@@ -27,6 +27,7 @@ from a2a_messages import (
     get_completed_analysis_ids,
 )
 from tools.analysis_library import LIBRARY_REGISTRY
+from tools.model_config import get_model
 
 
 _pipeline_store: dict = {}
@@ -65,26 +66,6 @@ async def run_full_pipeline(
     custom_requests: list = None,
     state=None,
 ) -> dict:
-    if state is None:
-        try:
-            from main import sessions
-            state = sessions.get(session_id)
-        except Exception as e:
-            print(f"ERROR: Cannot find session: {e}")
-            return {"status": "error", "error": "session not found"}
-    
-    if state is None:
-        print(f"ERROR: Session {session_id} not found")
-        return {"status": "error", "error": "session not found"}
-    
-    print(f"INFO: run_full_pipeline session found: {session_id}")
-    print(f"INFO: session status before: {state.status}")
-    
-    # --- Phase 3 / Group D: Inject custom external analyses into registry
-    from tools.analysis_library import LIBRARY_REGISTRY
-    from tools.workflow_loader import register_custom_analyses
-    register_custom_analyses(LIBRARY_REGISTRY)
-    
     """
     Run the complete analysis pipeline for a session.
 
@@ -105,12 +86,30 @@ async def run_full_pipeline(
     Returns:
         dict with status, report_path, results_summary
     """
+    if state is None:
+        try:
+            from main import sessions
+            state = sessions.get(session_id)
+        except Exception as e:
+            print(f"ERROR: Cannot find session: {e}")
+            return {"status": "error", "error": "session not found"}
+
+    if state is None:
+        print(f"ERROR: Session {session_id} not found")
+        return {"status": "error", "error": "session not found"}
+
+    print(f"INFO: run_full_pipeline session found: {session_id}")
+    print(f"INFO: session status before: {state.status}")
+
+    # --- Phase 3 / Group D: Inject custom external analyses into registry
+    from tools.analysis_library import LIBRARY_REGISTRY
+    from tools.workflow_loader import register_custom_analyses
+    register_custom_analyses(LIBRARY_REGISTRY)
+
     os.makedirs(output_folder, exist_ok=True)
 
     try:
         from main import run_agent_pipeline, extract_json
-        print(f"INFO: run_full_pipeline session found: {session_id}")
-        print(f"INFO: session status before: {state.status}")
 
         _update_session_status(state, "profiling")
 
@@ -219,7 +218,6 @@ async def run_full_pipeline(
             }
 
         dag  = plan["dag"]
-        state.dag = dag
 
         # Apply active policy to filter/prioritise/cap the DAG
         # Explicit bool + parentheses prevents Python and/or precedence bug
@@ -242,6 +240,10 @@ async def run_full_pipeline(
                 n for n in dag
                 if n["id"] in approved_metrics
             ]
+
+        # Assign state.dag AFTER all filtering so the status endpoint
+        # reports the exact node count that will actually execute.
+        state.dag = dag
 
         pipeline = create_pipeline_state(
             session_id, dag
@@ -404,7 +406,7 @@ async def run_full_pipeline(
         return {
             "status": "error",
             "error":  str(e),
-            "trace":  traceback.format_exc()[-1000:],
+            "trace":  traceback.format_exc()[:1000],
         }
 
 
@@ -616,10 +618,22 @@ async def _execute_single_node(
     library_fn    = node.get("library_function")
     description   = node.get("description", "")
 
+    # Derive the behavioral set from LIBRARY_REGISTRY so it stays in sync
+    # automatically as new analyses are added. Any entry with col_role == "behavioral"
+    # needs the session-enriched CSV produced by run_session_detection.
     behavioral = {
+        atype
+        for atype, entry in LIBRARY_REGISTRY.items()
+        if entry.get("col_role") == "behavioral"
+    }
+    # Hard-code the original set as a fallback in case LIBRARY_REGISTRY is empty
+    behavioral |= {
         "funnel_analysis", "friction_detection",
         "survival_analysis", "user_segmentation",
         "sequential_pattern_mining", "association_rules",
+        "dropout_analysis", "user_journey_analysis",
+        "intervention_triggers", "session_classification",
+        "path_analysis", "transition_analysis",
     }
     effective_csv = csv_path
     if analysis_type in behavioral:
@@ -630,7 +644,10 @@ async def _execute_single_node(
             effective_csv = enriched
 
     code = None
-    if library_fn and library_fn in str(LIBRARY_REGISTRY):
+    if library_fn and any(
+        entry.get("function") == library_fn
+        for entry in LIBRARY_REGISTRY.values()
+    ):
         for lib_type, entry in LIBRARY_REGISTRY.items():
             if entry["function"] == library_fn:
                 code = _build_library_call_code(lib_type, column_roles)
@@ -703,6 +720,41 @@ async def _execute_single_node(
     logging.info(msg)
     return result
 
+
+
+async def execute_single_analysis(
+    session_id: str,
+    analysis_type: str,
+    analysis_id: str,
+    csv_path: str,
+    output_folder: str,
+    description: str,
+    column_roles: dict,
+    state,
+) -> dict:
+    """
+    Public wrapper — execute one analysis node independently.
+    Used by the /add-metric and /retry endpoints in main.py.
+    """
+    from main import run_agent_pipeline
+
+    node = {
+        "id":               analysis_id,
+        "analysis_type":    analysis_type,
+        "description":      description,
+        "column_roles":     column_roles,
+        "library_function": LIBRARY_REGISTRY.get(analysis_type, {}).get("function"),
+        "depends_on":       [],
+    }
+
+    return await _execute_single_node(
+        session_id=session_id,
+        node=node,
+        csv_path=csv_path,
+        output_folder=output_folder,
+        state=state,
+        run_agent_pipeline=run_agent_pipeline,
+    )
 
 
 def _build_library_call_code(analysis_type: str, column_roles: dict) -> str:
@@ -924,7 +976,7 @@ def get_root_agent():
 
         _root_agent_instance = Agent(
             name="orchestrator",
-            model="openai/gpt-4o",
+            model=get_model("orchestrator"),
             description=(
                 "Central coordinator. Routes messages, "
                 "manages DAG execution order, "

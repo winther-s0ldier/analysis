@@ -6,6 +6,15 @@ venv/
 .venv/
 env/
 .env
+*.egg-info/
+dist/
+build/
+
+# Virtual environments (any name)
+**/venv/
+**/.venv/
+**/env/
+**/ENV/
 
 # Data & Reports
 output/
@@ -20,6 +29,3 @@ test_data*.csv
 # OS
 .DS_Store
 Thumbs.db
-nul
-null
-data/log/cleaning/ARCHITECTURE.md

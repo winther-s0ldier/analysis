@@ -163,19 +163,19 @@ LIBRARY_REGISTRY = {
         "function":      "run_intervention_triggers",
         "required_args": ["csv_path", "entity_col", "event_col", "time_col"],
         "col_role":      "behavioral",
-        "description":   "High-confidence dropout trigger rules: events that reliably predict session abandonment (>80% dropout rate). Equivalent to Datalog's Intervention Triggers tab.",
+        "description":   "High-confidence dropout trigger rules: events that reliably precede process or session abandonment (>80% dropout rate after the event). Produces a ranked list of risk-level triggers with exact dropout rates.",
     },
     "session_classification": {
         "function":      "run_session_classification",
         "required_args": ["csv_path", "entity_col", "event_col", "time_col"],
         "col_role":      "behavioral",
-        "description":   "Classifies users into Browser / Shopper / Attempter / Converter personas based on session depth and event diversity. Domain-agnostic.",
+        "description":   "Classifies entities into behavioural archetypes based on session depth, event diversity, and outcome signals. Reveals which engagement tiers exist and where the largest volume of incomplete journeys occurs.",
     },
     "path_analysis": {
         "function":      "run_user_journey_analysis",
         "required_args": ["csv_path", "entity_col", "event_col"],
         "col_role":      "behavioral",
-        "description":   "Maps the most common user journeys through your product. Identifies where users diverge from the ideal path, which entry points lead to conversion, and which routes end in abandonment. Reveals the full landscape of how users actually navigate vs. how they were expected to.",
+        "description":   "Maps the most common entity paths through the event sequence. Identifies where paths diverge, which entry points lead to completion, and which routes end in abandonment.",
     },
     "retention_analysis": {
         "function":      "run_cohort_analysis",
@@ -221,6 +221,27 @@ def _make_result(analysis_type: str, data: dict,
     }
 
 
+def _make_error_result(analysis_type: str, error: str, status: str = "error") -> dict:
+    """Return a properly-shaped envelope for error / insufficient-data cases."""
+    return {
+        "analysis_type": analysis_type,
+        "status": status,
+        "data": {},
+        "top_finding": error,
+        "severity": "info",
+        "confidence": 0.0,
+        "chart_ready_data": {},
+        "enables": [],
+        "insight_summary": {
+            "key_finding": error,
+            "top_values": "",
+            "anomalies": "",
+            "recommendation": ""
+        },
+        "error": error,
+    }
+
+
 def run_distribution_analysis(csv_path: str, col: str) -> dict:
     """
     Full distribution analysis on any numeric column.
@@ -230,13 +251,11 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
     df = pd.read_csv(csv_path, low_memory=False)
     
     if col not in df.columns:
-        return {"status": "error", 
-                "error": f"Column '{col}' not found"}
-    
+        return _make_error_result("distribution_analysis", f"Column '{col}' not found")
+
     data = df[col].dropna()
     if len(data) == 0:
-        return {"status": "insufficient_data",
-                "error": f"Column '{col}' has no non-null values"}
+        return _make_error_result("distribution_analysis", f"Column '{col}' has no non-null values", "insufficient_data")
     
     stats = {
         "count": len(data),
@@ -321,15 +340,13 @@ def run_categorical_analysis(csv_path: str, col: str) -> dict:
     df = pd.read_csv(csv_path, low_memory=False)
     
     if col not in df.columns:
-        return {"status": "error", 
-                "error": f"Column '{col}' not found"}
-    
+        return _make_error_result("categorical_analysis", f"Column '{col}' not found")
+
     counts = df[col].value_counts()
     total = len(df[col].dropna())
-    
+
     if total == 0:
-        return {"status": "insufficient_data",
-                "error": "No non-null values"}
+        return _make_error_result("categorical_analysis", "No non-null values", "insufficient_data")
     
     top_20_pct_count = max(1, int(len(counts) * 0.20))
     top_20_volume = counts.head(top_20_pct_count).sum()
@@ -387,8 +404,7 @@ def run_correlation_matrix(csv_path: str,
         numeric_df = df.select_dtypes(include=[np.number])
     
     if numeric_df.shape[1] < 2:
-        return {"status": "insufficient_data",
-                "error": "Need at least 2 numeric columns"}
+        return _make_error_result("correlation_matrix", "Need at least 2 numeric columns", "insufficient_data")
     
     pearson = numeric_df.corr(method='pearson')
     
@@ -452,12 +468,11 @@ def run_anomaly_detection(csv_path: str, col: str) -> dict:
     df = pd.read_csv(csv_path, low_memory=False)
     
     if col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{col}' not found"}
-    
+        return _make_error_result("anomaly_detection", f"Column '{col}' not found")
+
     data = df[col].dropna()
     if len(data) == 0:
-        return {"status": "insufficient_data"}
+        return _make_error_result("anomaly_detection", "Insufficient data", "insufficient_data")
     
     q1 = float(data.quantile(0.25))
     q3 = float(data.quantile(0.75))
@@ -608,19 +623,16 @@ def run_trend_analysis(
     df = pd.read_csv(csv_path, low_memory=False)
 
     if time_col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{time_col}' not found"}
+        return _make_error_result("trend_analysis", f"Column '{time_col}' not found")
     if value_col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{value_col}' not found"}
+        return _make_error_result("trend_analysis", f"Column '{value_col}' not found")
 
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col, value_col])
     df = df.sort_values(time_col)
 
     if len(df) < 3:
-        return {"status": "insufficient_data",
-                "error": "Need at least 3 data points"}
+        return _make_error_result("trend_analysis", "Need at least 3 data points", "insufficient_data")
 
     values = df[value_col].astype(float)
     times  = df[time_col]
@@ -744,20 +756,16 @@ def run_time_series_decomposition(
     df = pd.read_csv(csv_path, low_memory=False)
 
     if time_col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{time_col}' not found"}
+        return _make_error_result("time_series_decomposition", f"Column '{time_col}' not found")
     if value_col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{value_col}' not found"}
+        return _make_error_result("time_series_decomposition", f"Column '{value_col}' not found")
 
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[time_col, value_col])
     df = df.sort_values(time_col)
 
     if len(df) < 14:
-        return {"status": "insufficient_data",
-                "error": "Need at least 14 data points "
-                         "for decomposition"}
+        return _make_error_result("time_series_decomposition", "Need at least 14 data points for decomposition", "insufficient_data")
 
     values = df[value_col].astype(float)
 
@@ -869,8 +877,7 @@ def run_cohort_analysis(
 
     for col in [entity_col, time_col, value_col]:
         if col not in df.columns:
-            return {"status": "error",
-                    "error": f"Column '{col}' not found"}
+            return _make_error_result("cohort_analysis", f"Column '{col}' not found")
 
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[entity_col, time_col])
@@ -984,8 +991,7 @@ def run_session_detection(
 
     for col in [entity_col, time_col]:
         if col not in df.columns:
-            return {"status": "error",
-                    "error": f"Column '{col}' not found"}
+            return _make_error_result("session_detection", f"Column '{col}' not found")
 
     df[time_col] = pd.to_datetime(
         df[time_col], errors="coerce"
@@ -1180,18 +1186,14 @@ def run_funnel_analysis(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' column not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "funnel_analysis",
+                f"'{session_col}' column not found. Run session_detection first.",
+            )
 
     for col in [entity_col, event_col]:
         if col not in df.columns:
-            return {"status": "error",
-                    "error": f"Column '{col}' not found"}
+            return _make_error_result("funnel_analysis", f"Column '{col}' not found")
 
     df[time_col] = pd.to_datetime(
         df[time_col], errors="coerce"
@@ -1352,18 +1354,14 @@ def run_friction_detection(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' column not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "friction_detection",
+                f"'{session_col}' column not found. Run session_detection first.",
+            )
 
     for col in [entity_col, event_col]:
         if col not in df.columns:
-            return {"status": "error",
-                    "error": f"Column '{col}' not found"}
+            return _make_error_result("friction_detection", f"Column '{col}' not found")
 
     event_counts = (
         df.groupby([session_col, event_col])
@@ -1514,13 +1512,10 @@ def run_survival_analysis(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "survival_analysis",
+                f"'{session_col}' not found. Run session_detection first.",
+            )
 
     session_lengths = (
         df.groupby(session_col).size().values
@@ -1528,8 +1523,7 @@ def run_survival_analysis(
     total_sessions = len(session_lengths)
 
     if total_sessions == 0:
-        return {"status": "insufficient_data",
-                "error": "No sessions found"}
+        return _make_error_result("survival_analysis", "No sessions found", "insufficient_data")
 
     max_steps = int(np.percentile(session_lengths, 95))
     max_steps = min(max_steps, 50)
@@ -1676,13 +1670,10 @@ def run_user_segmentation(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "user_segmentation",
+                f"'{session_col}' not found. Run session_detection first.",
+            )
 
     if time_col and time_col in df.columns:
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
@@ -1737,8 +1728,7 @@ def run_user_segmentation(
     features = agg_df[feature_cols].values.tolist()
 
     if len(features) < 5:
-        return {"status": "insufficient_data",
-                "error": "Need at least 5 entities"}
+        return _make_error_result("user_segmentation", "Need at least 5 entities", "insufficient_data")
 
     feature_matrix = np.array(features, dtype=float)
 
@@ -1897,13 +1887,10 @@ def run_sequential_pattern_mining(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "sequential_pattern_mining",
+                f"'{session_col}' not found. Run session_detection first.",
+            )
 
     sequences = []
     for _, grp in df.groupby(session_col):
@@ -1913,8 +1900,7 @@ def run_sequential_pattern_mining(
 
     total_seqs = len(sequences)
     if total_seqs == 0:
-        return {"status": "insufficient_data",
-                "error": "No sequences found"}
+        return _make_error_result("sequential_pattern_mining", "No sequences found", "insufficient_data")
 
     min_count = max(2, int(total_seqs * min_support))
 
@@ -2055,13 +2041,10 @@ def run_association_rules(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": (
-                    f"'{session_col}' not found. "
-                    f"Run session_detection first."
-                ),
-            }
+            return _make_error_result(
+                "association_rules",
+                f"'{session_col}' not found. Run session_detection first.",
+            )
 
     total_sessions = df[session_col].nunique()
 
@@ -2077,10 +2060,7 @@ def run_association_rules(
         ].index.tolist()[:3]
 
     if not outcome_events:
-        return {
-            "status": "insufficient_data",
-            "error": "Could not identify outcome events",
-        }
+        return _make_error_result("association_rules", "Could not identify outcome events", "insufficient_data")
 
     session_events = (
         df.groupby(session_col)[event_col]
@@ -2218,8 +2198,7 @@ def run_rfm_analysis(
 
     for col in [entity_col, time_col, value_col]:
         if col not in df.columns:
-            return {"status": "error",
-                    "error": f"Column '{col}' not found"}
+            return _make_error_result("rfm_analysis", f"Column '{col}' not found")
 
     df[time_col] = pd.to_datetime(
         df[time_col], errors="coerce"
@@ -2230,7 +2209,7 @@ def run_rfm_analysis(
     df = df.dropna(subset=[value_col])
 
     if len(df) == 0:
-        return {"status": "insufficient_data"}
+        return _make_error_result("rfm_analysis", "Insufficient data", "insufficient_data")
 
     ref_date = df[time_col].max() + pd.Timedelta(days=1)
 
@@ -2359,19 +2338,19 @@ def run_pareto_analysis(
 
     for col in [entity_col, value_col]:
         if col not in df.columns:
-            return {"status": "error", "error": f"Missing {col}"}
+            return _make_error_result("pareto_analysis", f"Missing {col}")
 
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=[entity_col, value_col])
 
     if len(df) == 0:
-        return {"status": "insufficient_data"}
+        return _make_error_result("pareto_analysis", "Insufficient data", "insufficient_data")
 
     entity_value = df.groupby(entity_col)[value_col].sum().sort_values(ascending=False).reset_index()
     total_value = entity_value[value_col].sum()
-    
+
     if total_value <= 0:
-        return {"status": "insufficient_data", "error": "Total value is zero or negative"}
+        return _make_error_result("pareto_analysis", "Total value is zero or negative", "insufficient_data")
 
     entity_value["cum_value_pct"] = entity_value[value_col].cumsum() / total_value
     entity_value["cum_entity_pct"] = (entity_value.index + 1) / len(entity_value)
@@ -2436,7 +2415,7 @@ def run_transition_analysis(
     required_cols = [entity_col, event_col]
     for col in required_cols:
         if col not in df.columns:
-            return {"status": "error", "error": f"Column '{col}' not found"}
+            return _make_error_result("transition_analysis", f"Column '{col}' not found")
 
     if time_col and time_col in df.columns:
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
@@ -2447,8 +2426,7 @@ def run_transition_analysis(
         df = df.sort_values([entity_col])
 
     if len(df) < 10:
-        return {"status": "insufficient_data",
-                "error": "Need at least 10 rows"}
+        return _make_error_result("transition_analysis", "Need at least 10 rows", "insufficient_data")
 
     session_col = "session_id" if "session_id" in df.columns else None
 
@@ -2645,7 +2623,7 @@ def run_dropout_analysis(
     required_cols = [entity_col, event_col]
     for col in required_cols:
         if col not in df.columns:
-            return {"status": "error", "error": f"Column '{col}' not found"}
+            return _make_error_result("dropout_analysis", f"Column '{col}' not found")
 
     if time_col and time_col in df.columns:
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
@@ -2656,8 +2634,7 @@ def run_dropout_analysis(
         df = df.sort_values([entity_col])
 
     if len(df) < 10:
-        return {"status": "insufficient_data",
-                "error": "Need at least 10 rows"}
+        return _make_error_result("dropout_analysis", "Need at least 10 rows", "insufficient_data")
 
     session_col = "session_id" if "session_id" in df.columns else None
 
@@ -2699,8 +2676,7 @@ def run_dropout_analysis(
 
     total_sessions = len(last_1_events)
     if total_sessions == 0:
-        return {"status": "insufficient_data",
-                "error": "No sessions found"}
+        return _make_error_result("dropout_analysis", "No sessions found", "insufficient_data")
 
     last_1_counter = Counter(last_1_events)
     last_2_counter = Counter(last_2_seqs)
@@ -2828,13 +2804,11 @@ def run_event_taxonomy(
     df = pd.read_csv(csv_path, low_memory=False)
 
     if event_col not in df.columns:
-        return {"status": "error",
-                "error": f"Column '{event_col}' not found"}
+        return _make_error_result("event_taxonomy", f"Column '{event_col}' not found")
 
     events = df[event_col].dropna().astype(str)
     if len(events) == 0:
-        return {"status": "insufficient_data",
-                "error": "No events found"}
+        return _make_error_result("event_taxonomy", "No events found", "insufficient_data")
 
     TAXONOMY = [
         ("authentication", [
@@ -2985,8 +2959,8 @@ def run_user_journey_analysis(
     df = pd.read_csv(csv_path, low_memory=False)
     
     if entity_col not in df.columns or event_col not in df.columns:
-        return {"status": "error", "error": f"Missing required columns"}
-    
+        return _make_error_result("user_journey_analysis", "Missing required columns")
+
     if time_col and time_col in df.columns:
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
         df = df.sort_values([entity_col, time_col])
@@ -3008,7 +2982,7 @@ def run_user_journey_analysis(
         })
         
     if not journey_stats:
-        return {"status": "error", "error": "No valid journeys found"}
+        return _make_error_result("user_journey_analysis", "No valid journeys found")
         
     journey_df = pd.DataFrame(journey_stats)
     
@@ -3048,17 +3022,17 @@ def run_contribution_analysis(csv_path: str, group_col: str, value_col: str) -> 
     """
     df = pd.read_csv(csv_path, low_memory=False)
     if group_col not in df.columns or value_col not in df.columns:
-        return {"status": "error", "error": f"Missing columns: {group_col} or {value_col}"}
-    
+        return _make_error_result("contribution_analysis", f"Missing columns: {group_col} or {value_col}")
+
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
     df = df.dropna(subset=[group_col, value_col])
-    
+
     if len(df) == 0:
-        return {"status": "insufficient_data", "error": "No valid data after numeric conversion"}
-        
+        return _make_error_result("contribution_analysis", "No valid data after numeric conversion", "insufficient_data")
+
     total_val = df[value_col].sum()
     if total_val == 0:
-        return {"status": "error", "error": "Total sum of value_col is zero"}
+        return _make_error_result("contribution_analysis", "Total sum of value_col is zero")
         
     grouped = df.groupby(group_col)[value_col].agg(["sum", "count", "mean"]).reset_index()
     grouped["contribution_pct"] = (grouped["sum"] / total_val * 100).round(2)
@@ -3109,25 +3083,25 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
     try:
         from scipy.stats import chi2_contingency
     except ImportError:
-        return {"status": "error", "error": "scipy is required for cross_tab_analysis"}
-        
+        return _make_error_result("cross_tab_analysis", "scipy is required for cross_tab_analysis")
+
     df = pd.read_csv(csv_path, low_memory=False)
     if col_a not in df.columns or col_b not in df.columns:
-        return {"status": "error", "error": f"Missing columns: {col_a} or {col_b}"}
-        
+        return _make_error_result("cross_tab_analysis", f"Missing columns: {col_a} or {col_b}")
+
     df = df.dropna(subset=[col_a, col_b])
-    
+
     if df[col_a].nunique() > 50 or df[col_b].nunique() > 50:
-        return {"status": "error", "error": "Too many unique categories (max 50) for cross-tabulation"}
-        
+        return _make_error_result("cross_tab_analysis", "Too many unique categories (max 50) for cross-tabulation")
+
     if len(df) == 0:
-        return {"status": "insufficient_data", "error": "No valid rows"}
-        
+        return _make_error_result("cross_tab_analysis", "No valid rows", "insufficient_data")
+
     contingency = pd.crosstab(df[col_a], df[col_b])
-    
+
     # Check if table is valid for chi2 (needs sum > 0)
     if contingency.sum().sum() == 0 or contingency.shape[0] < 2 or contingency.shape[1] < 2:
-        return {"status": "error", "error": "Contingency table invalid (too few groups or counts)"}
+        return _make_error_result("cross_tab_analysis", "Contingency table invalid (too few groups or counts)")
         
     chi2_stat, p_val, dof, ex = chi2_contingency(contingency)
     
@@ -3214,14 +3188,14 @@ def run_intervention_triggers(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": "session_col not found. Run session_detection first.",
-            }
+            return _make_error_result(
+                "intervention_triggers",
+                "session_col not found. Run session_detection first.",
+            )
 
     for col in [entity_col, event_col]:
         if col not in df.columns:
-            return {"status": "error", "error": f"Column '{col}' not found"}
+            return _make_error_result("intervention_triggers", f"Column '{col}' not found")
 
     if time_col and time_col in df.columns:
         try:
@@ -3232,7 +3206,7 @@ def run_intervention_triggers(
 
     total_sessions = df[session_col].nunique()
     if total_sessions == 0:
-        return {"status": "insufficient_data", "error": "No sessions found"}
+        return _make_error_result("intervention_triggers", "No sessions found", "insufficient_data")
 
     # Last event per session = the event at which users dropped off
     session_last = (
@@ -3355,14 +3329,14 @@ def run_session_classification(
         if os.path.exists(enriched):
             df = pd.read_csv(enriched, low_memory=False)
         else:
-            return {
-                "status": "error",
-                "error": "session_col not found. Run session_detection first.",
-            }
+            return _make_error_result(
+                "session_classification",
+                "session_col not found. Run session_detection first.",
+            )
 
     for col in [entity_col, event_col]:
         if col not in df.columns:
-            return {"status": "error", "error": f"Column '{col}' not found"}
+            return _make_error_result("session_classification", f"Column '{col}' not found")
 
     user_stats = (
         df.groupby(entity_col)

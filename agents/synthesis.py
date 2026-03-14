@@ -360,7 +360,6 @@ def tool_aggregate_results(session_id: str) -> dict:
         }
 
 
-from tools.synthesis_helpers import deterministic_full_synthesis as run_synthesis_deterministic
 
 
 def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id: str = "") -> dict:
@@ -373,11 +372,9 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
     warnings_found = []
     citation_count = 0
 
-    # Check required top-level keys
-    required_keys = [
-        "executive_summary", "detailed_insights",
-        "personas", "intervention_strategies", "conversational_report"
-    ]
+    # Check required top-level keys — only mandate the three universal sections;
+    # personas/intervention_strategies may be absent for non-behavioural datasets.
+    required_keys = ["executive_summary", "detailed_insights", "conversational_report"]
     for key in required_keys:
         if key not in synthesis:
             warnings_found.append(f"MISSING KEY: '{key}' not found in synthesis output.")
@@ -402,17 +399,19 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
         emit(session_id, "synthesis_low_citation", {"citation_count": citation_count}, severity="warning")
 
     # Check insights have individual top_finding
-    insights = synthesis.get("detailed_insights", {}).get("insights", [])
+    # detailed_insights can be {"insights": [...]} or a bare list — handle both
+    _di = synthesis.get("detailed_insights", {})
+    insights = _di if isinstance(_di, list) else _di.get("insights", [])
     for i, ins in enumerate(insights):
         if not ins.get("ai_summary"):
             warnings_found.append(f"INSIGHT[{i}]: ai_summary is empty.")
         if not ins.get("how_to_fix"):
             warnings_found.append(f"INSIGHT[{i}]: how_to_fix steps are empty.")
 
-    # Check personas exist
+    # Check entity segments / personas if a segment section was included
     personas = synthesis.get("personas", {}).get("personas", [])
-    if not personas:
-        warnings_found.append("WEAK: No behavioral personas defined in synthesis.")
+    if synthesis.get("personas") is not None and not personas:
+        warnings_found.append("WEAK: personas section present but no archetypes defined.")
 
     # Check conversational_report has content
     conv = synthesis.get("conversational_report", "")
@@ -543,10 +542,13 @@ def get_synthesis_agent():
                 "- FORBIDDEN: Naming a specific user as a persona archetype unless `user_segmentation` was run and returned cluster labels.\n\n"
 
                 "## DOMAIN-AGNOSTIC REASONING\n"
-                "You do NOT know the industry. You do NOT know the product. You reason from DATA SHAPES:\n"
-                "- A high `avg_repetitions` in friction_detection means users are looping — do NOT assume this is a 'payment gateway' issue unless the `event_col` values mention payment.\n"
-                "- A 'Struggling Explorer' persona is a user who has many events but low conversion — infer this from segment cluster sizes and funnel data.\n"
-                "- Financial estimates are ALWAYS labeled as 'estimated' and show the formula used.\n\n"
+                "You do NOT know the industry. You do NOT know what the product, service, or system is. You reason ONLY from DATA SHAPES:\n"
+                "- A high `avg_repetitions` in friction_detection means entities are looping — do NOT assume this is a 'payment gateway' issue unless the event values explicitly mention payment.\n"
+                "- Persona names MUST come from data patterns, not from industry archetypes. 'Struggling Explorer' is acceptable only if the data shows high event count + low outcome. 'Shopper' is NOT acceptable unless that exact label appears in a tool result.\n"
+                "- Interventions MUST be described in terms of data signals (events, thresholds, timeframes) — never assume a UI, CRM, or notification system exists.\n"
+                "- The word 'user' is fine if `entity_col` represents people. If the entities are products, transactions, samples, or records, use the appropriate term.\n"
+                "- Financial estimates are ALWAYS labeled as 'estimated' and show the formula used.\n"
+                "- If the dataset is clearly non-behavioral (e.g., sales records, sensor readings, survey responses), SKIP the `personas` and `intervention_strategies` sections and focus on `detailed_insights` + `conversational_report`.\n\n"
 
                 "## REQUIRED OUTPUT STRUCTURE (All keys mandatory)\n\n"
 
@@ -571,7 +573,7 @@ def get_synthesis_agent():
                 "        'Cross-analysis cause citing two node IDs',\n"
                 "        'Third cause if data supports it'\n"
                 "      ],\n"
-                "      'ux_implications': 'Specific UX consequence with an estimated numeric impact where possible.',\n"
+                "      'downstream_implications': 'How this finding affects downstream processes, outcomes, or decisions. Quantify impact if data supports it.',\n"
                 "      'fix_priority': 'critical|high|medium|low',\n"
                 "      'how_to_fix': [\n"
                 "        'Step 1: Specific action naming the EXACT event/metric to target from [NodeID]',\n"
@@ -582,34 +584,50 @@ def get_synthesis_agent():
                 "}\n\n"
 
 
-                "### personas — infer 2-4 user archetypes from behavioral + segmentation data\n"
-                "PRIORITY: If `session_classification` was run [AX], you MUST use its Converter/Attempter/Shopper/Browser breakdown as the PRIMARY persona structure. "
-                "Cite exact percentages and counts from that node. Then enrich each persona with friction/funnel/dropout data.\n"
-                "If `session_classification` was NOT run, infer archetypes from funnel + dropout patterns. "
-                "Name archetypes based on what the DATA shows (behavior pattern), not generic marketing names.\n"
+                "### personas — infer 2-4 entity archetypes from segmentation / behavioral data\n"
+                "ONLY include this section if the analysis results support it "
+                "(i.e., at least one of `session_classification`, `user_segmentation`, `funnel_analysis`, or `dropout_analysis` ran successfully).\n"
+                "If none of those analyses were run, OMIT the `personas` key entirely rather than fabricating archetypes.\n\n"
+                "NAMING: Name archetypes from what the DATA shows — derive the name from the entity's OBSERVED PATTERN, not from any assumed industry. "
+                "Examples of data-driven names: 'Deep Explorer' (many events, no outcome), 'Fast Converter' (few steps, high completion rate), "
+                "'Abandoner at Step 3' (consistent exit point). NEVER name archetypes after marketing demographics or industry personas "
+                "unless those exact labels appear verbatim in a tool result.\n\n"
+                "If `session_classification` ran [AX], use the EXACT segment labels it returned (they are data-derived from THIS dataset). "
+                "If `user_segmentation` ran instead, use its cluster descriptions. "
+                "Never import persona names from prior domain knowledge.\n"
                 "{\n"
-                "  'persona_count': 4,\n"  
+                "  'persona_count': 3,\n"
                 "  'personas': [\n"
                 "    {\n"
-                "      'name': 'If session_classification ran: use Converter/Attempter/Shopper/Browser. Else: derive from data.',\n"
-                "      'size': 'N users (X%) [NodeID: session_classification or user_segmentation]',\n"
-                "      'profile': 'Data-derived description. E.g.: Users who trigger event X > 5 times but never reach event Y. [A3]',\n"
-                "      'pain_points': ['Pain point grounded in specific event/metric from tool result'],\n"
-                "      'opportunities': ['Quick win opportunity tied to a specific fix'],\n"
+                "      'name': 'Derive from data patterns, e.g. High-Engagement Non-Converter or Early Dropout',\n"
+                "      'size': 'N entities (X%) [NodeID that provided this breakdown]',\n"
+                "      'profile': 'Data-derived description citing the specific events/metrics that define this group. [AX]',\n"
+                "      'pain_points': ['Pain point grounded in a specific event or metric from a tool result'],\n"
+                "      'opportunities': ['Concrete action tied to a specific finding from [AX]'],\n"
                 "      'priority_level': 'high|medium|low'\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
 
-                "### intervention_strategies — Concrete, event-level interventions\n"
+                "### intervention_strategies — Concrete, evidence-backed actions\n"
+                "ONLY include this section if at least one analysis returned severity `critical` or `high`, "
+                "or if `intervention_triggers` was run. Omit the key entirely for descriptive/statistical datasets "
+                "where no actionable intervention signal was found.\n\n"
+                "Interventions MUST be domain-agnostic. Describe WHAT to do in terms of the data events/metrics found — "
+                "do NOT assume a UI, an email system, or a SaaS product. Instead, describe the action in terms of "
+                "the triggering condition and the outcome variable from the data.\n"
                 "{\n"
                 "  'critical_count': 1,\n"
                 "  'strategies': [\n"
                 "    {\n"
                 "      'severity': 'critical|high|medium|low',\n"
-                "      'title': 'Title referencing the specific event or stage',\n"
-                "      'realtime_interventions': ['Show modal WHEN event Y is triggered for the 3rd time [A3]'],\n"
-                "      'proactive_outreach': ['Email users who completed event X but NOT event Z within 24h [A2]']\n"
+                "      'title': 'Title referencing the specific event, metric, or stage from [AX]',\n"
+                "      'realtime_interventions': [\n"
+                "        'Trigger an action WHEN [specific event from AX] occurs for the Nth time — cite the exact threshold from the data [AX]'\n"
+                "      ],\n"
+                "      'proactive_outreach': [\n"
+                "        'Target entities who completed [event X] but NOT [event Z] within [timeframe derived from data] [AX]'\n"
+                "      ]\n"
                 "    }\n"
                 "  ]\n"
                 "}\n\n"
@@ -628,17 +646,19 @@ def get_synthesis_agent():
                 "}\n\n"
 
                 "### conversational_report — Long-form markdown narrative\n"
-                "Write a detailed markdown document formatted as a professional product analytics report. "
-                "Structure it with these sections:\n"
-                "# PART 1: BEHAVIOURAL & UX ANALYSIS\n"
-                "## User Intent Analysis (what are users TRYING to do vs what they ACTUALLY do)\n"
-                "## Friction Point Inventory (markdown table: Friction Point | Evidence [NodeID] | Severity | Estimated Impact)\n"
-                "# PART 2: BEHAVIORAL PERSONAS\n"
-                "## Archetype Profiles (one subsection per persona)\n"
-                "# PART 3: INTERVENTION ROADMAP\n"
-                "## Quick Wins (actions achievable in < 2 weeks)\n"
-                "## Strategic Initiatives (actions requiring > 1 month)\n"
-                "# CONFIDENCE ASSESSMENT\n"
+                "Write a detailed markdown document formatted as a professional data intelligence report. "
+                "Adapt the section structure to the DATASET TYPE and analyses that were actually run — "
+                "do not force product/UX framing onto non-behavioral datasets.\n\n"
+                "REQUIRED structure (use these section titles exactly, adapt only sub-headings to the data):\n"
+                "# Key Findings\n"
+                "## What the Data Shows (2-3 paragraphs summarising the most important patterns, citing [NodeIDs])\n"
+                "## Finding Inventory (markdown table: Finding | Evidence [NodeID] | Severity | Estimated Impact)\n"
+                "# Entity Profiles  (ONLY if segmentation data is available — omit this section entirely otherwise)\n"
+                "## Archetype Profiles (one subsection per segment, named from data)\n"
+                "# Action Roadmap\n"
+                "## Immediate Actions (achievable quickly, citing the specific metric/event to target)\n"
+                "## Strategic Initiatives (longer-horizon, with data justification)\n"
+                "# Confidence Assessment\n"
                 "| Claim | Evidence [NodeID] | Confidence Level |\n"
                 "|---|---|---|\n"
                 "| Each major claim | Which node supports it | High/Medium/Low based on data completeness |\n\n"

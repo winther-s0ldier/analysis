@@ -4,22 +4,16 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 env_path = Path(__file__).parent / ".env"
-load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path=env_path, override=True)
 
-api_key = os.getenv("GEMINI_API_KEY")
-if api_key:
-    # Strip quotes if present
-    os.environ["GEMINI_API_KEY"] = api_key.strip('"\'')
-    print(f"INFO: Gemini API Key loaded: {api_key[:4]}...")
+_raw_key = os.getenv("GEMINI_API_KEY")
+if _raw_key:
+    _raw_key = _raw_key.strip('"\'')
+    os.environ["GEMINI_API_KEY"] = _raw_key
+    os.environ["GOOGLE_API_KEY"] = _raw_key
+    print(f"INFO: Gemini API Key loaded: {_raw_key[:4]}...")
 else:
     print("WARNING: Gemini API Key NOT found in environment!")
-
-gemini_key = os.getenv("GOOGLE_API_KEY")
-if gemini_key:
-    os.environ["GOOGLE_API_KEY"] = gemini_key.strip('"\'')
-    print(f"INFO: Google API Key loaded: {gemini_key[:4]}...")
-else:
-    print("WARNING: Google API Key NOT found in environment!")
 
 import uuid
 import json
@@ -48,6 +42,7 @@ from agents.profiler import get_profiler_agent, get_profile_result
 from agents.coder import get_coder_agent
 from agents.synthesis import get_synthesis_agent
 from agents.dag_builder import get_dag_builder_agent
+from agents.chat_agent import get_chat_agent
 from tools.csv_profiler import profile_csv
 from tools.ingestion_normalizer import (
     normalize_file,
@@ -90,6 +85,7 @@ class SessionState:
 
         self.message_log: list = []
         self.normalization: dict = {}
+        self.gate_result: dict = {}
 
         self.user_instructions: str = ""
     
@@ -163,6 +159,7 @@ async def run_agent_pipeline(
         "coder":       get_coder_agent,
         "synthesis":   get_synthesis_agent,
         "dag_builder": get_dag_builder_agent,
+        "chat":        get_chat_agent,
     }
     getter = agent_map.get(
         agent_getter, get_root_agent
@@ -426,6 +423,8 @@ async def profile_dataset(session_id: str):
             "columns": raw.get("columns"),
             "column_types": raw.get("column_types", {}),
             "correlations": raw.get("correlations"),
+            "memory_mb": raw.get("memory_mb"),
+            "column_roles": raw.get("column_roles", {}),
         },
         "classification": profiler_data.get("classification"),
     }
@@ -462,11 +461,6 @@ def build_fallback_discovery(state: SessionState, session_id: str) -> dict:
         selected_analyses=recommended,
         row_count=row_count,
     )
-
-    plan_json = json.dumps({
-        "data_summary": dag_result.get("data_summary", ""),
-        "dag": dag_result.get("dag", []),
-    })
 
     plan_json = json.dumps({
         "data_summary": dag_result.get("data_summary", ""),
@@ -706,10 +700,10 @@ async def get_status(session_id: str):
 async def chat(session_id: str, request: Request):
     """
     Two-mode chat:
-    - Pre-pipeline (status in uploaded/discovered): stores message as
-      user_instructions for the next pipeline run.
-    - Post-pipeline (status == complete): enriches prompt with session
-      results and synthesis for context-aware answers.
+    - Pre-pipeline: stores message as user_instructions for the next run.
+    - Post-pipeline: routes to the dedicated chat_agent with the full
+      context (synthesis, all findings, column profile). Never triggers
+      the analysis pipeline.
     """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -719,63 +713,135 @@ async def chat(session_id: str, request: Request):
     if not message:
         return {"session_id": session_id, "response": "Please provide a message."}
 
-    session_info = sessions[session_id]
-    csv_path = session_info.csv_path
-    output_folder = session_info.output_folder
+    state = sessions[session_id]
 
-    if session_info.status in ("uploaded", "profiled", "discovered", "profiling", "discovering"):
-        if session_info.user_instructions:
-            session_info.user_instructions += f"\n{message}"
+    # ── Pre-pipeline: queue as instructions ──────────────────────────────
+    if state.status in ("uploaded", "profiled", "discovered", "profiling", "discovering"):
+        if state.user_instructions:
+            state.user_instructions += f"\n{message}"
         else:
-            session_info.user_instructions = message
-
+            state.user_instructions = message
         return {
             "session_id": session_id,
             "response": (
-                f"Got it — I'll factor \"{message}\" into "
-                f"the analysis when the pipeline runs. "
-                f"You can add more instructions or click "
-                f"'Execute Analysis Pipeline' when ready."
+                "Got it — I'll factor that into the analysis when the pipeline runs. "
+                "Add more instructions or click 'Execute Analysis Pipeline' when ready."
             ),
         }
 
-    context_parts = [
-        f"CSV file: {csv_path}",
-        f"Output folder: output/{output_folder}",
-        f"Dataset type: {session_info.dataset_type}",
-    ]
+    # ── Post-pipeline: answer from full context via chat_agent ───────────
+    context_parts = []
 
-    col_roles = session_info.semantic_map.get("column_roles", {})
-    if col_roles:
-        context_parts.append(f"Column roles: {json.dumps(col_roles)}")
+    # 1. Dataset basics
+    col_roles = (state.semantic_map or {}).get("column_roles", {}) if hasattr(state, "semantic_map") else {}
+    profile   = getattr(state, "raw_profile", {}) or {}
+    columns   = profile.get("columns", [])
+    col_summary = ", ".join(
+        f"{c['name']} ({c.get('type_category','?')})" for c in columns[:30]
+    ) if columns else "unavailable"
 
-    if session_info.results:
-        findings = []
-        for aid, result in session_info.results.items():
-            atype = result.get("analysis_type", aid)
+    context_parts.append(
+        f"DATASET\n"
+        f"  File: {os.path.basename(state.csv_path)}\n"
+        f"  Type: {getattr(state, 'dataset_type', 'unknown')}\n"
+        f"  Rows: {profile.get('row_count', '?')}\n"
+        f"  Columns: {col_summary}\n"
+        f"  Column roles: {json.dumps(col_roles)}"
+    )
+
+    # 2. Full analysis findings — no truncation
+    if state.results:
+        lines = []
+        for aid, result in state.results.items():
+            atype   = result.get("analysis_type", aid)
             finding = result.get("top_finding", "")
-            if finding:
-                findings.append(f"- {atype}: {finding[:200]}")
-        if findings:
-            context_parts.append(
-                "COMPLETED ANALYSES:\n" + "\n".join(findings)
+            sev     = result.get("severity", "info")
+            nav     = result.get("data", {}).get("narrative", {})
+            what    = nav.get("what_it_means", "")
+            fix     = nav.get("proposed_fix", "")
+            ins_sum = result.get("insight_summary", {})
+            rec     = ins_sum.get("recommendation", "")
+
+            block = f"[{aid}] {atype} (severity: {sev})\n  Finding: {finding}"
+            if what: block += f"\n  What it means: {what}"
+            if fix:  block += f"\n  Proposed fix: {fix}"
+            if rec:  block += f"\n  Recommendation: {rec}"
+            lines.append(block)
+        context_parts.append("ANALYSIS RESULTS\n" + "\n\n".join(lines))
+
+    # 3. Full synthesis — all sections
+    synth = getattr(state, "synthesis", {}) or {}
+    if synth:
+        synth_parts = []
+
+        exec_sum = synth.get("executive_summary", {})
+        if exec_sum:
+            synth_parts.append(
+                f"Executive Summary:\n"
+                f"  Health: {exec_sum.get('overall_health','')}\n"
+                f"  Priorities: {'; '.join(exec_sum.get('top_priorities', []))}\n"
+                f"  Business impact: {exec_sum.get('business_impact','')}\n"
+                f"  Timeline: {exec_sum.get('timeline','')}"
             )
 
-    if session_info.synthesis:
-        synth = session_info.synthesis
-        overview = ""
-        if isinstance(synth, dict):
-            exec_sum = synth.get("executive_summary", {})
-            if isinstance(exec_sum, dict):
-                overview = exec_sum.get("overview", "")
-        if overview:
-            context_parts.append(
-                f"SYNTHESIS OVERVIEW: {overview[:500]}"
-            )
+        insights = synth.get("detailed_insights", {}).get("insights", [])
+        if insights:
+            ins_lines = [
+                f"  - {i.get('title','')} [{i.get('fix_priority','')}]: "
+                f"{i.get('ai_summary','')} | "
+                f"Root cause: {i.get('root_cause_hypothesis','')} | "
+                f"Fix: {'; '.join(i.get('how_to_fix', []))}"
+                for i in insights
+            ]
+            synth_parts.append("Detailed Insights:\n" + "\n".join(ins_lines))
 
-    context = "\n".join(context_parts)
-    prompt = f"{context}\n\nUser question: {message}"
-    response = await run_agent_pipeline(session_id, prompt)
+        strategies = synth.get("intervention_strategies", {}).get("strategies", [])
+        if strategies:
+            strat_lines = [
+                f"  - [{s.get('severity','')}] {s.get('title','')}: "
+                f"Real-time: {'; '.join(s.get('realtime_interventions',[]))} | "
+                f"Proactive: {'; '.join(s.get('proactive_outreach',[]))}"
+                for s in strategies
+            ]
+            synth_parts.append("Intervention Strategies:\n" + "\n".join(strat_lines))
+
+        personas = synth.get("personas", {}).get("personas", [])
+        if personas:
+            p_lines = [
+                f"  - {p.get('name','')} ({p.get('priority_level','')}): "
+                f"{p.get('profile','')} | "
+                f"Pain: {'; '.join(p.get('pain_points',[])[:3])} | "
+                f"Opp: {'; '.join(p.get('opportunities',[])[:2])}"
+                for p in personas
+            ]
+            synth_parts.append("User Profiles:\n" + "\n".join(p_lines))
+
+        connections = synth.get("cross_metric_connections", {}).get("connections", [])
+        if connections:
+            cx_lines = [
+                f"  - {c.get('finding_a','')} × {c.get('finding_b','')} "
+                f"→ {c.get('synthesized_meaning','')}"
+                for c in connections
+            ]
+            synth_parts.append("Cross-Metric Connections:\n" + "\n".join(cx_lines))
+
+        conv = synth.get("conversational_report", "")
+        if conv:
+            synth_parts.append(f"Narrative Report:\n{conv}")
+
+        context_parts.append("SYNTHESIS\n" + "\n\n".join(synth_parts))
+
+    # 4. Assemble prompt and call dedicated chat agent
+    separator = "\n" + "=" * 60 + "\n"
+    full_context = separator.join(context_parts)
+    prompt = f"{full_context}\n\n{'=' * 60}\nUSER QUESTION: {message}"
+
+    response = await run_agent_pipeline(
+        f"{session_id}_chat",
+        prompt,
+        agent_getter="chat",
+        max_turns=4,
+    )
 
     return {"session_id": session_id, "response": response}
 
@@ -784,10 +850,9 @@ async def chat(session_id: str, request: Request):
 async def add_metric(session_id: str, request: Request):
     """
     Add and execute a single custom metric after discovery.
-    1. Validates the metric against available data
-    2. Creates a custom DAG node
-    3. Executes it via coder agent
-    4. Returns the result (chart + finding)
+    1. AI validates whether the data supports the requested metric
+    2. If unsupported, returns missing requirements without running
+    3. If supported, uses AI-generated description + column mapping then executes
     """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -798,18 +863,84 @@ async def add_metric(session_id: str, request: Request):
         raise HTTPException(400, "No metric description provided")
 
     state = sessions[session_id]
+    profile      = state.raw_profile or {}
+    dataset_type = state.dataset_type or "unknown"
 
-    validation = {
-        "valid": True,
-        "analysis_type": "custom",
-        "metric_name": metric_text[:30],
-        "description": metric_text
-    }
-    analysis_type = validation["analysis_type"]
-    analysis_id = f"C{len(state.results) + 1}"
+    # ── Step 1: Build a rich column context for the LLM ──────────────────
+    col_lines = []
+    for c in profile.get("columns", []):
+        line = f"  - {c['name']} ({c.get('type_category', 'unknown')}, {c.get('unique_count', '?')} unique"
+        samples = c.get("sample_values", [])
+        if samples:
+            line += f", e.g. {samples[:3]}"
+        line += ")"
+        col_lines.append(line)
+    col_block = "\n".join(col_lines) if col_lines else "  (no profile available)"
+
+    validation_prompt = (
+        f"Dataset type: {dataset_type}\n"
+        f"Available columns:\n{col_block}\n\n"
+        f"User's analysis request: \"{metric_text}\"\n\n"
+        f"TASK:\n"
+        f"1. Determine if this analysis can be performed with the columns listed above.\n"
+        f"2. If feasible: map the required column roles from the ACTUAL column names above, "
+        f"pick the closest analysis_type from the known library types, "
+        f"and write a 2-sentence description of what will be computed and what insight it reveals.\n"
+        f"3. If not feasible: list exactly what data or column types are missing.\n\n"
+        f"Known analysis_type values (use the closest match, or 'custom' if none fit):\n"
+        f"session_detection, funnel_analysis, friction_detection, survival_analysis, "
+        f"user_segmentation, transition_analysis, dropout_analysis, sequential_pattern_mining, "
+        f"association_rules, distribution_analysis, categorical_analysis, correlation_matrix, "
+        f"anomaly_detection, missing_data_analysis, trend_analysis, cohort_analysis, "
+        f"rfm_analysis, pareto_analysis, event_taxonomy, user_journey_analysis, "
+        f"intervention_triggers, session_classification, contribution_analysis, cross_tab_analysis\n\n"
+        f"Respond with ONLY this JSON (no extra text, no markdown):\n"
+        f'{{"valid": true, "reason": "one sentence", '
+        f'"metric_name": "3-5 word clean name", '
+        f'"description": "2 sentences: what is computed and what insight it reveals", '
+        f'"analysis_type": "exact type or custom", '
+        f'"column_roles": {{"entity_col": "col_name or null", "time_col": "col_name or null", '
+        f'"event_col": "col_name or null", "outcome_col": "col_name or null"}}, '
+        f'"missing_requirements": []}}'
+    )
+
+    # ── Step 2: Ask the discovery LLM to validate ────────────────────────
+    validation = {}
+    try:
+        val_response = await run_agent_pipeline(
+            f"{session_id}_validate_custom",
+            validation_prompt,
+            agent_getter="discovery",
+        )
+        validation = extract_json(val_response) or {}
+        print(f"INFO: Custom metric validation for '{metric_text[:40]}': "
+              f"valid={validation.get('valid')} type={validation.get('analysis_type')}")
+    except Exception as ve:
+        print(f"WARNING: Custom metric validation LLM call failed: {ve}. Proceeding with defaults.")
+        # On LLM failure, fall through to default behaviour (treat as valid custom)
+
+    # ── Step 3: If invalid, return unsupported early ─────────────────────
+    if validation.get("valid") is False:
+        missing = validation.get("missing_requirements", [])
+        reason  = validation.get("reason", "This analysis cannot be performed with the available data.")
+        return {
+            "session_id":          session_id,
+            "status":              "unsupported",
+            "reason":              reason,
+            "missing_requirements": missing,
+        }
+
+    # ── Step 4: Use AI-generated fields where available ──────────────────
+    analysis_type  = validation.get("analysis_type") or "custom"
+    description    = validation.get("description") or metric_text
+    ai_roles       = validation.get("column_roles") or {}
+
+    # Merge: AI-derived roles override the session semantic map
+    base_roles   = state.semantic_map.get("column_roles", {})
+    merged_roles = {**base_roles, **{k: v for k, v in ai_roles.items() if v}}
+
+    analysis_id   = f"C{len(state.results) + 1}"
     output_folder = f"output/{state.output_folder}"
-
-    column_roles = state.semantic_map.get("column_roles", {})
 
     try:
         from agents.orchestrator import execute_single_analysis
@@ -819,32 +950,34 @@ async def add_metric(session_id: str, request: Request):
             analysis_id=analysis_id,
             csv_path=state.csv_path,
             output_folder=output_folder,
-            description=metric_text,
-            column_roles=column_roles,
+            description=description,
+            column_roles=merged_roles,
             state=state,
         )
 
         if result.get("status") == "success":
             return {
-                "session_id": session_id,
-                "status": "success",
+                "session_id":  session_id,
+                "status":      "success",
                 "analysis_id": analysis_id,
                 "analysis_type": result.get("analysis_type", analysis_type),
+                "metric_name": validation.get("metric_name", metric_text[:40]),
                 "top_finding": result.get("top_finding", ""),
-                "chart_path": result.get("chart_file_path"),
-                "severity": result.get("severity", "info"),
+                "chart_path":  result.get("chart_file_path"),
+                "severity":    result.get("severity", "info"),
+                "description": description,
             }
         else:
             return {
                 "session_id": session_id,
-                "status": "error",
-                "error": result.get("error", "Analysis failed"),
+                "status":     "error",
+                "error":      result.get("error", "Analysis execution failed"),
             }
     except Exception as e:
         return {
             "session_id": session_id,
-            "status": "error",
-            "error": str(e),
+            "status":     "error",
+            "error":      str(e),
         }
 
 
@@ -857,13 +990,86 @@ async def get_results(session_id: str):
     results = []
     for aid, result in state.results.items():
         results.append({
-            "analysis_id":   aid,
-            "analysis_type": result.get("analysis_type"),
-            "top_finding":   result.get("top_finding",""),
-            "severity":      result.get("severity","info"),
-            "chart_path":    result.get("chart_file_path"),
+            "analysis_id":     aid,
+            "analysis_type":   result.get("analysis_type"),
+            "top_finding":     result.get("top_finding", ""),
+            "severity":        result.get("severity", "info"),
+            "chart_path":      result.get("chart_file_path"),
+            "insight_summary": result.get("insight_summary", {}),
+            "narrative":       result.get("data", {}).get("narrative", {}),
+            "status":          result.get("status", "success"),
         })
     return results
+
+
+@app.post("/retry/{session_id}/{node_id}")
+async def retry_node(session_id: str, node_id: str):
+    """Re-execute a failed or pending DAG node."""
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(404, "Session not found")
+
+    # Find the node spec in the stored DAG
+    node = next((n for n in (state.dag or []) if n.get("id") == node_id), None)
+    if not node:
+        raise HTTPException(404, f"Node {node_id} not found in pipeline plan")
+
+    analysis_type = node.get("analysis_type", "custom")
+    description   = node.get("description", analysis_type)
+    column_roles  = state.semantic_map.get("column_roles", {})
+    output_folder = f"output/{state.output_folder}"
+
+    # Remove from failed_nodes so it's treated as fresh
+    state.failed_nodes.discard(node_id)
+    state.results.pop(node_id, None)
+
+    try:
+        from agents.orchestrator import execute_single_analysis
+        result = await execute_single_analysis(
+            session_id=session_id,
+            analysis_type=analysis_type,
+            analysis_id=node_id,
+            csv_path=state.csv_path,
+            output_folder=output_folder,
+            description=description,
+            column_roles=column_roles,
+            state=state,
+        )
+        ok = result.get("status") == "success"
+        return {
+            "status":        "success" if ok else "error",
+            "analysis_id":   node_id,
+            "analysis_type": result.get("analysis_type", analysis_type),
+            "top_finding":   result.get("top_finding", ""),
+            "chart_path":    result.get("chart_file_path"),
+            "severity":      result.get("severity", "info"),
+            "insight_summary": result.get("insight_summary", {}),
+            "narrative":       result.get("data", {}).get("narrative", {}),
+            "error":         result.get("error"),
+        }
+    except Exception as e:
+        state.failed_nodes.add(node_id)
+        return {"status": "error", "analysis_id": node_id, "error": str(e)}
+
+
+@app.post("/report/refresh/{session_id}")
+async def refresh_report(session_id: str):
+    """Regenerate the HTML report to include any custom analyses added after initial pipeline."""
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(404, "Session not found")
+    if not state.output_folder:
+        raise HTTPException(400, "No output folder — run the pipeline first")
+
+    try:
+        from agents.dag_builder import tool_build_report
+        result = tool_build_report(
+            session_id=session_id,
+            output_folder=f"output/{state.output_folder}",
+        )
+        return {"status": "success", "chart_count": result.get("chart_count", 0)}
+    except Exception as e:
+        raise HTTPException(500, f"Report refresh failed: {e}")
 
 
 @app.get("/chart/{session_id}/{analysis_id}")
@@ -944,7 +1150,7 @@ async def list_sessions():
 
 
 @app.get("/api/session/{session_id}/status")
-async def get_pipeline_status(session_id: str):
+async def api_get_pipeline_status(session_id: str):
     """
     Returns real-time pipeline status for the frontend grid panel.
     Includes node pass/fail states, gate results, and monitor alerts.
@@ -968,7 +1174,7 @@ async def get_pipeline_status(session_id: str):
         for node in state.dag:
             nid = node["id"]
             if nid in state.results:
-                status = "success"
+                status = "complete"
                 error = ""
             elif hasattr(state, "failed_nodes") and nid in state.failed_nodes:
                 status = "failed"

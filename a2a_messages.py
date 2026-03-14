@@ -255,7 +255,7 @@ class PipelineState:
     """
     session_id: str
     total_nodes: int = 0
-    nodes: Dict[str, str] = field(default_factory=dict)
+    nodes: Dict[str, Any] = field(default_factory=dict)
 
     completed: List[str] = field(default_factory=list)
     running: List[str] = field(default_factory=list)

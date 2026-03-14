@@ -10,6 +10,7 @@ from tools.csv_profiler import (
     infer_column_semantics,
     classify_dataset,
 )
+from tools.model_config import get_model
 from a2a_messages import create_message, Intent
 
 
@@ -38,9 +39,6 @@ def tool_profile_and_classify(
         "raw_profile": raw_profile
     }
 
-
-from tools.model_config import get_model
-
 _profiler_agent_instance = None
 
 def get_profiler_agent():
@@ -67,19 +65,23 @@ def get_profiler_agent():
                 "4. Output the EXACT JSON schema defined below. No extra text.\n\n"
 
                 "## COLUMN ROLE DEFINITIONS (Infer from data shape, NOT column names)\n"
-                "- `entity_col`: High-cardinality column of identifiers (UUIDs, IDs, hashes). Evidence: high unique count, string or int type.\n"
-                "- `time_col`: Temporal column. Evidence: datetime dtype, or string parseable as ISO8601 / epoch.\n"
-                "- `event_col`: Categorical column describing what happened. Evidence: low-to-medium cardinality, string type, repeating values per entity.\n"
-                "- `outcome_col`: Numeric column representing a measurable result (revenue, score, duration). Evidence: numeric dtype, non-trivial variance.\n"
-                "- `funnel_col`: Ordered categorical column representing progression stages. Evidence: small cardinality, values suggest an ordered journey.\n\n"
+                "- `entity_col`: High-cardinality column of identifiers (UUIDs, IDs, hashes, codes). Evidence: high unique count, string or int type, consistent format.\n"
+                "- `time_col`: Temporal column. Evidence: datetime dtype, epoch integers, or string parseable as ISO8601.\n"
+                "- `event_col`: Categorical column describing WHAT happened. Evidence: low-to-medium cardinality, string type, repeating values across rows for the same entity.\n"
+                "- `outcome_col`: Numeric column representing a measurable result (any quantity: revenue, score, count, duration, measurement). Evidence: numeric dtype, non-trivial variance.\n"
+                "- `funnel_col`: Ordered categorical column representing PROGRESSION STAGES. Evidence: small cardinality (2–15 distinct values), values suggest sequential steps or levels.\n\n"
+                "IMPORTANT: column roles describe DATA STRUCTURE only. `entity_col` might be a patient ID, machine ID, customer ID, or account ID — do not assume any domain. "
+                "`event_col` might be a medical procedure, a log event type, a sensor reading label, or a web action — name does not matter, data pattern does.\n\n"
 
                 "## DATASET TYPE RULES\n"
-                "Assign `dataset_type` based on the PRESENCE of required columns:\n"
-                "- `event_log`: Has `entity_col` + `time_col` + `event_col`. The most structured behavioral dataset.\n"
-                "- `transactional`: Has `entity_col` + `time_col` + `outcome_col`. No event action column.\n"
-                "- `time_series`: Has `time_col` + `outcome_col`. No entity column (aggregate over time).\n"
-                "- `funnel`: Has `entity_col` + `funnel_col`. No raw event column.\n"
-                "- `tabular_generic`: Does not fit any of the above. Treat as a static cross-sectional table.\n\n"
+                "Assign `dataset_type` based on the PRESENCE of required columns. "
+                "These types are based on DATA STRUCTURE — not domain. A medical trial log and a web event log can both be `event_log`.\n"
+                "- `event_log`: Has `entity_col` + `time_col` + `event_col`. Entities perform discrete, named actions over time.\n"
+                "- `transactional`: Has `entity_col` + `time_col` + `outcome_col`. Entities generate measurable outcomes over time, but no named event column.\n"
+                "- `time_series`: Has `time_col` + `outcome_col`. Aggregate measurements over time; no per-entity column.\n"
+                "- `funnel`: Has `entity_col` + `funnel_col`. Entities are at named sequential stages; no raw timestamp.\n"
+                "- `survey_or_cross_sectional`: Rows represent a single observation per entity at one point in time. Typically no time or event column. Common for survey data, census snapshots, or scored records.\n"
+                "- `tabular_generic`: Does not fit any of the above, or the data structure is mixed/ambiguous. Treat as a static cross-sectional table.\n\n"
 
                 "## CONFIDENCE SCORING\n"
                 "Set `confidence` between 0.0 and 1.0 based on how clearly the data fits the assigned type:\n"
@@ -92,13 +94,16 @@ def get_profiler_agent():
                 "- DO infer column roles from data distributions and uniqueness ratios, not from column name patterns.\n"
                 "- DO set `outcome_col` or `funnel_col` to `null` if no clear evidence exists.\n"
                 "- DO embed the FULL `raw_profile` dict from the tool call into your output — do not truncate or summarise it.\n"
-                "- DO produce `recommended_analyses` that are appropriate for the assigned dataset_type only.\n\n"
+                "- DO produce `recommended_analyses` that are appropriate for the assigned dataset_type and the column roles actually found.\n"
+                "- DO use `survey_or_cross_sectional` when rows are single per-entity observations with no time/event structure.\n"
+                "- DO use `tabular_generic` when the data is genuinely mixed or ambiguous — do not force a structured type onto messy data.\n\n"
 
                 "## DON'Ts\n"
-                "- DON'T hardcode English keywords (e.g., never rely on 'user_id', 'timestamp' matching as strings).\n"
+                "- DON'T hardcode English keywords (e.g., never rely on 'user_id' or 'timestamp' matching as exact strings).\n"
                 "- DON'T assign a column role based purely on column name without cross-checking data statistics.\n"
                 "- DON'T suggest more than 6 recommended analyses — keep to the most relevant.\n"
                 "- DON'T fabricate statistics or sample values that were not returned by the tool.\n"
+                "- DON'T make domain assumptions — the dataset could be from ANY industry, language, or field.\n"
                 "- DON'T output any text outside the JSON block.\n\n"
 
                 "## OUTPUT SCHEMA (Strict JSON — no deviations)\n"
@@ -117,7 +122,8 @@ def get_profiler_agent():
                 "      \"outcome_col\": \"<actual_column_name or null>\",\n"
                 "      \"funnel_col\": \"<actual_column_name or null>\"\n"
                 "    },\n"
-                "    \"recommended_analyses\": [\"session_detection\", \"funnel_analysis\", \"dropout_analysis\"]\n"
+                "    \"recommended_analyses\": [\"session_detection\", \"funnel_analysis\", \"dropout_analysis\"],\n"
+                "    \"reasoning\": \"One sentence: WHY this dataset_type was assigned, referencing specific column names and their observed data characteristics.\"\n"
                 "  }\n"
                 "}\n"
                 "```\n"

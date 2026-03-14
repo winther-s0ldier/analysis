@@ -546,9 +546,34 @@ def generate_chart(
                 )
 
         elif chart_type == "dropout_bar":
-            events = chart_ready_data.get("events", [])
-            counts = chart_ready_data.get("counts", [])
-            rates = chart_ready_data.get("dropout_rates", [])
+            # Try canonical key names first, then common coder-agent alternatives
+            events = (
+                chart_ready_data.get("events") or
+                chart_ready_data.get("event_names") or
+                chart_ready_data.get("event_types") or
+                chart_ready_data.get("labels") or
+                []
+            )
+            counts = (
+                chart_ready_data.get("counts") or
+                chart_ready_data.get("dropout_counts") or
+                chart_ready_data.get("values") or
+                chart_ready_data.get("frequencies") or
+                []
+            )
+            rates = (
+                chart_ready_data.get("dropout_rates") or
+                chart_ready_data.get("rates") or
+                chart_ready_data.get("dropout_rate") or
+                []
+            )
+            # Last-resort: pick any list of strings as labels and any list of numbers as values
+            if not events or not counts:
+                str_keys = [k for k, v in chart_ready_data.items() if isinstance(v, list) and v and isinstance(v[0], str)]
+                num_keys = [k for k, v in chart_ready_data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
+                if str_keys and num_keys:
+                    events = chart_ready_data[str_keys[0]]
+                    counts = chart_ready_data[num_keys[0]]
             if events and counts:
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
@@ -705,6 +730,92 @@ def generate_chart(
                     xaxis_title="Recency Score",
                     yaxis_title="Frequency Score",
                 )
+
+        # ── NEW HANDLERS ──────────────────────────────────────────────────────
+
+        elif chart_type == "horizontal_bar":
+            labels = chart_ready_data.get("labels", [])
+            values = chart_ready_data.get("values", [])
+            if labels and values:
+                fig = go.Figure(go.Bar(
+                    x=values, y=labels,
+                    orientation="h",
+                    marker_color="#3B5BDB",
+                    hovertemplate="%{y}: %{x:,}<extra></extra>",
+                ))
+                fig.update_layout(
+                    xaxis_title="Count",
+                    yaxis=dict(autorange="reversed"),
+                )
+
+        elif chart_type == "bar_chart":
+            labels = chart_ready_data.get("labels", [])
+            values = chart_ready_data.get("values", [])
+            if labels and values:
+                fig = go.Figure(go.Bar(
+                    x=labels, y=values,
+                    marker_color="#3B5BDB",
+                    hovertemplate="%{x}: %{y:,}<extra></extra>",
+                ))
+                fig.update_layout(yaxis_title="Count")
+
+        elif chart_type == "pie_chart":
+            labels = chart_ready_data.get("labels", [])
+            values = chart_ready_data.get("values", [])
+            if labels and values:
+                fig = go.Figure(go.Pie(
+                    labels=labels, values=values,
+                    hole=0.35,
+                    textinfo="label+percent",
+                    hovertemplate="%{label}: %{value:.1f}%<extra></extra>",
+                ))
+
+        elif chart_type == "heatmap":
+            lbl = chart_ready_data.get("labels", {})
+            x_labels = lbl.get("x", []) if isinstance(lbl, dict) else chart_ready_data.get("x", [])
+            y_labels = lbl.get("y", []) if isinstance(lbl, dict) else chart_ready_data.get("y", [])
+            matrix   = chart_ready_data.get("values", chart_ready_data.get("z", []))
+            if matrix:
+                fig = go.Figure(go.Heatmap(
+                    z=matrix, x=x_labels, y=y_labels,
+                    colorscale="Blues",
+                    hovertemplate="x=%{x}<br>y=%{y}<br>count=%{z:,}<extra></extra>",
+                ))
+                fig.update_layout(yaxis_autorange="reversed")
+
+        elif chart_type == "intervention_bar":
+            triggers      = chart_ready_data.get("triggers", [])
+            dropout_rates = chart_ready_data.get("dropout_rates", [])
+            risk_levels   = chart_ready_data.get("risk_levels", [])
+            if triggers and dropout_rates:
+                color_map = {"critical": "#C92A2A", "high": "#E67700", "medium": "#F59F00", "low": "#2F9E44"}
+                colors = [color_map.get(str(r).lower(), "#3B5BDB") for r in risk_levels] if risk_levels else "#3B5BDB"
+                fig = go.Figure(go.Bar(
+                    x=[f"{r:.1%}" for r in dropout_rates],
+                    y=triggers,
+                    orientation="h",
+                    marker_color=colors,
+                    hovertemplate="%{y}<br>Dropout: %{x}<extra></extra>",
+                ))
+                fig.update_layout(
+                    xaxis_title="Dropout Rate",
+                    yaxis=dict(autorange="reversed"),
+                )
+
+        elif chart_type == "persona_donut":
+            personas = chart_ready_data.get("personas", [])
+            counts   = chart_ready_data.get("counts", [])
+            pcts     = chart_ready_data.get("pcts", [])
+            if personas and counts:
+                fig = go.Figure(go.Pie(
+                    labels=personas,
+                    values=counts,
+                    hole=0.42,
+                    textinfo="label+percent",
+                    hovertemplate="%{label}<br>%{value:,} sessions (%{percent})<extra></extra>",
+                ))
+
+        # ─────────────────────────────────────────────────────────────────────
 
         if fig is None:
             print(f"WARNING: generate_chart — no handler for chart_type='{chart_type}' "

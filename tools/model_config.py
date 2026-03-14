@@ -14,6 +14,7 @@ _AGENT_MODELS = {
     "discovery":    MODEL,
     "synthesis":    MODEL,
     "dag_builder":  MODEL,
+    "chat":         MODEL,
 }
 
 

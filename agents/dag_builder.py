@@ -71,7 +71,9 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
         for fname in os.listdir(output_folder):
             if fname.endswith(".html") and fname != "report.html":
                 fpath = os.path.join(output_folder, fname)
-                if not any(c["chart_path"] == fpath for c in charts):
+                # Use abspath on both sides so absolute vs relative path
+                # differences do not cause the same file to be added twice.
+                if not any(os.path.abspath(c["chart_path"]) == os.path.abspath(fpath) for c in charts):
                     parts = fname.replace(".html", "").split("_", 1)
                     charts.append({
                         "analysis_id": parts[0],
@@ -294,7 +296,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     ch_h = "".join(ch_chunks)
 
     conv_rep = synthesis.get("conversational_report", "")
-    
+
     if conv_rep:
         try:
             import markdown
@@ -304,32 +306,76 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     else:
         conv_h = ""
 
+    # Cross-metric connections (present in UI, previously missing from report)
+    cx = synthesis.get("cross_metric_connections", {})
+    connections_list = cx.get("connections", [])
+    cx_chunks = []
+    for conn in connections_list:
+        fa = conn.get("finding_a", "")
+        fb = conn.get("finding_b", "")
+        meaning = conn.get("synthesized_meaning", "")
+        cx_chunks.append(
+            f'<div class="strategy-card info">'
+            f'<div class="strat-header">&#128279; Cross-Metric Connection</div>'
+            f'<div class="strat-body">'
+            f'<p style="margin-bottom:6px;"><b>Finding A:</b> {fa}</p>'
+            f'<p style="margin-bottom:6px;"><b>Finding B:</b> {fb}</p>'
+            f'<p style="margin-bottom:0;"><b>Synthesised Meaning:</b> {meaning}</p>'
+            f'</div></div>'
+        )
+    cx_h = "".join(cx_chunks)
+
+    # Section display names (IEEE-style labels, no "Part N" prefixes)
+    _sect_labels = {
+        "executive_summary":       "Executive Summary",
+        "key_findings":            "Key Findings",
+        "detailed_insights":       "Detailed Insights",
+        "personas":                "User Profiles",
+        "cross_metric_connections":"Cross-Metric Connections",
+        "intervention_strategies": "Intervention Strategies",
+        "analysis_charts":         "Analysis Charts",
+    }
+
+    def get_sect_labeled(key, content):
+        if not content:
+            return ""
+        label = _sect_labels.get(key, key.replace("_", " ").title())
+        return f'<section class="section {key}"><h2>{label}</h2>{content}</section>'
+
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>{title}</title>
     <style>
-        body {{ font-family: system-ui, -apple-system, sans-serif; background: #f5f6fa; color: #333; }}
-        .header {{ background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }}
-        .section {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
-        h2 {{ border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0; }}
-        .insight-block {{ background: #f8f9fa; border-left: 4px solid #3498db; padding: 10px 15px; margin-bottom: 10px; border-radius: 4px; }}
-        .insight-block p {{ margin: 5px 0 0 0; }}
-        .badge {{ padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; }}
+        body {{ font-family: "Georgia", "Times New Roman", serif; background: #f5f6fa; color: #222; line-height: 1.65; }}
+        .header {{ background: #1a2535; color: white; padding: 28px 32px; border-radius: 8px; margin-bottom: 28px; }}
+        .header h1 {{ margin: 0 0 8px 0; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }}
+        .header p {{ margin: 0; opacity: 0.75; font-size: 13px; font-family: system-ui, sans-serif; }}
+        .section {{ background: white; padding: 28px 32px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
+        h2 {{ font-size: 17px; font-weight: 700; border-bottom: 2px solid #e8e8e8; padding-bottom: 10px; margin-top: 0; margin-bottom: 18px; color: #1a2535; letter-spacing: -0.2px; }}
+        .insight-block {{ background: #f8f9fa; border-left: 4px solid #3498db; padding: 12px 16px; margin-bottom: 12px; border-radius: 4px; }}
+        .insight-block p {{ margin: 5px 0 0 0; font-size: 14px; }}
+        .badge {{ padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; font-family: system-ui, sans-serif; }}
         .critical {{ color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; }}
         .high {{ color: #856404; background-color: #fff3cd; border: 1px solid #ffeeba; }}
         .medium {{ color: #004085; background-color: #cce5ff; border: 1px solid #b8daff; }}
         .low {{ color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb; }}
         .info {{ color: #383d41; background-color: #e2e3e5; border: 1px solid #d6d8db; }}
-        .strategy-card {{ border: 1px solid #eee; border-radius: 6px; margin-bottom: 15px; overflow: hidden; }}
-        .strat-header {{ padding: 12px; font-weight: bold; background: #fafafa; border-bottom: 1px solid #eee; }}
-        .strat-body {{ padding: 15px; }}
+        .strategy-card {{ border: 1px solid #e4e4e4; border-radius: 6px; margin-bottom: 16px; overflow: hidden; }}
+        .strat-header {{ padding: 12px 16px; font-weight: bold; background: #fafafa; border-bottom: 1px solid #e4e4e4; font-size: 14px; }}
+        .strat-body {{ padding: 16px; font-size: 14px; }}
+        .strat-body p {{ margin-bottom: 8px; }}
+        .strat-body ul {{ margin-top: 4px; padding-left: 20px; }}
+        .strat-body li {{ margin-bottom: 4px; }}
         .persona-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }}
-        .persona-card {{ border: 1px solid #eee; border-radius: 6px; padding: 15px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-        .chart-container {{ border: 1px solid #ddd; border-radius: 8px; margin-bottom: 20px; overflow: hidden; background: white; }}
-        .chart-header {{ background: #f8f9fa; padding: 10px 15px; font-weight: 600; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; }}
-        /* Markdown generated table styles */
-        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem; color: #212529; }}
-        th, td {{ padding: 0.75rem; vertical-align: top; border-top: 1px solid #dee2e6; }}
-        thead th {{ vertical-align: bottom; border-bottom: 2px solid #dee2e6; }}
-        tbody tr:nth-of-type(odd) {{ background-color: rgba(0,0,0,.05); }}
+        .persona-card {{ border: 1px solid #e4e4e4; border-radius: 6px; padding: 16px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); font-size: 14px; }}
+        /* Chart figures — numbered captions */
+        .chart-container {{ border: 1px solid #ddd; border-radius: 8px; margin-bottom: 28px; overflow: hidden; background: white; }}
+        .chart-header {{ background: #f8f9fa; padding: 10px 16px; font-weight: 600; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; font-size: 14px; font-family: system-ui, sans-serif; }}
+        .chart-fig-num {{ font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .05em; font-weight: 400; margin-right: 8px; }}
+        /* Markdown table styles (IEEE-compatible) */
+        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.2rem; font-size: 13px; font-family: system-ui, sans-serif; }}
+        th {{ background: #f0f0f0; font-weight: 600; }}
+        th, td {{ padding: 8px 12px; vertical-align: top; border: 1px solid #ddd; text-align: left; }}
+        thead th {{ border-bottom: 2px solid #bbb; }}
+        tbody tr:nth-of-type(odd) {{ background-color: #fafafa; }}
         /* Narrative blocks */
         .narrative-block {{ margin-top: 0; border-top: 1px solid #eee; display: flex; gap: 0; }}
         .narrative-what {{
@@ -342,19 +388,30 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         }}
         .narrative-what strong, .narrative-fix strong {{
             display: block; font-size: 11px; letter-spacing: .05em;
-            text-transform: uppercase; color: #666; margin-bottom: 6px;
+            text-transform: uppercase; color: #666; margin-bottom: 6px; font-family: system-ui, sans-serif;
         }}
         .narrative-what p, .narrative-fix p {{ margin: 0; font-size: 13px; line-height: 1.55; }}
         .narrative-icon {{ margin-right: 5px; }}
+        /* Key findings / conversational report prose */
+        .key_findings h1, .key_findings h2, .key_findings h3 {{ font-family: "Georgia", serif; }}
+        .key_findings p {{ font-size: 14px; margin-bottom: 12px; }}
+        .key_findings ul, .key_findings ol {{ font-size: 14px; padding-left: 22px; }}
+        .key_findings li {{ margin-bottom: 6px; }}
     </style></head><body>
-    <div class="header"><h1 style="margin:0 0 10px 0;">{title}</h1><p style="margin:0;opacity:0.8;">Dataset: {dataset_type} | Generated: {generated}</p></div>
-    {get_sect("conversational_report", conv_h)}
-    {get_sect("executive_summary", ex_h)}
-    {get_sect("detailed_insights", di_h)}
-    {get_sect("intervention_strategies", st_h)}
-    {get_sect("personas", pe_h)}
-    {get_sect("analysis_charts", ch_h)}
-    <div style="text-align:center; color:#999; font-size:12px; margin-top:20px;">Generated by Analytics Session {session_id}</div>
+    <div class="header">
+        <h1>{title}</h1>
+        <p>Dataset: {dataset_type}&nbsp;&nbsp;|&nbsp;&nbsp;Generated: {generated}&nbsp;&nbsp;|&nbsp;&nbsp;Session: {session_id}</p>
+    </div>
+    {get_sect_labeled("executive_summary", ex_h)}
+    {get_sect_labeled("key_findings", conv_h)}
+    {get_sect_labeled("detailed_insights", di_h)}
+    {get_sect_labeled("personas", pe_h)}
+    {get_sect_labeled("cross_metric_connections", cx_h)}
+    {get_sect_labeled("intervention_strategies", st_h)}
+    {get_sect_labeled("analysis_charts", ch_h)}
+    <div style="text-align:center; color:#aaa; font-size:12px; margin-top:28px; font-family:system-ui,sans-serif;">
+        Analytics Report &mdash; {generated}
+    </div>
     </body></html>"""
 
 
