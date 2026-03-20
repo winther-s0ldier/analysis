@@ -1465,3 +1465,215 @@ button, input, textarea {
 
 /* ─── Utilities ───────────────────────────────────────────────── */
 .hidden { display: none !important; }
+
+/* ─── Chart: Decision-maker takeaway highlight row (Fix 6) ──────── */
+.chart-detail-dm {
+    background: #fffde7;
+    border-left: 3px solid #f9a825;
+    border-radius: 4px;
+}
+.chart-detail-dm .chart-detail-label {
+    color: #b8860b;
+}
+
+/* ─── Conversational Report sections in chat (Fix 7) ───────────── */
+.conv-report {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 8px;
+}
+.conv-report-section {
+    background: var(--bg-secondary, #f8f9fa);
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border-color, #e8eaed);
+}
+.conv-report-header {
+    background: #1a2535;
+    color: #fff;
+    padding: 8px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-family: var(--font-mono, monospace);
+}
+.conv-report-body {
+    padding: 12px 14px;
+    font-size: 13px;
+    line-height: 1.65;
+    color: var(--text-primary, #222);
+}
+.conv-report-body strong {
+    color: var(--text-primary, #111);
+}
+.conv-report-subheader {
+    font-weight: 700;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #1a2535;
+    margin: 12px 0 4px;
+    padding-bottom: 3px;
+    border-bottom: 1px solid #dde1e7;
+}
+.conv-report-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    margin: 10px 0;
+}
+.conv-report-table th {
+    background: #1a2535;
+    color: #fff;
+    padding: 6px 10px;
+    text-align: left;
+    font-weight: 600;
+}
+.conv-report-table td {
+    padding: 6px 10px;
+    border-bottom: 1px solid #e8eaed;
+    color: #333;
+    vertical-align: top;
+}
+.conv-report-table tr:nth-child(even) td {
+    background: #f4f6f9;
+}
+
+/* ── #8: Adversarial Critic Review card ───────────────────────────────── */
+.critic-card {
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--r-md);
+    margin-top: 8px;
+    font-family: var(--font-sans, system-ui, sans-serif);
+    background: var(--bg-surface);
+    box-shadow: var(--shadow-xs);
+}
+.critic-status-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.critic-status-label {
+    font-size: 12px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.critic-status-ok   { color: var(--success); }
+.critic-status-warn { color: var(--warning);  }
+.critic-verdict {
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    margin: 0;
+    border-bottom: 1px solid var(--border-subtle);
+    line-height: 1.6;
+}
+.critic-challenges {
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.critic-challenge {
+    background: var(--bg-elevated, #f8f9fa);
+    border-radius: var(--r-sm);
+    padding: 8px 12px;
+    border-left: 3px solid var(--border-default);
+}
+.critic-challenge-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.critic-claim {
+    font-weight: 600;
+    font-size: 12.5px;
+    line-height: 1.4;
+    color: var(--text-primary);
+    flex: 1;
+}
+.critic-issue {
+    font-size: 12px;
+    color: var(--text-tertiary);
+    line-height: 1.55;
+}
+.critic-none {
+    font-size: 12.5px;
+    color: var(--success);
+    margin: 0;
+    padding: 2px 0;
+}
+
+/* ── #5: Re-run synthesis button ──────────────────────────────────────── */
+.rerun-btn {
+    background: #1a2535;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 13px;
+    font-family: var(--font-sans, system-ui, sans-serif);
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.rerun-btn:hover {
+    background: #2d3f5a;
+}
+.rerun-btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+/* ── Text-Selection Ask Popup ───────────────────────────────────────────── */
+.sel-popup {
+    position: fixed;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: all;
+    filter: drop-shadow(0 4px 14px rgba(0,0,0,0.28));
+    transition: opacity 0.12s ease, transform 0.12s ease;
+    transform-origin: bottom center;
+}
+.sel-popup.hidden {
+    display: none;
+}
+.sel-popup-btn {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: #1a2535;
+    color: #fff;
+    border: none;
+    border-radius: 20px;
+    padding: 8px 16px;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    letter-spacing: 0.01em;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+.sel-popup-btn:hover {
+    background: #2d3f5a;
+    transform: scale(1.04);
+}
+.sel-popup-btn:active {
+    transform: scale(0.97);
+}
+.sel-popup-arrow {
+    width: 0;
+    height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-top: 7px solid #1a2535;
+    margin-top: -1px;
+}

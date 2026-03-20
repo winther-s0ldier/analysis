@@ -3095,11 +3095,20 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
 
     df = df.dropna(subset=[col_a, col_b])
 
-    if df[col_a].nunique() > 50 or df[col_b].nunique() > 50:
-        return _make_error_result("cross_tab_analysis", "Too many unique categories (max 50) for cross-tabulation")
-
     if len(df) == 0:
         return _make_error_result("cross_tab_analysis", "No valid rows", "insufficient_data")
+
+    # Adaptive binning: keep every category that represents ≥1% of rows.
+    # This is data-driven — a dataset with 30 meaningful event types keeps all 30,
+    # while a column with 10,000 user IDs collapses to just the significant ones.
+    # Floor at 5 categories so there's always something meaningful to cross-tabulate.
+    for _col in [col_a, col_b]:
+        _freq = df[_col].value_counts(normalize=True)
+        _keep = _freq[_freq >= 0.01].index  # categories with ≥1% share
+        if len(_keep) < 5:                  # ensure minimum meaningful groupings
+            _keep = _freq.nlargest(5).index
+        if len(_keep) < df[_col].nunique():
+            df[_col] = df[_col].where(df[_col].isin(_keep), other="Other")
 
     contingency = pd.crosstab(df[col_a], df[col_b])
 

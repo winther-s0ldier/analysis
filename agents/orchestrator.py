@@ -32,6 +32,15 @@ from tools.model_config import get_model
 
 _pipeline_store: dict = {}
 
+# --- #12: SSE event hooks (session_id -> callable(event_type, data)) ---
+# Registered by main.py before pipeline starts; called when nodes complete.
+_pipeline_event_hooks: dict = {}
+
+# --- #11: Global reasoning thread (session_id -> list of completed node summaries) ---
+# Accumulates findings from ALL completed nodes; injected into subsequent node prompts
+# so every analysis knows what has already been discovered — even without a depends_on edge.
+_global_threads: dict = {}
+
 
 def get_pipeline_state(
     session_id: str
@@ -56,6 +65,125 @@ def create_pipeline_state(
     _pipeline_store[session_id] = state
     return state
 
+
+def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
+    """
+    Build the synthesis agent prompt + image_paths list from current session state.
+    Extracted as a standalone function so /rerun-synthesis can call it without
+    re-running the entire pipeline. (#5)
+
+    Returns:
+        (synthesis_prompt: str, image_paths: list[str])
+    """
+    import math, json as _json
+
+    dag = dag or getattr(state, "dag", []) or []
+
+    def _clean(obj):
+        if isinstance(obj, dict):   return {k: _clean(v) for k, v in obj.items()}
+        if isinstance(obj, list):   return [_clean(x) for x in obj]
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)): return None
+        if hasattr(obj, "item"):    return _clean(obj.item())
+        if isinstance(obj, (bool, int, float, str)) or obj is None: return obj
+        return str(obj)
+
+    _rich_results = []
+    for _nid, _res in state.results.items():
+        if not isinstance(_res, dict): continue
+        _rich_results.append({
+            "analysis_id":     _nid,
+            "analysis_type":   _res.get("analysis_type", "unknown"),
+            "top_finding":     _res.get("top_finding", ""),
+            "severity":        _res.get("severity", "info"),
+            "confidence":      _res.get("confidence", 0.0),
+            "data":            _res.get("data", {}),
+            "insight_summary": _res.get("insight_summary", {}),
+        })
+    _rich_summary = _json.dumps(_clean(_rich_results), indent=2) if _rich_results else "[]"
+
+    try:
+        from agents.synthesis import _extract_node_facts as _efs
+        _fact_sheet = {}
+        _atype_to_id = {
+            n.get("analysis_type"): n.get("id")
+            for n in dag if n.get("id") and n.get("analysis_type")
+        }
+        for _aid, _res in state.results.items():
+            if not isinstance(_res, dict): continue
+            _atype = _res.get("analysis_type", "unknown")
+            _nid   = _atype_to_id.get(_atype, _aid)
+            _fact_sheet[_nid] = _efs(_nid, _aid, _res)
+        _fact_json = _json.dumps(_clean(_fact_sheet), indent=2)
+    except Exception as _e:
+        _fact_json = "{}"
+        print(f"WARNING: fact_sheet build failed in build_synthesis_prompt: {_e}")
+
+    _dag_lines = []
+    for _n in dag:
+        _d = _n.get("depends_on", [])
+        _dag_lines.append(
+            f"  {_n.get('id')} [{_n.get('analysis_type')}]"
+            + (f" -> depends on {_d}" if _d else " -> root node")
+        )
+    _dag_graph = "\n".join(_dag_lines) if _dag_lines else "  (no DAG available)"
+
+    _user_goal = ""
+    if getattr(state, "user_instructions", ""):
+        _user_goal = (
+            f"\n== USER GOAL / STAKEHOLDER QUESTION ==\n"
+            f"{state.user_instructions}\n"
+            f"Your synthesis MUST directly address this. "
+            f"top_priorities and the Action Roadmap must map to this goal.\n"
+        )
+
+    _profile = ""
+    _raw = getattr(state, "raw_profile", {}) or {}
+    if _raw:
+        _col_roles = (getattr(state, "semantic_map", {}) or {}).get("column_roles", {})
+        _profile = (
+            f"\n== DATASET DESCRIPTION ==\n"
+            f"Rows: {_raw.get('row_count', 'unknown')} | "
+            f"Columns: {_raw.get('column_count', 'unknown')} | "
+            f"Type: {getattr(state, 'dataset_type', '')}\n"
+            f"Column roles: {_json.dumps(_col_roles, default=str)}\n"
+        )
+
+    prompt = (
+        f"Session ID: {session_id}\n"
+        f"Dataset type: {getattr(state, 'dataset_type', '')}\n"
+        f"Total analyses completed: {len(state.results)}\n"
+        f"{_profile}"
+        f"{_user_goal}"
+        f"\n== DAG DEPENDENCY GRAPH (use this to reason causally) ==\n"
+        f"{_dag_graph}\n"
+        f"\n== PRE-EXTRACTED FACT SHEET (cite ONLY these numbers — do not invent) ==\n"
+        f"{_fact_json}\n\n"
+        f"== FULL ANALYSIS RESULTS (raw — for additional context) ==\n"
+        f"{_rich_summary}\n\n"
+        f"INSTRUCTIONS:\n"
+        f"1. Call tool_aggregate_results(session_id) to get column_roles context (required).\n"
+        f"2. Before writing anything, reason step-by-step: what did each node find? "
+        f"What is surprising? What connects across nodes? THEN build your synthesis.\n"
+        f"3. Use the DAG DEPENDENCY GRAPH to identify causal chains "
+        f"(child node results are constrained by their parent — reason causally).\n"
+        f"4. Look closely at the provided chart images. Describe visual trends natively.\n"
+        f"5. SELF-REVIEW before calling tool_submit_synthesis: "
+        f"(a) every insight cites a [NodeID] with a specific number, "
+        f"(b) cross_metric_connections has entries citing 2 different node pairs, "
+        f"(c) conversational_report contains '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
+        f"6. Call tool_submit_synthesis(session_id, synthesis_json_str)."
+    )
+
+    images = []
+    for _res in state.results.values():
+        if not isinstance(_res, dict): continue
+        cp = _res.get("chart_file_path")
+        if cp:
+            pp = cp.replace(".html", ".png")
+            if os.path.exists(pp):
+                images.append(pp)
+
+    return prompt, images
 
 
 async def run_full_pipeline(
@@ -283,133 +411,134 @@ async def run_full_pipeline(
         from tools.monitor import check_failure_threshold
         check_failure_threshold(session_id, results["total"], len(results["failed"]))
 
-        _rich_results = []
-        for _nid, _res in state.results.items():
-            _rich_results.append({
-                "analysis_id":    _nid,
-                "analysis_type":  _res.get("analysis_type", "unknown"),
-                "top_finding":    _res.get("top_finding", ""),
-                "severity":       _res.get("severity", "info"),
-                "confidence":     _res.get("confidence", 0.0),
-                "data":           _res.get("data", {}),
-                "insight_summary": _res.get("insight_summary", {}),
-            })
-        import math
-        def _clean_data(obj):
-            if isinstance(obj, dict):
-                return {k: _clean_data(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [_clean_data(x) for x in obj]
-            elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-                return None
-            elif hasattr(obj, "item"): # Handle numpy types
-                return _clean_data(obj.item())
-            elif isinstance(obj, (bool, int, float, str)) or obj is None:
-                return obj
-            else:
-                return str(obj)
+        # Build synthesis prompt via shared helper (also used by /rerun-synthesis — #5)
+        synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag)
 
-        _rich_summary = json.dumps(_clean_data(_rich_results), indent=2) if _rich_results else "[]"
-
-        # --- Pre-build fact_sheet so synthesis has verified numbers before reasoning begins ---
-        # This means the LLM doesn't need a tool call to know what to cite.
+        # --- Stage 4: Synthesis wrapped in LoopAgent for outer-retry resilience (#7) ---
+        # The synthesis agent has an internal quality-rejection loop via tool_submit_synthesis.
+        # The LoopAgent adds an OUTER retry: if synthesis exhausts all internal retries and
+        # still fails quality, the LoopAgent re-runs it from scratch (up to 3 outer tries).
+        # A lightweight terminator agent checks _qc_passed and escalates to stop the loop.
+        print(f"INFO: [{session_id}] Stage 4 — Synthesis (LoopAgent outer resilience, max 3 iterations)")
+        _synthesis_ran_ok = False
         try:
-            from agents.synthesis import _extract_node_facts as _efs
-            _fact_sheet_for_prompt = {}
-            _dag_atype_to_id = {
-                n.get("analysis_type"): n.get("id")
-                for n in dag
-                if n.get("id") and n.get("analysis_type")
-            }
-            for _aid, _res in state.results.items():
-                if not isinstance(_res, dict):
-                    continue
-                _atype = _res.get("analysis_type", "unknown")
-                _nid = _dag_atype_to_id.get(_atype, _aid)
-                _fact_sheet_for_prompt[_nid] = _efs(_nid, _aid, _res)
-            _fact_sheet_json = json.dumps(_clean_data(_fact_sheet_for_prompt), indent=2)
-        except Exception as _fse:
-            _fact_sheet_json = "{}"
-            print(f"WARNING: fact_sheet pre-build failed: {_fse}")
+            from google.adk.agents import LoopAgent, Agent as _Agent
 
-        # DAG dependency map — lets synthesis reason causally (child depends on parent)
-        _dag_dep_lines = []
-        for _n in dag:
-            _deps = _n.get("depends_on", [])
-            _dep_str = f" -> depends on {_deps}" if _deps else " -> root node"
-            _dag_dep_lines.append(
-                f"  {_n.get('id')} [{_n.get('analysis_type')}]{_dep_str}"
-            )
-        _dag_graph_str = "\n".join(_dag_dep_lines) if _dag_dep_lines else "  (no DAG available)"
+            def _check_synthesis_done(session_id: str, tool_context=None) -> str:
+                """Check if synthesis quality passed and escalate LoopAgent if so."""
+                from agents.synthesis import _synthesis_store as _ss
+                _syn = _ss.get(session_id, {})
+                if _syn and _syn.get("_qc_passed"):
+                    if tool_context is not None:
+                        try:
+                            tool_context.actions.escalate = True
+                        except AttributeError:
+                            pass
+                    return "Synthesis quality confirmed — loop terminating."
+                return "Synthesis not yet confirmed — loop will continue if iterations remain."
 
-        # User goal — focus the synthesis on what the user actually wants answered
-        _user_goal_block = ""
-        if getattr(state, "user_instructions", ""):
-            _user_goal_block = (
-                f"\n== USER GOAL / STAKEHOLDER QUESTION ==\n"
-                f"{state.user_instructions}\n"
-                f"Your synthesis MUST directly address this. "
-                f"top_priorities and the Action Roadmap must map to this goal.\n"
+            _terminator_agent = _Agent(
+                name=f"synthesis_terminator_{session_id[:8]}",
+                model=get_model("synthesis"),
+                description="Checks synthesis quality and terminates the LoopAgent when confirmed.",
+                instruction=(
+                    f"Call _check_synthesis_done('{session_id}') immediately with no other actions. "
+                    "Return the tool result verbatim."
+                ),
+                tools=[_check_synthesis_done],
             )
 
-        # Dataset description
-        _profile_block = ""
-        _raw = getattr(state, "raw_profile", {}) or {}
-        if _raw:
-            _col_roles = (getattr(state, "semantic_map", {}) or {}).get("column_roles", {})
-            _profile_block = (
-                f"\n== DATASET DESCRIPTION ==\n"
-                f"Rows: {_raw.get('row_count', 'unknown')} | "
-                f"Columns: {_raw.get('column_count', 'unknown')} | "
-                f"Type: {state.dataset_type}\n"
-                f"Column roles: {json.dumps(_col_roles, default=str)}\n"
+            from agents.synthesis import get_synthesis_agent as _get_synthesis_agent
+            _synth_loop = LoopAgent(
+                name=f"synthesis_loop_{session_id[:8]}",
+                sub_agents=[_get_synthesis_agent(), _terminator_agent],
+                max_iterations=3,
             )
-
-        synthesis_prompt = (
-            f"Session ID: {session_id}\n"
-            f"Dataset type: {state.dataset_type}\n"
-            f"Total analyses completed: {len(state.results)}\n"
-            f"{_profile_block}"
-            f"{_user_goal_block}"
-            f"\n== DAG DEPENDENCY GRAPH (use this to reason causally) ==\n"
-            f"{_dag_graph_str}\n"
-            f"\n== PRE-EXTRACTED FACT SHEET (cite ONLY these numbers — do not invent) ==\n"
-            f"{_fact_sheet_json}\n\n"
-            f"== FULL ANALYSIS RESULTS (raw — for additional context) ==\n"
-            f"{_rich_summary}\n\n"
-            f"INSTRUCTIONS:\n"
-            f"1. Call tool_aggregate_results(session_id) to get column_roles context (required).\n"
-            f"2. Before writing anything, reason step-by-step: what did each node find? "
-            f"What is surprising? What connects across nodes? THEN build your synthesis.\n"
-            f"3. Use the DAG DEPENDENCY GRAPH to identify causal chains "
-            f"(child node results are constrained by their parent — reason causally, not just correlationally).\n"
-            f"4. Look closely at the provided chart images. Describe visual trends natively in your analysis.\n"
-            f"5. SELF-REVIEW before calling tool_submit_synthesis: "
-            f"(a) every insight cites a [NodeID] with a specific number, "
-            f"(b) cross_metric_connections has entries citing 2 different node pairs, "
-            f"(c) conversational_report contains '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
-            f"6. Call tool_submit_synthesis(session_id, synthesis_json_str)."
-        )
-
-        image_paths = []
-        for _res in state.results.values():
-            chart_path = _res.get("chart_file_path")
-            if chart_path:
-                png_path = chart_path.replace(".html", ".png")
-                if os.path.exists(png_path):
-                    image_paths.append(png_path)
-
-        try:
             await run_agent_pipeline(
                 f"{session_id}_synthesis",
                 synthesis_prompt,
-                agent_getter="synthesis",
+                agent=_synth_loop,
                 image_paths=image_paths,
             )
-        except Exception as e:
-            msg = f"ERROR: Synthesis agent failed for session {session_id}: {e}"
-            print(msg)
-            logging.error(msg)
+            _synthesis_ran_ok = True
+        except Exception as _loop_err:
+            print(f"WARNING: LoopAgent synthesis error ({type(_loop_err).__name__}: {_loop_err}), "
+                  f"falling back to direct synthesis call")
+            try:
+                await run_agent_pipeline(
+                    f"{session_id}_synthesis",
+                    synthesis_prompt,
+                    agent_getter="synthesis",
+                    image_paths=image_paths,
+                )
+                _synthesis_ran_ok = True
+            except Exception as e:
+                msg = f"ERROR: Synthesis agent failed for session {session_id}: {e}"
+                print(msg)
+                logging.error(msg)
+
+        # Verify synthesis was actually stored — if not, retry up to 2 more times.
+        # This catches the case where the agent returned but hit a rate limit internally
+        # and never called tool_submit_synthesis (so _synthesis_store is still empty).
+        from agents.synthesis import _synthesis_store as _ss_check
+        _syn_retry = 0
+        while not _ss_check.get(session_id) and _syn_retry < 2:
+            _syn_retry += 1
+            _wait = 30 * _syn_retry
+            print(f"WARNING: Synthesis not in store after run — waiting {_wait}s then retrying "
+                  f"(attempt {_syn_retry}/2)")
+            await asyncio.sleep(_wait)
+            try:
+                await run_agent_pipeline(
+                    f"{session_id}_synthesis_retry{_syn_retry}",
+                    synthesis_prompt,
+                    agent_getter="synthesis",
+                    image_paths=image_paths,
+                )
+            except Exception as _sr_err:
+                print(f"WARNING: Synthesis retry {_syn_retry} failed: {_sr_err}")
+
+        # Push synthesis SSE event
+        try:
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("synthesis_complete", {"session_id": session_id})
+        except Exception:
+            pass
+
+        # --- Stage 4.5: Adversarial Critic Review (#8) — NON-BLOCKING ---
+        # Fired as a background task so dag_builder runs immediately.
+        # Uses Flash model (higher RPM) to avoid rate-limiting the main pipeline.
+        # When critic finishes it injects its result into _synthesis_store directly.
+        async def _run_critic_bg(sid: str):
+            try:
+                from agents.critic import get_critic_store_result
+                _crit_prompt = (
+                    f"session_id: {sid}\n"
+                    "Review the synthesis for this session. "
+                    "Call tool_get_synthesis_for_critique first, "
+                    "then submit your critique via tool_submit_critique."
+                )
+                await run_agent_pipeline(
+                    f"{sid}_critic",
+                    _crit_prompt,
+                    agent_getter="critic",
+                    max_turns=8,
+                )
+                _crit = get_critic_store_result(sid)
+                if _crit:
+                    print(f"INFO: [Critic BG] approved={_crit.get('approved')}, "
+                          f"challenges={len(_crit.get('challenges', []))}")
+                    from agents.synthesis import _synthesis_store as _ss
+                    if sid in _ss:
+                        _ss[sid]["_critic_review"] = _crit
+                else:
+                    print(f"INFO: [Critic BG] No result for {sid}")
+            except Exception as _ce:
+                print(f"WARNING: [Critic BG] Failed (non-fatal): {type(_ce).__name__}: {_ce}")
+
+        print(f"INFO: [{session_id}] Stage 4.5 — Adversarial Critic (background, Flash model)")
+        _critic_task = asyncio.create_task(_run_critic_bg(session_id))
 
         # Wait for state.synthesis to be populated before building the report.
         # The synthesis LLM may need 2 turns (first call fails, retries succeed),
@@ -433,6 +562,25 @@ async def run_full_pipeline(
             print(f"INFO: Synthesis ready after {_synthesis_wait_secs}s wait.")
         else:
             print("WARNING: Synthesis not stored after 8s wait — report will have no insights.")
+
+        # --- Smart critic wait: up to 45s, exit as soon as result is stored ---
+        # Critic runs concurrently; we wait here so its result gets into the HTML report.
+        # Flash model is fast (usually 3-8s), so the pipeline almost never waits the full 45s.
+        try:
+            from agents.critic import get_critic_store_result as _gcsr
+            _critic_wait_secs = 0
+            while _critic_wait_secs < 45:
+                if _gcsr(session_id):
+                    print(f"INFO: Critic result ready after {_critic_wait_secs}s — injecting into report.")
+                    break
+                if _critic_task.done():
+                    break
+                await asyncio.sleep(1)
+                _critic_wait_secs += 1
+            else:
+                print(f"WARNING: Critic did not finish within 45s — report proceeds without critic review.")
+        except Exception as _cw_err:
+            print(f"WARNING: Critic wait error (non-fatal): {_cw_err}")
 
         _update_session_status(
             state, "building_report"
@@ -462,7 +610,15 @@ async def run_full_pipeline(
         ) if report else None
 
         _update_session_status(state, "complete")
-        
+
+        # Push report SSE event (#12)
+        try:
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("report_ready", {"session_id": session_id, "report_path": str(report_path or "")})
+        except Exception:
+            pass
+
         # Group A: Register the schema fingerprint so drift detection works on next run
         try:
             from tools.data_gate import register_schema
@@ -521,6 +677,9 @@ async def _execute_dag(
     round_num    = 0
     completed    = set()
     failed       = set()
+
+    # --- #11: Initialise global reasoning thread for this session ---
+    _global_threads[session_id] = []
 
     for node_id, node in pipeline.nodes.items():
         status = pipeline.get_status(node_id)
@@ -733,6 +892,57 @@ async def _execute_single_node(
         if os.path.exists(enriched):
             effective_csv = enriched
 
+    # --- #6: A2A Dependency Awareness ---
+    # Built BEFORE the library/custom code split so ALL nodes (library-based
+    # or custom) have parent context available. Library nodes can't inject it
+    # into code generation (no LLM call), but it IS passed to the per-node
+    # insight generator (#10) so even library nodes produce context-aware insights.
+    _parent_context = ""
+    _deps = node.get("depends_on", [])
+    if _deps and state:
+        _parent_facts = []
+        for _pid in _deps:
+            _pres = state.results.get(_pid)
+            if _pres and isinstance(_pres, dict) and _pres.get("status") == "success":
+                _ptf = _pres.get("top_finding", "")
+                _patype = _pres.get("analysis_type", _pid)
+                _pdm = _pres.get("insight_summary") or {}
+                _pdm_text = _pdm.get("decision_maker_takeaway", "") if isinstance(_pdm, dict) else ""
+                _entry = f"  [{_pid}: {_patype}] {_ptf}"
+                if _pdm_text:
+                    _entry += f"\n  Key insight: {_pdm_text}"
+                _parent_facts.append(_entry)
+        if _parent_facts:
+            _parent_context = (
+                "\n== PARENT NODE RESULTS (this analysis depends on these) ==\n"
+                "Your analysis builds on these completed nodes. "
+                "Reference them where relevant and let their findings shape your approach:\n"
+                + "\n".join(_parent_facts) + "\n"
+            )
+
+    # --- #11: Global Reasoning Thread ---
+    # All completed node findings (excluding declared parents already covered by #6)
+    # are injected here so later analyses know what has already been discovered.
+    _global_ctx = ""
+    _global_thread = _global_threads.get(session_id, [])
+    _non_parent_entries = [
+        e for e in _global_thread
+        if e["id"] not in (_deps or []) and e["id"] != analysis_id
+    ]
+    if _non_parent_entries:
+        _recent = _non_parent_entries[-5:]  # cap at 5 to stay within token budget
+        _global_ctx = (
+            "\n== COMPLETED ANALYSES (pipeline context) ==\n"
+            "These analyses finished before yours. Reference them to avoid duplication "
+            "and to connect your findings to the broader picture:\n"
+            + "\n".join(
+                f"  [{e['id']}: {e['type']}] {e['finding']}"
+                + (f"\n  Key insight: {e['dm_insight']}" if e.get('dm_insight') else "")
+                for e in _recent
+            )
+            + "\n"
+        )
+
     code = None
     if library_fn and any(
         entry.get("function") == library_fn
@@ -751,9 +961,11 @@ async def _execute_single_node(
             f"CSV Path: {effective_csv}\n"
             f"Column Roles: {json.dumps(column_roles, default=str)}\n"
             f"Description: {description}\n"
-            + (f"Library Function: {library_fn}\n" if library_fn else "") +
-            (f"PREVIOUS ERROR: {last_error}\n" if last_error else "") +
-            "\nWrite a Python function `analyze(csv_path: str) -> dict` that performs this analysis. "
+            + (f"Library Function: {library_fn}\n" if library_fn else "")
+            + _parent_context
+            + _global_ctx
+            + (f"PREVIOUS ERROR: {last_error}\n" if last_error else "")
+            + "\nWrite a Python function `analyze(csv_path: str) -> dict` that performs this analysis. "
             "Return ONLY the code block. Use the rules in your system instructions."
         )
 
@@ -794,6 +1006,80 @@ async def _execute_single_node(
 
         submit_result(session_id, analysis_id, analysis_type, result)
         state.store_result(analysis_id, result)
+
+        # --- #10: Per-node decision-maker insight ---
+        # Immediately after the node result is stored, ask the LLM one focused
+        # question: "what should a decision-maker act on from this result?"
+        # Stored as insight_summary.decision_maker_takeaway and fed to synthesis
+        # so it starts from pre-digested meaning, not raw numbers.
+        try:
+            import google.genai as _genai
+            _dm_client = _genai.Client()
+            _key_data = {
+                k: v for k, v in result.get("data", {}).items()
+                if isinstance(v, (int, float, str, bool)) and v is not None
+            }
+            _dm_prompt = (
+                f"Analysis type: {analysis_type}\n"
+                f"Top finding: {result.get('top_finding', '')}\n"
+                f"Key metrics: {json.dumps(_key_data, default=str)[:400]}\n"
+                + (_parent_context if _parent_context else "")
+                + (_global_ctx if _global_ctx else "")
+                + "\nWrite ONE sentence only — what is the single most important thing "
+                "a business decision-maker needs to act on from this result? "
+                "Be specific. Cite the actual number. "
+                "If prior analyses are shown above, connect this finding to the broader pattern. "
+                "Do not start with 'The analysis shows' or 'Based on'."
+            )
+            _dm_resp = _dm_client.models.generate_content(
+                model=get_model("coder"),
+                contents=_dm_prompt,
+            )
+            _dm_text = _dm_resp.text.strip().split('\n')[0]
+
+            # Store on result and update state
+            if not isinstance(result.get("insight_summary"), dict):
+                result["insight_summary"] = {}
+            result["insight_summary"]["decision_maker_takeaway"] = _dm_text
+            if analysis_id in state.results:
+                if not isinstance(state.results[analysis_id].get("insight_summary"), dict):
+                    state.results[analysis_id]["insight_summary"] = {}
+                state.results[analysis_id]["insight_summary"]["decision_maker_takeaway"] = _dm_text
+            print(f"INFO: [{analysis_id}] Insight: {_dm_text[:120]}")
+        except Exception as _dm_err:
+            print(f"WARNING: Per-node insight skipped for {analysis_id}: {_dm_err}")
+
+        # --- #11: Append to global reasoning thread ---
+        _dm_text_for_thread = ""
+        try:
+            _dm_text_for_thread = (
+                state.results[analysis_id].get("insight_summary", {}) or {}
+            ).get("decision_maker_takeaway", "")
+        except Exception:
+            pass
+        if session_id in _global_threads:
+            _global_threads[session_id].append({
+                "id": analysis_id,
+                "type": analysis_type,
+                "finding": result.get("top_finding", ""),
+                "dm_insight": _dm_text_for_thread,
+            })
+
+        # --- #12: Push SSE event via registered hook ---
+        try:
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("node_complete", {
+                    "analysis_id": analysis_id,
+                    "analysis_type": analysis_type,
+                    "top_finding": result.get("top_finding", ""),
+                    "severity": result.get("severity", "info"),
+                    "chart_path": bool(result.get("chart_file_path")),
+                    "status": "success",
+                })
+        except Exception as _hook_err:
+            print(f"WARNING: SSE event hook failed for {analysis_id}: {_hook_err}")
+
         return {**result, "analysis_type": analysis_type, "status": "success"}
 
     except Exception as e:

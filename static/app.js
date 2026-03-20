@@ -402,11 +402,90 @@ async function runAnalysis() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ request: 'Analyze all discovered metrics.', custom_metrics: [] }),
+    }).then(() => {
+        // Show ring immediately — don't wait for first status poll
+        if (progressRing) progressRing.classList.remove('hidden');
+        updateProgressRing(0, 1);
+        // Prime the terminal card and ring before any charts arrive
+        updatePipelineStatusPanel();
     });
 
     pollStartTime = Date.now();
     if (pollInterval) clearInterval(pollInterval);
 
+    // --- #12: Try SSE stream first; fall back to polling if unavailable ---
+    startSSEStream();
+}
+
+// #12: SSE stream — receives real-time events from the pipeline backend.
+// Falls back to polling if connection fails (e.g. proxy timeout, server restart).
+let _activeSSE = null;
+function startSSEStream() {
+    if (_activeSSE) { try { _activeSSE.close(); } catch(e) {} }
+
+    const evtSource = new EventSource(`/stream/${sessionId}`);
+    _activeSSE = evtSource;
+    let _streamReceived = false;
+
+    evtSource.onmessage = async (e) => {
+        _streamReceived = true;
+        let ev;
+        try { ev = JSON.parse(e.data); } catch { return; }
+
+        if (ev.type === 'node_complete') {
+            await updatePipelineStatusPanel();   // terminal + ring first
+            await renderNewCharts();             // then charts below terminal
+            const nodeStatuses = {};
+            nodeStatuses[ev.data.analysis_id] = 'complete';
+            updateMetricCards(nodeStatuses);
+            // Keep stage indicator updated
+            updateStage(4, 'active');
+        } else if (ev.type === 'synthesis_complete') {
+            updateStage(5, 'active');
+            startProcessingStatus('synthesize');
+        } else if (ev.type === 'report_ready') {
+            updateStage(6, 'active');
+            startProcessingStatus('report');
+        } else if (ev.type === 'stream_end') {
+            evtSource.close();
+            _activeSSE = null;
+            stopProcessingStatus();
+            setProgress(100);
+            const status = ev.data?.status || 'complete';
+            if (status === 'complete') {
+                await finishPipeline();
+            } else {
+                addAIMessage('Pipeline encountered an error. Some results may be available.');
+            }
+        }
+    };
+
+    evtSource.onerror = () => {
+        evtSource.close();
+        _activeSSE = null;
+        if (!_streamReceived) {
+            // SSE never connected — fall back to polling immediately
+            console.warn('SSE unavailable, falling back to polling');
+            _startPolling();
+        }
+        // If we already received events, pipeline is likely done — don't re-poll
+    };
+
+    // Safety timeout: if no stream_end received in MAX_POLL_TIME, switch to polling
+    setTimeout(() => {
+        if (_activeSSE === evtSource) {
+            evtSource.close();
+            _activeSSE = null;
+            if (Date.now() - pollStartTime < MAX_POLL_TIME) {
+                _startPolling();
+            }
+        }
+    }, MAX_POLL_TIME);
+}
+
+// Original polling fallback (preserved intact for reliability)
+function _startPolling() {
+    if (pollInterval) clearInterval(pollInterval);
     pollInterval = setInterval(async () => {
         if (Date.now() - pollStartTime > MAX_POLL_TIME) {
             clearInterval(pollInterval);
@@ -414,21 +493,16 @@ async function runAnalysis() {
             addAIMessage('Pipeline timed out after 10 minutes.');
             return;
         }
-
         try {
             const res = await fetch(`/status/${sessionId}`);
             if (!res.ok) return;
             const status = await res.json();
-
             updateStageFromStatus(status);
             updateMetricCards(status.pipeline?.node_statuses || {});
             await renderNewCharts();
             await updatePipelineStatusPanel();
-
-            // Update rotating messages based on current stage
             const phase = { analyzing: 'analyze', synthesizing: 'synthesize', building_report: 'report' }[status.session_status];
             if (phase) startProcessingStatus(phase);
-
             if (status.session_status === 'complete') {
                 clearInterval(pollInterval);
                 stopProcessingStatus();
@@ -661,21 +735,28 @@ async function finishPipeline() {
         const synthesis = await res.json();
         stopProcessingStatus();
 
-        // Render synthesis sections in order: detailed → personas → interventions → connections → summary
-        if (synthesis.detailed_insights?.insights?.length) {
-            addDetailedInsightsMessage(synthesis.detailed_insights);
-        }
-        if (synthesis.personas?.personas?.length) {
-            addPersonasMessage(synthesis.personas);
-        }
-        if (synthesis.intervention_strategies?.strategies?.length) {
-            addInterventionsMessage(synthesis.intervention_strategies);
-        }
-        if (synthesis.cross_metric_connections?.connections?.length) {
-            addCrossConnectionsMessage(synthesis.cross_metric_connections);
-        }
+        // Normalize synthesis sections — handle flat array OR {key: [...]} wrapper object
+        // (LLM sometimes returns a bare list; this prevents silent render failures)
+        const di  = Array.isArray(synthesis.detailed_insights)       ? { insights:    synthesis.detailed_insights }        : (synthesis.detailed_insights       || {});
+        const ps  = Array.isArray(synthesis.personas)                 ? { personas:    synthesis.personas }                 : (synthesis.personas                 || {});
+        const inv = Array.isArray(synthesis.intervention_strategies)  ? { strategies:  synthesis.intervention_strategies }  : (synthesis.intervention_strategies  || {});
+        const cx  = Array.isArray(synthesis.cross_metric_connections) ? { connections: synthesis.cross_metric_connections } : (synthesis.cross_metric_connections  || {});
+
+        // Render synthesis sections in order: detailed → personas → interventions → connections → summary → narrative
+        if (di.insights?.length)    addDetailedInsightsMessage(di);
+        if (ps.personas?.length)    addPersonasMessage(ps);
+        if (inv.strategies?.length) addInterventionsMessage(inv);
+        if (cx.connections?.length) addCrossConnectionsMessage(cx);
         if (synthesis.executive_summary) {
             addExecutiveSummaryMessage(synthesis.executive_summary);
+        }
+        if (synthesis.conversational_report) {
+            addConversationalReportMessage(synthesis.conversational_report);
+        }
+
+        // --- #8: Adversarial critic review card ---
+        if (synthesis._critic_review) {
+            addCriticReviewMessage(synthesis._critic_review);
         }
 
         addAIMessageHTML(`
@@ -688,6 +769,9 @@ async function finishPipeline() {
                 <button class="btn btn-ghost" onclick="downloadReport()">Download HTML</button>
             </div>
         `);
+
+        // --- #5: Rerun synthesis button ---
+        addRerunSynthesisButton();
     } catch (err) {
         stopProcessingStatus();
         console.error('Synthesis error:', err);
@@ -901,12 +985,15 @@ function addChartMessage(result) {
 
     // Build detail block — show all available insight fields, no fallback duplication
     const detailRows = [];
+    // Decision-maker takeaway is the most valuable per-node LLM insight — show it first
+    if (ins.decision_maker_takeaway) detailRows.push(`<div class="chart-detail-row chart-detail-dm"><span class="chart-detail-label">&#128161; Key Insight</span><span>${escapeHtml(ins.decision_maker_takeaway)}</span></div>`);
     if (ins.key_finding) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Key Finding</span><span>${escapeHtml(ins.key_finding)}</span></div>`);
     if (ins.top_values) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Notable Values</span><span>${escapeHtml(ins.top_values)}</span></div>`);
     if (ins.anomalies) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Anomalies</span><span>${escapeHtml(ins.anomalies)}</span></div>`);
     if (ins.recommendation) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Recommendation</span><span>${escapeHtml(ins.recommendation)}</span></div>`);
     if (nav.what_it_means) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">What It Means</span><span>${escapeHtml(nav.what_it_means)}</span></div>`);
     if (nav.proposed_fix) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Proposed Fix</span><span>${escapeHtml(nav.proposed_fix)}</span></div>`);
+    if (result.confidence) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Confidence</span><span>${Math.round(result.confidence * 100)}%</span></div>`);
 
     const detailHtml = detailRows.length
         ? `<div class="card-chart-detail">${detailRows.join('')}</div>`
@@ -949,7 +1036,100 @@ function addExecutiveSummaryMessage(summary) {
             ${(summary.key_findings || summary.top_priorities || []).map(f => `<div class="card-exec-finding">${escapeHtml(f)}</div>`).join('')}
             ${summary.business_impact ? `<div class="card-exec-impact"><span class="card-exec-label">Business Impact</span>${escapeHtml(summary.business_impact)}</div>` : ''}
             ${summary.timeline ? `<div class="card-exec-impact"><span class="card-exec-label">Timeline</span>${escapeHtml(summary.timeline)}</div>` : ''}
+            ${summary.resource_allocation ? `<div class="card-exec-impact"><span class="card-exec-label">Resource Allocation</span>${escapeHtml(summary.resource_allocation)}</div>` : ''}
         </div>
+    `;
+    chatContainer.appendChild(el);
+    scrollToBottom();
+}
+
+function addConversationalReportMessage(report) {
+    if (!report || report.length < 50) return;
+    const el = createAIMessageEl();
+    const content = el.querySelector('.msg-ai-content');
+
+    // Parse markdown into header+body section pairs
+    // Split on lines that start with one or two # characters
+    const lines = report.split('\n');
+    const sections = [];
+    let currentHeader = null;
+    let currentBody = [];
+
+    for (const line of lines) {
+        if (/^#{1,2} /.test(line)) {
+            if (currentHeader !== null) {
+                sections.push({ header: currentHeader, body: currentBody.join('\n').trim() });
+            }
+            currentHeader = line.replace(/^#+\s*/, '');
+            currentBody = [];
+        } else {
+            currentBody.push(line);
+        }
+    }
+    if (currentHeader !== null) {
+        sections.push({ header: currentHeader, body: currentBody.join('\n').trim() });
+    }
+
+    // If no headers found, render as one block
+    if (!sections.length) {
+        sections.push({ header: 'Intelligence Report', body: report.trim() });
+    }
+
+    // Render a markdown table string into an HTML table
+    const renderTable = (tableLines) => {
+        // Strip \r (Windows line endings) and filter separator rows like |---|---|
+        const rows = tableLines
+            .map(l => l.replace(/\r$/, ''))
+            .filter(l => l.trim().startsWith('|') && !/^\|[\s\-|: ]+\|$/.test(l.trim()));
+        if (!rows.length) return '';
+        const parseRow = (row) => row.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+        const [head, ...body] = rows;
+        const headCells = parseRow(head).map(c => `<th>${escapeHtml(c)}</th>`).join('');
+        const bodyRows = body.map(r => `<tr>${parseRow(r).map(c => `<td>${escapeHtml(c)}</td>`).join('')}</tr>`).join('');
+        return `<table class="conv-report-table"><thead><tr>${headCells}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+    };
+
+    const renderBody = (text) => {
+        const bodyLines = text.split('\n');
+        let html = '';
+        let i = 0;
+        while (i < bodyLines.length) {
+            const line = bodyLines[i];
+            // ### sub-header
+            if (/^### /.test(line)) {
+                html += `<div class="conv-report-subheader">${escapeHtml(line.replace(/^###\s*/, ''))}</div>`;
+                i++; continue;
+            }
+            // markdown table block
+            if (/^\|/.test(line.trim())) {
+                const tableBlock = [];
+                while (i < bodyLines.length && /^\|/.test(bodyLines[i].trim())) {
+                    tableBlock.push(bodyLines[i]);
+                    i++;
+                }
+                html += renderTable(tableBlock);
+                continue;
+            }
+            // normal line — inline markdown
+            const rendered = escapeHtml(line)
+                .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+                .replace(/^•\s+|^-\s+/, '• ');
+            html += rendered ? `<span>${rendered}</span><br>` : '<br>';
+            i++;
+        }
+        return html;
+    };
+
+    const sectionsHtml = sections.map(s => `
+        <div class="conv-report-section">
+            <div class="conv-report-header">${escapeHtml(s.header)}</div>
+            <div class="conv-report-body">${renderBody(s.body)}</div>
+        </div>
+    `).join('');
+
+    content.innerHTML = `
+        <div class="msg-ai-text"><strong>Full Intelligence Report</strong></div>
+        <div class="conv-report">${sectionsHtml}</div>
     `;
     chatContainer.appendChild(el);
     scrollToBottom();
@@ -985,6 +1165,87 @@ function addDetailedInsightsMessage(detailedInsights) {
     `;
     chatContainer.appendChild(el);
     scrollToBottom();
+}
+
+// --- #8: Adversarial Critic Review card ---
+function addCriticReviewMessage(critic) {
+    if (!critic || typeof critic !== 'object') return;
+    const approved = critic.approved !== false;
+    const challenges = Array.isArray(critic.challenges) ? critic.challenges : [];
+    const confAdj = typeof critic.confidence_adjustment === 'number' ? critic.confidence_adjustment : 1;
+    const verdict = critic.overall_verdict || '';
+
+    const el = createAIMessageEl();
+    const content = el.querySelector('.msg-ai-content');
+    content.innerHTML = `
+        <div class="msg-ai-text"><strong>Adversarial Review</strong></div>
+        <div class="critic-card">
+            <div class="critic-status-row">
+                <span class="critic-status-label ${approved ? 'critic-status-ok' : 'critic-status-warn'}">
+                    ${approved ? 'Synthesis Approved' : 'Issues Flagged'}
+                </span>
+                <span class="badge ${approved ? 'low' : 'medium'}" style="font-size:10px;">
+                    Confidence ${Math.round(confAdj * 100)}%
+                </span>
+            </div>
+            ${verdict ? `<p class="critic-verdict">${escapeHtml(verdict)}</p>` : ''}
+            <div class="critic-challenges">
+                ${challenges.length
+                    ? challenges.map(c => `
+                        <div class="critic-challenge">
+                            <div class="critic-challenge-top">
+                                <span class="badge ${c.severity === 'high' ? 'high' : c.severity === 'low' ? 'low' : 'medium'}">${escapeHtml((c.severity || 'medium').toUpperCase())}</span>
+                                <div class="critic-claim">${escapeHtml(c.claim || '')}</div>
+                            </div>
+                            <div class="critic-issue">${escapeHtml(c.issue || '')}</div>
+                        </div>`).join('')
+                    : '<p class="critic-none">No significant issues found — synthesis is well-grounded.</p>'
+                }
+            </div>
+        </div>`;
+    chatContainer.appendChild(el);
+    scrollToBottom();
+}
+
+// --- #5: Re-run synthesis button ---
+function addRerunSynthesisButton() {
+    const el = createAIMessageEl();
+    const content = el.querySelector('.msg-ai-content');
+    content.innerHTML = `
+        <div style="padding: 4px 0;">
+            <button class="rerun-btn" id="rerun-synthesis-btn" onclick="triggerSynthesisRerun(this)">
+                &#8635; Re-run Synthesis
+            </button>
+            <span style="font-size:12px;color:#888;margin-left:10px;">
+                Reanalyse all findings without re-running analyses
+            </span>
+        </div>`;
+    chatContainer.appendChild(el);
+    scrollToBottom();
+}
+
+async function triggerSynthesisRerun(btn) {
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+    try {
+        const r = await fetch(`/rerun-synthesis/${sessionId}`, { method: 'POST' });
+        if (r.ok) {
+            addAIMessage('Synthesis restarting — new insights will appear shortly.');
+            // Reset rendered charts tracking so synthesis results refresh
+            pollStartTime = Date.now();
+            // Re-subscribe to SSE stream for new events
+            startSSEStream();
+        } else {
+            const err = await r.json().catch(() => ({}));
+            addAIMessage(`Rerun failed: ${err.detail || r.status}`);
+            btn.disabled = false;
+            btn.textContent = '&#8635; Re-run Synthesis';
+        }
+    } catch (e) {
+        addAIMessage(`Rerun error: ${e.message}`);
+        btn.disabled = false;
+        btn.textContent = '&#8635; Re-run Synthesis';
+    }
 }
 
 function addPersonasMessage(personas) {
@@ -1309,3 +1570,105 @@ function formatSize(bytes) {
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
+
+/* ─── Text-Selection Ask Popup ───────────────────────────────────────────────
+   When the user highlights any text inside the chat, a floating pill appears
+   above the selection. Clicking it sends the selected text as a user question
+   to the existing /chat endpoint — exactly like ChatGPT's "Ask about this".
+────────────────────────────────────────────────────────────────────────────── */
+(function initSelectionPopup() {
+    // Build the popup pill once and reuse it
+    const popup = document.createElement('div');
+    popup.id = 'sel-popup';
+    popup.className = 'sel-popup hidden';
+    popup.innerHTML = `
+        <button class="sel-popup-btn" id="sel-ask-btn">
+            <svg width="12" height="12" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M10 2C5.58 2 2 5.58 2 10s3.58 8 8 8 8-3.58 8-8-3.58-8-8-8zm.75 12.5h-1.5v-1.5h1.5v1.5zm1.56-5.44c-.63.84-1.31 1.1-1.31 2.19H9.5c0-1.53.76-2.17 1.38-2.84.45-.49.87-.94.87-1.66 0-.97-.78-1.75-1.75-1.75s-1.75.78-1.75 1.75H6.75C6.75 5.54 8.2 4 10 4s3.25 1.54 3.25 3.25c0 1.2-.62 1.95-1.19 2.56-.07.08-.13.17-.19.25z"
+                      fill="currentColor"/>
+            </svg>
+            Ask about this
+        </button>
+        <div class="sel-popup-arrow"></div>`;
+    document.body.appendChild(popup);
+
+    let _pendingText = '';
+
+    // Position + show popup above the current selection
+    function showPopup() {
+        const sel = window.getSelection();
+        if (!sel || sel.rangeCount === 0) return;
+        const text = sel.toString().trim();
+        if (!text || text.length < 3) { hidePopup(); return; }
+
+        // Only trigger if selection is inside the chat container
+        const range = sel.getRangeAt(0);
+        if (!chatContainer || !chatContainer.contains(range.commonAncestorContainer)) {
+            hidePopup(); return;
+        }
+
+        _pendingText = text;
+        const rect = range.getBoundingClientRect();
+        const popupW = 160; // approximate pill width
+        let left = rect.left + rect.width / 2 - popupW / 2;
+        // Clamp inside viewport
+        left = Math.max(8, Math.min(left, window.innerWidth - popupW - 8));
+        const top = rect.top - 48; // 44px pill height + 4px gap
+
+        popup.style.left = left + 'px';
+        popup.style.top  = top  + 'px';
+        popup.classList.remove('hidden');
+    }
+
+    function hidePopup() {
+        popup.classList.add('hidden');
+        _pendingText = '';
+    }
+
+    // Show on mouse-up inside chat
+    document.addEventListener('mouseup', (e) => {
+        // Small timeout so selection is finalised before we measure
+        setTimeout(() => {
+            const sel = window.getSelection();
+            if (sel && sel.toString().trim().length >= 3) {
+                showPopup();
+            } else {
+                hidePopup();
+            }
+        }, 10);
+    });
+
+    // Hide when clicking anywhere outside the popup
+    document.addEventListener('mousedown', (e) => {
+        if (!popup.contains(e.target)) hidePopup();
+    });
+
+    // Hide on scroll (position would drift)
+    window.addEventListener('scroll', hidePopup, { passive: true });
+    if (chatContainer) chatContainer.addEventListener('scroll', hidePopup, { passive: true });
+
+    // Main action — send selection as a chat question
+    document.getElementById('sel-ask-btn').addEventListener('click', () => {
+        const text = _pendingText || window.getSelection().toString().trim();
+        if (!text) { hidePopup(); return; }
+
+        if (!sessionId) {
+            addAIMessage('Upload a file first to ask questions about your data.');
+            hidePopup(); return;
+        }
+
+        // Clear highlight
+        window.getSelection().removeAllRanges();
+        hidePopup();
+
+        // Quote short selections; truncate long ones
+        const quoted = text.length <= 120
+            ? `"${text}"`
+            : `"${text.slice(0, 117)}…"`;
+        const question = `What does this mean? ${quoted}`;
+
+        addUserMessage(question);
+        sendChatMessage(question);
+        scrollToBottom();
+    });
+})();

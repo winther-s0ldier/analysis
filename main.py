@@ -43,6 +43,7 @@ from agents.coder import get_coder_agent
 from agents.synthesis import get_synthesis_agent
 from agents.dag_builder import get_dag_builder_agent
 from agents.chat_agent import get_chat_agent
+from agents.critic import get_critic_agent
 from tools.csv_profiler import profile_csv
 from tools.ingestion_normalizer import (
     normalize_file,
@@ -131,6 +132,17 @@ class SessionState:
 
 sessions: Dict[str, SessionState] = {}
 
+# --- #12: SSE event store — thread-safe list per session ---
+# Background pipeline thread appends events; SSE endpoint reads them.
+_sse_events: Dict[str, list] = {}
+
+
+def push_sse_event(session_id: str, event_type: str, data: dict) -> None:
+    """Push a real-time event to the SSE stream for a session."""
+    if session_id not in _sse_events:
+        _sse_events[session_id] = []
+    _sse_events[session_id].append({"type": event_type, "data": data})
+
 
 async def run_agent_pipeline(
     pipeline_id: str,
@@ -138,16 +150,18 @@ async def run_agent_pipeline(
     agent_getter: str = "root",
     max_turns: int = 15,
     image_paths: List[str] = None,
+    agent=None,  # #7: pass a pre-built agent directly (e.g. LoopAgent) instead of agent_getter
 ) -> str:
     """Run an agent with a user message and return the response.
 
     Args:
         pipeline_id: Session/pipeline identifier.
         prompt: User message to send to the agent.
-        agent_getter: Which agent to use.
+        agent_getter: Which agent to use (looked up from agent_map).
         max_turns: Maximum number of LLM round-trips before
             giving up. Prevents small models from looping forever.
         image_paths: Optional list of local file paths to images.
+        agent: Pre-built agent instance. If provided, agent_getter is ignored.
     """
     APP_NAME = "Analytics_analytics"
     USER_ID = "user_1"
@@ -160,11 +174,13 @@ async def run_agent_pipeline(
         "synthesis":   get_synthesis_agent,
         "dag_builder": get_dag_builder_agent,
         "chat":        get_chat_agent,
+        "critic":      get_critic_agent,   # #8: adversarial critic
     }
-    getter = agent_map.get(
-        agent_getter, get_root_agent
-    )
-    target_agent = getter()
+    if agent is not None:
+        target_agent = agent  # #7: LoopAgent or any pre-built agent passed directly
+    else:
+        getter = agent_map.get(agent_getter, get_root_agent)
+        target_agent = getter()
 
     session = await session_service.get_session(
         app_name=APP_NAME, user_id=USER_ID, session_id=pipeline_id
@@ -205,7 +221,7 @@ async def run_agent_pipeline(
         parts=parts
     )
 
-    max_retries = 3
+    max_retries = 6
 
     for attempt in range(max_retries):
         try:
@@ -233,16 +249,23 @@ async def run_agent_pipeline(
 
         except Exception as e:
             error_str = str(e).lower()
-            if "429" in error_str or "rate" in error_str or "exhausted" in error_str or "quota" in error_str:
+            is_rate_limit = (
+                "429" in error_str or "rate" in error_str
+                or "exhausted" in error_str or "quota" in error_str
+                or "resource_exhausted" in error_str
+            )
+            if is_rate_limit:
                 if attempt < max_retries - 1:
+                    # Respect API-suggested delay if present, else exponential backoff
                     match = re.search(r"'retryDelay': '(\d+)s'", str(e))
-                    delay = int(match.group(1)) + 1 if match else 20
+                    base_delay = int(match.group(1)) + 1 if match else 20
+                    delay = min(base_delay * (attempt + 1), 120)  # cap at 2 min
                     print(f"Rate limit hit. Waiting {delay}s... (Attempt {attempt+1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
                 else:
                     print(f"Rate limit exhausted after {max_retries} attempts")
-                    return f"Error: API rate limit exceeded after {max_retries} retries. Please wait a minute and try again."
+                    return f"Error: API rate limit exceeded after {max_retries} retries."
             raise
 
     return final_response
@@ -600,6 +623,11 @@ async def run_pipeline_background(
     approved, state
 ):
     try:
+        # --- #12: Register SSE event hook so orchestrator can push real-time events ---
+        from agents.orchestrator import _pipeline_event_hooks
+        _pipeline_event_hooks[session_id] = lambda evt, data: push_sse_event(session_id, evt, data)
+        _sse_events[session_id] = []  # Reset event list for this run
+
         print(f"INFO: Pipeline starting for {session_id}")
         result = await run_full_pipeline(
             session_id=session_id,
@@ -694,6 +722,149 @@ async def get_status(session_id: str):
             for a in state.artifacts
         ),
     }
+
+@app.get("/stream/{session_id}")
+async def sse_stream(session_id: str, request: Request):
+    """
+    #12: Server-Sent Events endpoint for real-time pipeline progress.
+    Replaces polling — frontend subscribes once and receives events as they happen.
+    Events: node_complete, synthesis_complete, report_ready, stream_end.
+    Falls back gracefully: if client disconnects, generator exits cleanly.
+    """
+    async def event_generator():
+        last_index = 0
+        while True:
+            if await request.is_disconnected():
+                break
+            events = _sse_events.get(session_id, [])
+            # Yield any new events since last check
+            new_events = events[last_index:]
+            for ev in new_events:
+                yield f"data: {json.dumps(ev)}\n\n"
+            last_index += len(new_events)
+            # Check terminal condition: pipeline done AND all events sent
+            state = sessions.get(session_id)
+            if state and state.status in ("complete", "error") and last_index >= len(events):
+                yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': state.status}})}\n\n"
+                break
+            await asyncio.sleep(0.8)
+
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/rerun-synthesis/{session_id}")
+async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
+    """
+    #5: Re-run synthesis (and critic + report) without re-running all analysis nodes.
+    Useful when synthesis quality was poor or the user wants a fresh interpretation.
+    Returns immediately; results stream via SSE or appear on next /synthesis poll.
+    """
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(404, "Session not found")
+
+    # Block if pipeline is still running
+    if state.status not in ("complete", "error", "rerunning_synthesis"):
+        raise HTTPException(
+            409,
+            f"Cannot rerun synthesis while pipeline is in state '{state.status}'. "
+            "Wait for the pipeline to complete first."
+        )
+
+    completed = {
+        k: v for k, v in state.results.items()
+        if isinstance(v, dict) and v.get("status") == "success"
+    }
+    if not completed:
+        raise HTTPException(400, "No completed analyses available to synthesize.")
+
+    # Clear old synthesis so agents start fresh
+    try:
+        from agents.synthesis import _synthesis_store, _reasoning_store
+        _synthesis_store.pop(session_id, None)
+        _reasoning_store.pop(session_id, None)
+    except Exception:
+        pass
+    state.synthesis = {}
+    state.status = "rerunning_synthesis"
+    _sse_events[session_id] = []  # Fresh event stream
+
+    # Register event hook
+    from agents.orchestrator import _pipeline_event_hooks
+    _pipeline_event_hooks[session_id] = lambda evt, data: push_sse_event(session_id, evt, data)
+
+    async def _do_rerun():
+        try:
+            from agents.orchestrator import build_synthesis_prompt, get_pipeline_state
+            pipe_state = get_pipeline_state(session_id)
+            effective_state = pipe_state or state
+            dag = getattr(state, "dag", []) or []
+            prompt, images = build_synthesis_prompt(session_id, effective_state, dag)
+
+            await run_agent_pipeline(
+                f"{session_id}_synthesis_rerun",
+                prompt,
+                agent_getter="synthesis",
+                image_paths=images,
+            )
+            push_sse_event(session_id, "synthesis_complete", {"session_id": session_id})
+
+            # Re-run critic
+            try:
+                from agents.critic import get_critic_store_result
+                await run_agent_pipeline(
+                    f"{session_id}_critic_rerun",
+                    f"session_id: {session_id}\nReview the regenerated synthesis.",
+                    agent_getter="critic",
+                    max_turns=8,
+                )
+                _crit = get_critic_store_result(session_id)
+                if _crit:
+                    from agents.synthesis import _synthesis_store as _ss
+                    if session_id in _ss:
+                        _ss[session_id]["_critic_review"] = _crit
+                    if isinstance(state.synthesis, dict):
+                        state.synthesis["_critic_review"] = _crit
+            except Exception as _ce:
+                print(f"WARNING: Critic rerun failed (non-fatal): {_ce}")
+
+            # Re-run dag_builder
+            await run_agent_pipeline(
+                f"{session_id}_report_rerun",
+                f"Session ID: {session_id}\nOutput folder: {str(OUTPUT_DIR / state.output_folder)}\n"
+                f"Call tool_build_report(session_id, output_folder) now.",
+                agent_getter="dag_builder",
+            )
+            push_sse_event(session_id, "report_ready", {"session_id": session_id})
+            state.status = "complete"
+            print(f"INFO: Synthesis rerun complete for {session_id}")
+        except Exception as _e:
+            import traceback
+            print(f"ERROR: Synthesis rerun failed for {session_id}: {_e}")
+            traceback.print_exc()
+            state.status = "error"
+
+    def _sync_rerun():
+        import asyncio as _aio
+        _aio.run(_do_rerun())
+
+    background_tasks.add_task(_sync_rerun)
+    return {
+        "status": "rerunning",
+        "session_id": session_id,
+        "message": f"Synthesis restarted for {len(completed)} completed analyses. "
+                   "Results will appear shortly.",
+    }
+
 
 @app.post("/chat/{session_id}")
 async def chat(session_id: str, request: Request):

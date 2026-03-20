@@ -74,6 +74,7 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
                     continue
                 chart_path = result.get("chart_file_path")
                 if chart_path and os.path.exists(chart_path):
+                    _ins_sum = result.get("insight_summary") or {}
                     charts.append({
                         "analysis_id": aid,
                         "analysis_type": result.get("analysis_type", ""),
@@ -82,6 +83,8 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
                         "severity": result.get("severity", "info"),
                         "confidence": result.get("confidence", 0.0),
                         "narrative": result.get("data", {}).get("narrative", {}),
+                        # Per-node decision-maker insight from #10
+                        "decision_maker_takeaway": _ins_sum.get("decision_maker_takeaway", "") if isinstance(_ins_sum, dict) else "",
                     })
     except Exception as e:
         print(f"WARNING: dag_builder state read failed: {e}")
@@ -215,6 +218,43 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         )
     di_h = "".join(di_chunks)
 
+    # --- #8: Adversarial Critic Review section ---
+    _crit_rev = synthesis.get("_critic_review", {})
+    _critic_h = ""
+    if isinstance(_crit_rev, dict) and _crit_rev:
+        _cr_approved = _crit_rev.get("approved", True)
+        _cr_challenges = _crit_rev.get("challenges", [])
+        _cr_conf = _crit_rev.get("confidence_adjustment", 1.0)
+        _cr_verdict = _crit_rev.get("overall_verdict", "")
+        _verdict_label = "&#10003; Approved" if _cr_approved else "&#9888; Issues Found"
+        _verdict_class = "low" if _cr_approved else "high"
+        _chal_html = ""
+        for _ch in _cr_challenges:
+            if not isinstance(_ch, dict):
+                continue
+            _ch_sev = _ch.get("severity", "medium").lower()
+            if _ch_sev not in ("critical", "high", "medium", "low"):
+                _ch_sev = "medium"
+            _chal_html += (
+                f'<div class="strategy-card {_ch_sev}" style="margin-bottom:10px;">'
+                f'<div class="strat-header">'
+                f'<span class="badge {_ch_sev}">{_ch_sev.upper()}</span>'
+                f'&nbsp;{_ch.get("claim", "")}'
+                f'</div>'
+                f'<div class="strat-body">{_ch.get("issue", "")}</div>'
+                f'</div>'
+            )
+        if not _cr_challenges:
+            _chal_html = '<p style="color:#27ae60;margin:0;">No significant issues found — synthesis is well-grounded.</p>'
+        _critic_h = (
+            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">'
+            f'<span class="badge {_verdict_class}" style="font-size:13px;padding:5px 12px;">{_verdict_label}</span>'
+            f'<span style="font-size:12px;color:#666;">Confidence adjustment: {int(_cr_conf * 100)}%</span>'
+            f'</div>'
+            + (f'<p style="font-size:13px;color:#555;margin-bottom:14px;">{_cr_verdict}</p>' if _cr_verdict else "")
+            + _chal_html
+        )
+
     st = synthesis.get("intervention_strategies", {})
     if isinstance(st, list):
         strategies_list = st
@@ -273,13 +313,34 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         )
     pe_h = f'<div class="persona-grid">{"".join(pe_chunks)}</div>' if pe_chunks else ""
 
+    # Pre-index synthesis insight cards by analysis_id so each chart can
+    # pull its matching insight for the detailed description below the chart.
+    _insight_index = {}
+    _di_raw = synthesis.get("detailed_insights", {})
+    _all_insights = _di_raw if isinstance(_di_raw, list) else (_di_raw.get("insights", []) if isinstance(_di_raw, dict) else [])
+    for _ins in _all_insights:
+        if not isinstance(_ins, dict):
+            continue
+        # Scan ai_summary and root_cause_hypothesis for [AX] node citations
+        _text = str(_ins.get("ai_summary", "")) + str(_ins.get("root_cause_hypothesis", "")) + str(_ins.get("title", ""))
+        import re as _re
+        for _m in _re.findall(r'\[A(\d+)\]', _text):
+            _nid = f"A{_m}"
+            if _nid not in _insight_index:
+                _insight_index[_nid] = _ins
+
     ch_chunks = []
     for c in charts:
+        a_id   = c.get("analysis_id", "")
         a_type = c.get("analysis_type", "").replace("_", " ").title()
-        sev = c.get("severity", "info")
+        sev    = c.get("severity", "info")
         html_content = c.get("_embedded_html", "")
-        narrative = c.get("narrative", {})
+        narrative = c.get("narrative", {}) if isinstance(c.get("narrative"), dict) else {}
         top_finding = c.get("top_finding", "")
+        dm_takeaway = c.get("decision_maker_takeaway", "")
+        confidence  = c.get("confidence", 0.0)
+        conf_pct    = f"{round(confidence * 100)}%" if confidence else ""
+
         safe_html = (
             html_content
             .replace("&", "&amp;")
@@ -288,49 +349,87 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             .replace(">", "&gt;")
         )
 
-        # Build the narrative block
+        # --- Pre-chart: decision-maker takeaway (from #10) ---
+        pre_chart = ""
+        if dm_takeaway:
+            pre_chart = (
+                f'<div class="dm-takeaway">'
+                f'<span style="font-size:18px;">&#128161;</span>'
+                f'<strong> Decision-Maker Insight</strong>'
+                f'<p style="margin:6px 0 0 0;">{dm_takeaway}</p>'
+                f'</div>'
+            )
+        elif top_finding:
+            pre_chart = (
+                f'<div class="dm-takeaway">'
+                f'<span style="font-size:18px;">&#128269;</span>'
+                f'<strong> Key Finding</strong>'
+                f'<p style="margin:6px 0 0 0;">{top_finding}</p>'
+                f'</div>'
+            )
+
+        # --- Post-chart: narrative (what it means + proposed fix) ---
         what_it_means = narrative.get("what_it_means", "")
-        proposed_fix = narrative.get("proposed_fix", "")
+        proposed_fix  = narrative.get("proposed_fix", "")
         narr_severity = narrative.get("severity", sev)
         if narr_severity not in ["critical", "high", "medium", "low", "info"]:
             narr_severity = "info"
 
         narrative_html = ""
-        if what_it_means or proposed_fix:
-            narrative_html = (
-                f'<div class="narrative-block">'
+        if what_it_means:
+            narrative_html += (
                 f'<div class="narrative-what">'
                 f'<span class="narrative-icon">&#128269;</span>'
                 f'<strong>WHAT IT MEANS</strong>'
                 f'<p>{what_it_means}</p>'
                 f'</div>'
-                + (
-                    f'<div class="narrative-fix">'
-                    f'<span class="narrative-icon">&#9889;</span>'
-                    f'<strong>PROPOSED FIX</strong>'
-                    f'<span class="badge {narr_severity}" style="float:right;margin-top:-2px">{narr_severity.upper()}</span>'
-                    f'<p>{proposed_fix}</p>'
-                    f'</div>'
-                    if proposed_fix else ""
-                )
-                + f'</div>'
             )
-        elif top_finding:
-            narrative_html = (
-                f'<div class="narrative-block">'
-                f'<div class="narrative-what">'
-                f'<span class="narrative-icon">&#128269;</span>'
-                f'<strong>KEY FINDING</strong>'
-                f'<p>{top_finding}</p>'
-                f'</div>'
+        if proposed_fix:
+            narrative_html += (
+                f'<div class="narrative-fix">'
+                f'<span class="narrative-icon">&#9889;</span>'
+                f'<strong>PROPOSED FIX</strong>'
+                f'<span class="badge {narr_severity}" style="float:right;margin-top:-2px">{narr_severity.upper()}</span>'
+                f'<p>{proposed_fix}</p>'
                 f'</div>'
             )
 
+        # --- Matched synthesis insight card for this node ---
+        matched_ins = _insight_index.get(a_id)
+        insight_detail_html = ""
+        if matched_ins:
+            _ai_sum  = matched_ins.get("ai_summary", "")
+            _rc      = matched_ins.get("root_cause_hypothesis", "")
+            _causes  = matched_ins.get("possible_causes", [])
+            _ds_impl = matched_ins.get("downstream_implications", "")
+            _fixes   = matched_ins.get("how_to_fix", matched_ins.get("recommended_solutions", []))
+            _pri     = matched_ins.get("fix_priority", "medium").lower()
+            if _pri not in ["critical","high","medium","low"]: _pri = "medium"
+            _causes_html = "".join(f"<li>{x}</li>" for x in _causes) if _causes else ""
+            _fixes_html  = "".join(f"<li>{x}</li>" for x in _fixes)  if _fixes  else ""
+            insight_detail_html = (
+                f'<div class="insight-deep-dive">'
+                f'<div class="idive-header"><span class="badge {_pri}">{_pri.upper()}</span>&nbsp;Deep Dive Analysis [{a_id}]</div>'
+                + (f'<div class="idive-row"><strong>&#129302; AI Analysis</strong><p>{_ai_sum}</p></div>' if _ai_sum else "")
+                + (f'<div class="idive-row"><strong>&#128279; Root Cause Chain</strong><p>{_rc}</p></div>' if _rc else "")
+                + (f'<div class="idive-row"><strong>&#128270; Possible Causes</strong><ul>{_causes_html}</ul></div>' if _causes_html else "")
+                + (f'<div class="idive-row"><strong>&#128200; Downstream Impact</strong><p>{_ds_impl}</p></div>' if _ds_impl else "")
+                + (f'<div class="idive-row"><strong>&#9989; How to Fix</strong><ul>{_fixes_html}</ul></div>' if _fixes_html else "")
+                + f'</div>'
+            )
+
+        post_chart = ""
+        if narrative_html or insight_detail_html:
+            post_chart = f'<div class="narrative-block">{narrative_html}{insight_detail_html}</div>'
+
+        conf_badge = f'<span style="font-size:11px;color:#888;margin-left:8px;">confidence {conf_pct}</span>' if conf_pct else ""
+
         ch_chunks.append(
             f'<div class="chart-container">'
-            f'<div class="chart-header"><span>{a_type}</span><span class="badge {sev}">{sev}</span></div>'
+            f'<div class="chart-header"><span>{a_type} [{a_id}]</span><span class="badge {sev}">{sev}</span>{conf_badge}</div>'
+            + pre_chart +
             f'<iframe srcdoc="{safe_html}" width="100%" height="500" frameborder="0"></iframe>'
-            + narrative_html +
+            + post_chart +
             f'</div>'
         )
     ch_h = "".join(ch_chunks)
@@ -348,7 +447,12 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
 
     # Cross-metric connections (present in UI, previously missing from report)
     cx = synthesis.get("cross_metric_connections", {})
-    connections_list = cx.get("connections", [])
+    if isinstance(cx, list):
+        connections_list = cx
+    elif isinstance(cx, dict):
+        connections_list = cx.get("connections", [])
+    else:
+        connections_list = []
     cx_chunks = []
     for conn in connections_list:
         fa = conn.get("finding_a", "")
@@ -370,6 +474,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         "executive_summary":       "Executive Summary",
         "key_findings":            "Key Findings",
         "detailed_insights":       "Detailed Insights",
+        "adversarial_review":      "&#128269; Adversarial Review",
         "personas":                "User Profiles",
         "cross_metric_connections":"Cross-Metric Connections",
         "intervention_strategies": "Intervention Strategies",
@@ -437,6 +542,17 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         .key_findings p {{ font-size: 14px; margin-bottom: 12px; }}
         .key_findings ul, .key_findings ol {{ font-size: 14px; padding-left: 22px; }}
         .key_findings li {{ margin-bottom: 6px; }}
+        /* Decision-maker takeaway block (pre-chart highlight) */
+        .dm-takeaway {{ padding: 12px 18px; background: #fffde7; border-left: 4px solid #f9a825; margin: 0; font-family: system-ui, sans-serif; }}
+        .dm-takeaway p {{ margin: 6px 0 0 0; font-size: 14px; line-height: 1.5; }}
+        /* Deep-dive synthesis insight section (post-chart) */
+        .insight-deep-dive {{ border-top: 1px solid #e0e0e0; padding: 16px 18px; background: #fafafa; font-family: system-ui, sans-serif; }}
+        .idive-header {{ font-weight: 700; font-size: 13px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }}
+        .idive-row {{ margin-bottom: 10px; font-size: 13px; line-height: 1.55; }}
+        .idive-row strong {{ display: block; font-size: 11px; text-transform: uppercase; color: #666; margin-bottom: 4px; letter-spacing: 0.4px; }}
+        .idive-row p {{ margin: 0; }}
+        .idive-row ul {{ margin: 4px 0; padding-left: 20px; }}
+        .idive-row li {{ margin-bottom: 4px; }}
     </style></head><body>
     <div class="header">
         <h1>{title}</h1>
@@ -445,6 +561,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     {get_sect_labeled("executive_summary", ex_h)}
     {get_sect_labeled("key_findings", conv_h)}
     {get_sect_labeled("detailed_insights", di_h)}
+    {get_sect_labeled("adversarial_review", _critic_h)}
     {get_sect_labeled("personas", pe_h)}
     {get_sect_labeled("cross_metric_connections", cx_h)}
     {get_sect_labeled("intervention_strategies", st_h)}
