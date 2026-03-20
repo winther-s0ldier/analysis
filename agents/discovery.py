@@ -1,6 +1,10 @@
-import json
+import re
 import os
 import sys
+import json
+import traceback
+from typing import Annotated
+from pydantic import Field
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -98,15 +102,17 @@ def build_dag_deterministic(
     return {"status": "success", "dag": final_dag, "data_summary": data_summary, "node_count": len(final_dag)}
 
 
-def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
+def tool_submit_analysis_plan(
+    session_id: Annotated[str, Field(description="Active pipeline session ID")],
+    dag_json_str: Annotated[str, Field(description="JSON string of the analysis DAG â€” a list of node objects or a dict with a 'dag' key")],
+    tool_context=None,  # ADK injects ToolContext automatically when declared
+) -> str:
     """
     Submit the final analysis plan as structured JSON.
     MUST be called to complete the discovery process.
     """
     try:
         from tools.analysis_library import LIBRARY_REGISTRY
-        
-        import re
         
         # Helper function to extract JSON from mixed text
         def _extract_json_from_text(text: str):
@@ -168,10 +174,10 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
         final_dag = []
         metrics_ui = []
         
-        # ── Alias map: silently remap common LLM-generated synonyms to registered types
+        # â”€â”€ Alias map: silently remap common LLM-generated synonyms to registered types
         # This keeps the LLM free to propose analyses by any reasonable name while
         # ensuring the coder agent gets a type it can look up. Unknown types without
-        # an alias are kept as-is — the coder agent will write custom code for them.
+        # an alias are kept as-is â€” the coder agent will write custom code for them.
         ALIAS_MAP = {
             "path_analysis":           "user_journey_analysis",
             "retention_analysis":      "cohort_analysis",
@@ -194,7 +200,7 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
             original_atype = atype
             atype = ALIAS_MAP.get(atype, atype)
             if atype != original_atype:
-                print(f"INFO: Remapped analysis_type '{original_atype}' → '{atype}'")
+                print(f"INFO: Remapped analysis_type '{original_atype}' â†’ '{atype}'")
                 node["analysis_type"] = atype
 
             lib_entry = LIBRARY_REGISTRY.get(atype, {})
@@ -202,6 +208,11 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
             desc = node.get("description") or lib_entry.get("description", atype)
             lib_fn = node.get("library_function") or lib_entry.get("function")
             
+            # Extract cohort_window from column_roles if LLM placed it there,
+            # then remove it from column_roles so it doesn't confuse the coder agent.
+            _col_roles = dict(node.get("column_roles", {}))
+            _cohort_window = _col_roles.pop("cohort_window", None)
+
             spec = {
                 "id": node.get("id"),
                 "name": name,
@@ -209,12 +220,14 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
                 "analysis_type": atype,
                 "library_function": lib_fn,
                 "required_columns": node.get("required_columns", []),
-                "column_roles": node.get("column_roles", {}),
+                "column_roles": _col_roles,
                 "depends_on": node.get("depends_on", []),
                 "priority": node.get("priority", "medium"),
                 "feasibility": node.get("feasibility", "HIGH" if lib_fn else "MEDIUM"),
                 "status": "pending"
             }
+            if _cohort_window and atype == "cohort_analysis":
+                spec["cohort_window"] = _cohort_window
             final_dag.append(spec)
             
             metrics_ui.append({
@@ -227,6 +240,37 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
                 "status": "pending"
             })
 
+        # Check for LOW-feasibility nodes that could benefit from user clarification.
+        # If ALL nodes are LOW feasibility, pause the pipeline and request clarification
+        # rather than proceeding with a likely-broken DAG.
+        _low_feas = [n for n in final_dag if n.get("feasibility", "").upper() == "LOW"]
+        if _low_feas:
+            try:
+                from main import sessions
+                _state = sessions.get(session_id)
+                if _state:
+                    _state.status = "clarification_needed"
+                    _state.clarification_request = {
+                        "ambiguous_nodes": [
+                            {"id": n["id"], "analysis_type": n["analysis_type"],
+                             "reason": "feasibility=LOW â€” column roles uncertain"}
+                            for n in _low_feas
+                        ],
+                        "message": (
+                            "The Discovery Agent could not confidently assign column roles for all planned analyses. "
+                            "Please confirm the role of each column below before proceeding."
+                        ),
+                    }
+                    from a2a_messages import create_message, Intent
+                    _state.post_message(create_message(
+                        intent=Intent.CLARIFICATION_NEEDED,
+                        sender="discovery_agent",
+                        recipient="orchestrator",
+                        payload=_state.clarification_request,
+                    ))
+            except Exception as _clar_err:
+                print(f"WARNING: CLARIFICATION_NEEDED post failed: {_clar_err}")
+
         plan = {
             "data_summary": (parsed.get("data_summary") if isinstance(parsed, dict) else ""),
             "dag": final_dag,
@@ -234,10 +278,36 @@ def tool_submit_analysis_plan(session_id: str, dag_json_str: str) -> str:
             "node_count": len(final_dag)
         }
         _plan_store[session_id] = plan
+
+        # A2A server mode: write plan to file so orchestrator (main process) can read it
+        try:
+            from agent_servers.a2a_orchestrator import lookup_session as _lookup_s
+            _abs_out = _lookup_s(session_id)
+            if _abs_out:
+                os.makedirs(_abs_out, exist_ok=True)
+                _plan_cache = os.path.join(_abs_out, "_plan_cache.json")
+                with open(_plan_cache, "w", encoding="utf-8") as _pf:
+                    json.dump(plan, _pf)
+                print(f"INFO: [A2A] plan cache written for {session_id}")
+        except Exception as _pce:
+            print(f"WARNING: [A2A] plan cache write failed: {_pce}")
+
+        # ADK-native: write to ToolContext state so downstream SequentialAgent
+        # sub-agents (synthesis, dag_builder) can read dag without importing main
+        if tool_context is not None:
+            try:
+                tool_context.state["dag"] = final_dag
+                tool_context.state["plan"] = plan
+                tool_context.state["dag_ready"] = True
+            except Exception:
+                pass
+
         return f"Successfully stored analysis plan with {len(final_dag)} nodes for session {session_id}."
     except Exception as e:
-        import traceback
-        print(f"Discovery parsing error: {traceback.format_exc()}")
+        try:
+            print(f"Discovery parsing error: {traceback.format_exc()}".encode("utf-8", errors="replace").decode("utf-8"))
+        except Exception:
+            print("Discovery parsing error: (traceback unprintable)")
         return f"Error parsing JSON: {str(e)}"
 
 
@@ -261,7 +331,7 @@ def get_discovery_agent():
                 "You are NOT a rule-based router. Do NOT apply the same template to every dataset. "
                 "Reason about THIS specific dataset's structure, distribution, and the Profiler's column roles to decide WHICH analyses will yield the most valuable insights. "
                 "A dataset with no `entity_col` CANNOT have session-based analyses. A dataset with no `time_col` CANNOT have trend or cohort analyses. "
-                "Let the data dictate the plan — not assumptions about the domain or industry.\n\n"
+                "Let the data dictate the plan â€” not assumptions about the domain or industry.\n\n"
 
                 "## WORKFLOW\n"
                 "1. Receive the Profiler's JSON output (dataset_type, column_roles, recommended_analyses, raw_profile).\n"
@@ -273,48 +343,42 @@ def get_discovery_agent():
                 "CRITICAL: The key names in `column_roles` for each node MUST EXACTLY match the function signatures listed here. "
                 "ANY deviation (e.g., using 'target_col' instead of 'col') will cause a runtime crash.\n\n"
                 "### Statistical / Data Quality\n"
-                "- `distribution_analysis`: {\"col\": <numeric_column>} — histograms, box plots, normality test.\n"
-                "- `categorical_analysis`: {\"col\": <categorical_column>} — frequency table, Pareto, entropy.\n"
-                "- `correlation_matrix`: {} — no extra args needed.\n"
-                "- `anomaly_detection`: {\"col\": <numeric_column>} — IQR + Z-score outlier detection.\n"
-                "- `missing_data_analysis`: {} — no extra args needed.\n"
-                "- `pareto_analysis`: {\"category_col\": <category>, \"value_col\": <numeric>} — 80/20 rule.\n"
-                "- `contribution_analysis`: {\"group_col\": <category>, \"value_col\": <numeric>} — % contribution to total value.\n"
-                "- `cross_tab_analysis`: {\"col_a\": <category>, \"col_b\": <category>} — Chi-squared + Cramér's V categorical association.\n\n"
+                "- `distribution_analysis`: {\"col\": <numeric_column>} â€” histograms, box plots, normality test.\n"
+                "- `categorical_analysis`: {\"col\": <categorical_column>} â€” frequency table, Pareto, entropy.\n"
+                "- `correlation_matrix`: {} â€” no extra args needed.\n"
+                "- `anomaly_detection`: {\"col\": <numeric_column>} â€” IQR + Z-score outlier detection.\n"
+                "- `missing_data_analysis`: {} â€” no extra args needed.\n"
+                "- `pareto_analysis`: {\"category_col\": <category>, \"value_col\": <numeric>} â€” 80/20 rule.\n"
+                "- `contribution_analysis`: {\"group_col\": <category>, \"value_col\": <numeric>} â€” % contribution to total value.\n"
+                "- `cross_tab_analysis`: {\"col_a\": <category>, \"col_b\": <category>} â€” Chi-squared + CramÃ©r's V categorical association.\n\n"
                 "**For non-behavioral datasets, strongly prefer contribution_analysis, cross_tab_analysis, pareto, and correlation.**\n\n"
                 "### Time-Based\n"
-                "- `trend_analysis`: {\"time_col\": <time>, \"value_col\": <numeric>} — rolling averages, change-points.\n"
-                "- `time_series_decomposition`: {\"time_col\": <time>, \"value_col\": <numeric>} — STL decomposition.\n"
-                "- `cohort_analysis`: {\"entity_col\": <id>, \"time_col\": <time>, \"value_col\": <numeric>} — retention by cohort.\n"
-                "- `rfm_analysis`: {\"entity_col\": <id>, \"time_col\": <time>, \"value_col\": <numeric>} — RFM segmentation.\n\n"
-                "### Behavioral (REQUIRE sessions — only use if dataset has entity_col + time_col + event_col)\n"
-                "- `session_detection`: {\"entity_col\": <id>, \"time_col\": <time>} — Groups raw events into sessions. MUST run before any other behavioral analysis.\n"
-                "- `funnel_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — Conversion rates per step.\n"
-                "- `friction_detection`: {\"entity_col\": <id>, \"event_col\": <event>} — Repeat-attempt loops.\n"
-                "- `survival_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} — Kaplan-Meier session survival.\n"
-                "- `user_segmentation`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — DBSCAN behavioral clustering.\n"
-                "- `sequential_pattern_mining`: {\"entity_col\": <id>, \"event_col\": <event>} — Frequent sub-sequences.\n"
-                "- `transition_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — Markov transition matrix.\n"
-                "- `dropout_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — Events before early exit.\n"
-                "- `event_taxonomy`: {\"event_col\": <event>} — Auto-classify events into 9 functional categories.\n"
-                "- `intervention_triggers`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — "
+                "- `trend_analysis`: {\"time_col\": <time>, \"value_col\": <numeric>} â€” rolling averages, change-points.\n"
+                "- `time_series_decomposition`: {\"time_col\": <time>, \"value_col\": <numeric>} â€” STL decomposition.\n"
+                "- `cohort_analysis`: {\"entity_col\": <id>, \"time_col\": <time>, \"value_col\": <numeric>} â€” retention by cohort. Add `\"cohort_window\": \"W\"` for weekly or `\"D\"` for daily granularity (default monthly).\n"
+                "- `rfm_analysis`: {\"entity_col\": <id>, \"time_col\": <time>, \"value_col\": <numeric>} â€” RFM segmentation.\n\n"
+                "### Behavioral (REQUIRE sessions â€” only use if dataset has entity_col + time_col + event_col)\n"
+                "- `session_detection`: {\"entity_col\": <id>, \"time_col\": <time>} â€” Groups raw events into sessions. MUST run before any other behavioral analysis.\n"
+                "- `funnel_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” Conversion rates per step.\n"
+                "- `friction_detection`: {\"entity_col\": <id>, \"event_col\": <event>} â€” Repeat-attempt loops.\n"
+                "- `survival_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} â€” Kaplan-Meier session survival.\n"
+                "- `user_segmentation`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” DBSCAN behavioral clustering.\n"
+                "- `sequential_pattern_mining`: {\"entity_col\": <id>, \"event_col\": <event>} â€” Frequent sub-sequences.\n"
+                "- `transition_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” Markov transition matrix.\n"
+                "- `dropout_analysis`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” Events before early exit.\n"
+                "- `event_taxonomy`: {\"event_col\": <event>} â€” Auto-classify events into 9 functional categories.\n"
+                "- `intervention_triggers`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” "
                 "Discovers events that reliably precede sequence or process abandonment (>80% dropout rate after the event). "
                 "Produces a ranked list of risk-level triggers with their dropout rates.\n"
-                "- `session_classification`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} — "
+                "- `session_classification`: {\"entity_col\": <id>, \"event_col\": <event>, \"time_col\": <time>} â€” "
                 "Classifies entities into archetypes based on sequence depth and event diversity. "
                 "Reveals which engagement tiers exist and where the biggest volume of incomplete sequences occurs.\n"
-                "- `user_journey_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} — "
+                "- `user_journey_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} â€” "
                 "Maps the most common entity paths through the event sequence. Shows which routes lead to completion vs abandonment, "
                 "the most common entry and exit events, and where paths diverge. Use this when path or flow analysis is valuable.\n"
-                "- `survival_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} — "
+                "- `survival_analysis`: {\"entity_col\": <id>, \"event_col\": <event>} â€” "
                 "Kaplan-Meier curve measuring what fraction of sequences remain active at each successive event depth. "
                 "Identifies the typical sequence 'half-life' and the depth at which most sequences terminate.\n\n"
-                "NOTE: `user_journey_analysis` is the correct type for path or flow analysis. "
-                "DO NOT use `path_analysis` — it is not a registered type.\n"
-                "NOTE: `cohort_analysis` is the correct type for retention or repeat-engagement tracking. "
-                "DO NOT use `retention_analysis` — it is not a registered type.\n"
-                "NOTE: `trend_analysis` is the correct type for time-to-event or temporal patterns. "
-                "DO NOT use `time_to_event_analysis` — it is not a registered type.\n\n"
 
                 "## DEPENDENCY RULES (NON-NEGOTIABLE)\n"
                 "1. `session_detection` (A1): If ANY behavioral analysis is selected, `session_detection` MUST be the first node and ALL behavioral analyses MUST list `session_detection`'s ID in their `depends_on`.\n"
@@ -323,17 +387,17 @@ def get_discovery_agent():
                 "4. Do NOT create circular dependencies.\n\n"
 
                 "## FEASIBILITY RULES\n"
-                "- If `entity_col` is null in Profiler output → SKIP all behavioral analyses.\n"
-                "- If `time_col` is null → SKIP `trend_analysis`, `cohort_analysis`, `rfm_analysis`, `time_series_decomposition`, `session_detection`.\n"
-                "- If `event_col` is null → SKIP all behavioral analyses that require it.\n"
-                "- If dataset has < 50 rows → SKIP `cohort_analysis`, `rfm_analysis`, `sequential_pattern_mining`.\n\n"
+                "- If `entity_col` is null in Profiler output â†’ SKIP all behavioral analyses.\n"
+                "- If `time_col` is null â†’ SKIP `trend_analysis`, `cohort_analysis`, `rfm_analysis`, `time_series_decomposition`, `session_detection`.\n"
+                "- If `event_col` is null â†’ SKIP all behavioral analyses that require it.\n"
+                "- If dataset has < 50 rows â†’ SKIP `cohort_analysis`, `rfm_analysis`, `sequential_pattern_mining`.\n\n"
 
                 "## DO's\n"
                 "- DO use the EXACT column names from `column_roles` returned by the Profiler as values in each node's `column_roles`.\n"
                 "- DO write a meaningful `description` for every node explaining WHY this analysis is valuable for this specific dataset.\n"
                 "- DO set `priority` to `critical` for analyses that unlock downstream analyses, `high` for primary insights, `medium` for supporting evidence.\n"
-                "- CONSIDER `user_journey_analysis` or `event_taxonomy` for event_log datasets with rich, diverse event values — only if path or flow patterns are genuinely valuable for this specific data.\n"
-                "- DO write node descriptions that explain WHY this analysis is valuable for THIS specific dataset — avoid generic descriptions.\n"
+                "- CONSIDER `user_journey_analysis` or `event_taxonomy` for event_log datasets with rich, diverse event values â€” only if path or flow patterns are genuinely valuable for this specific data.\n"
+                "- DO write node descriptions that explain WHY this analysis is valuable for THIS specific dataset â€” avoid generic descriptions.\n"
                 "- DO treat the dataset as domain-unknown. Never inject assumptions about products, users, or industries unless the column names or data samples confirm it.\n\n"
 
                 "## DON'Ts\n"
@@ -341,11 +405,9 @@ def get_discovery_agent():
                 "- DON'T include analyses whose required columns are not present in the dataset.\n"
                 "- DON'T force `session_detection` if NO behavioral analyses are being selected.\n"
                 "- DON'T use domain-specific language in node `description` fields unless the data confirms that domain.\n"
-                "- DON'T create more than 10 nodes — prioritize depth over breadth.\n"
-                "- DON'T output any text after calling `tool_submit_analysis_plan` — the tool call IS your final action.\n"
-                "- DON'T use analysis_type values that are not in the AVAILABLE ANALYSES list above. "
-                "Only use the exact type names listed. Using unlisted types (e.g. 'path_analysis', 'retention_analysis', 'time_to_event_analysis') "
-                "means the Coder Agent cannot find a registered function and the analysis will silently fail.\n\n"
+                "- DON'T create more than 10 nodes â€” prioritize depth over breadth.\n"
+                "- DON'T output any text after calling `tool_submit_analysis_plan` â€” the tool call IS your final action.\n"
+                "- DON'T use analysis_type values that are not in the AVAILABLE ANALYSES list above.\n\n"
 
                 "## OUTPUT FORMAT (passed to tool_submit_analysis_plan as a JSON string)\n"
                 "{\n"
@@ -375,3 +437,4 @@ def get_discovery_agent():
             tools=[tool_submit_analysis_plan],
         )
     return _discovery_agent_instance
+

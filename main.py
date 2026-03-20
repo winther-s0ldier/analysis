@@ -11,7 +11,7 @@ if _raw_key:
     _raw_key = _raw_key.strip('"\'')
     os.environ["GEMINI_API_KEY"] = _raw_key
     os.environ["GOOGLE_API_KEY"] = _raw_key
-    print(f"INFO: Gemini API Key loaded: {_raw_key[:4]}...")
+    print("INFO: Gemini API Key loaded.")
 else:
     print("WARNING: Gemini API Key NOT found in environment!")
 
@@ -19,6 +19,7 @@ import uuid
 import json
 import re
 import asyncio
+import traceback
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
@@ -52,8 +53,109 @@ from tools.ingestion_normalizer import (
 )
 
 
+# ── Kaleido startup check ─────────────────────────────────────────────────
+# kaleido is required for Plotly to export static PNG charts. If it is missing
+# charts will silently fail to render in the report. Warn loudly at startup.
+try:
+    import kaleido as _kaleido  # noqa: F401
+    print("INFO: kaleido OK — static chart export available.")
+except ImportError:
+    print(
+        "WARNING: kaleido not installed. Plotly PNG chart export will fail. "
+        "Install with: pip install kaleido"
+    )
+
 app = FastAPI(title="Agentic Analytics", description="Multi-Agent CSV Analytics System")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# --- A2A endpoints: root pipeline + each individual agent ---
+# Host/port read from env so Agent Card URLs are correct in production.
+# On AWS set A2A_HOST=your-domain.com A2A_PORT=443 A2A_PROTOCOL=https
+_A2A_HOST     = os.getenv("A2A_HOST",     "localhost")
+_A2A_PORT     = int(os.getenv("A2A_PORT", "8000"))
+_A2A_PROTOCOL = os.getenv("A2A_PROTOCOL", "http")
+
+# Agents to expose individually via A2A
+_A2A_AGENTS = [
+    ("profiler",    "agents.profiler",    "get_profiler_agent"),
+    ("discovery",   "agents.discovery",   "get_discovery_agent"),
+    ("coder",       "agents.coder",       "get_coder_agent"),
+    ("synthesis",   "agents.synthesis",   "get_synthesis_agent"),
+    ("critic",      "agents.critic",      "get_critic_agent"),
+    ("dag_builder", "agents.dag_builder", "get_dag_builder_agent"),
+]
+
+_mounted_a2a_agents: dict = {}   # name -> mount path, for the /agents registry
+
+try:
+    import importlib
+    from google.adk.a2a.utils.agent_to_a2a import to_a2a as _to_a2a
+
+    # Root pipeline agent
+    _root_a2a = _to_a2a(
+        get_root_agent(),
+        host=_A2A_HOST, port=_A2A_PORT, protocol=_A2A_PROTOCOL,
+    )
+    app.mount("/a2a", _root_a2a)
+    _mounted_a2a_agents["pipeline"] = "/a2a"
+    print("INFO: A2A root   -> /a2a  |  Card -> /a2a/.well-known/agent-card.json")
+
+    # Individual agents
+    for _a2a_name, _a2a_module, _a2a_getter in _A2A_AGENTS:
+        try:
+            _mod    = importlib.import_module(_a2a_module)
+            _agent  = getattr(_mod, _a2a_getter)()
+            _path   = f"/agents/{_a2a_name}"
+            _sub    = _to_a2a(
+                _agent,
+                host=_A2A_HOST, port=_A2A_PORT, protocol=_A2A_PROTOCOL,
+            )
+            app.mount(_path, _sub)
+            _mounted_a2a_agents[_a2a_name] = _path
+            print(f"INFO: A2A agent  -> {_path}  |  Card -> {_path}/.well-known/agent-card.json")
+        except Exception as _agent_err:
+            print(f"WARNING: A2A mount failed for {_a2a_name}: {_agent_err}")
+
+except Exception as _a2a_err:
+    print(f"WARNING: A2A endpoints unavailable: {_a2a_err}")
+
+
+@app.get("/agents", tags=["A2A"])
+async def list_a2a_agents():
+    """
+    A2A service registry — lists every agent exposed via Google A2A protocol.
+    Each entry includes the agent name, mount path, and Agent Card URL.
+    External A2A-compliant systems can use these cards to discover and call
+    individual agents without going through the full pipeline.
+    """
+    base = f"{_A2A_PROTOCOL}://{_A2A_HOST}:{_A2A_PORT}"
+    return {
+        "protocol": "Google A2A",
+        "agents": [
+            {
+                "name":      name,
+                "path":      path,
+                "card_url":  f"{base}{path}/.well-known/agent-card.json",
+                "rpc_url":   f"{base}{path}/",
+            }
+            for name, path in _mounted_a2a_agents.items()
+        ],
+    }
+
+
+@app.on_event("startup")
+async def _startup_checks() -> None:
+    """Validate runtime environment on startup."""
+    # Multi-worker guard: sessions{} is in-process memory — sharing it across
+    # multiple workers causes session loss and race conditions. Fail fast.
+    worker_count = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    if worker_count > 1:
+        print(
+            f"ERROR: This server uses in-process session state and cannot run "
+            f"with multiple workers (WEB_CONCURRENCY={worker_count}). "
+            f"Set WEB_CONCURRENCY=1 or remove it."
+        )
+        sys.exit(1)
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -85,19 +187,27 @@ class SessionState:
         self.artifacts: list = []
 
         self.message_log: list = []
+        # A2A Phase 2: per-recipient indexed mailbox — O(1) lookup instead of O(n) scan
+        self._mailbox: dict = {}
         self.normalization: dict = {}
         self.gate_result: dict = {}
 
         self.user_instructions: str = ""
-    
+        self.conversation_history: list = []  # [(user_msg, agent_reply), ...]
+        self.clarification_request: dict = {}  # set by discovery when CLARIFICATION_NEEDED
+
     def post_message(self, message) -> None:
-        self.message_log.append(message.to_dict())
-    
-    def get_messages_for(self, recipient: str, 
+        d = message.to_dict()
+        self.message_log.append(d)
+        # A2A Phase 2: index by recipient for O(1) mailbox lookup
+        recipient = d.get("recipient", "")
+        if recipient:
+            self._mailbox.setdefault(recipient, []).append(d)
+
+    def get_messages_for(self, recipient: str,
                           unread_only: bool = False) -> list:
-        msgs = [m for m in self.message_log 
-                if m.get("recipient") == recipient]
-        return msgs
+        # A2A Phase 2: use indexed mailbox instead of full scan
+        return list(self._mailbox.get(recipient, []))
     
     def store_result(self, analysis_id: str, result: dict) -> None:
         self.results[analysis_id] = result
@@ -135,6 +245,22 @@ sessions: Dict[str, SessionState] = {}
 # --- #12: SSE event store — thread-safe list per session ---
 # Background pipeline thread appends events; SSE endpoint reads them.
 _sse_events: Dict[str, list] = {}
+
+# Maximum pipeline wall-clock time before watchdog force-completes the session as error.
+PIPELINE_TIMEOUT_SECONDS = 900  # 15 minutes
+
+
+async def _pipeline_watchdog(session_id: str) -> None:
+    """Force-fail a session that stays 'analyzing' beyond PIPELINE_TIMEOUT_SECONDS."""
+    await asyncio.sleep(PIPELINE_TIMEOUT_SECONDS)
+    state = sessions.get(session_id)
+    if state and state.status == "analyzing":
+        state.status = "error"
+        _sse_events.setdefault(session_id, []).append({
+            "type": "stream_end",
+            "data": {"status": "error", "reason": "Pipeline timed out"}
+        })
+        print(f"WARNING: [Watchdog] Session {session_id} timed out after {PIPELINE_TIMEOUT_SECONDS}s")
 
 
 def push_sse_event(session_id: str, event_type: str, data: dict) -> None:
@@ -223,10 +349,15 @@ async def run_agent_pipeline(
 
     max_retries = 6
 
+    _adk_trace = os.environ.get("ADK_TRACE", "1") == "1"
+
     for attempt in range(max_retries):
         try:
             final_response = ""
             turn_count = 0
+
+            if _adk_trace:
+                push_sse_event(pipeline_id, "turn_started", {"agent": agent_getter})
 
             async for event in runner.run_async(
                 user_id=USER_ID,
@@ -234,9 +365,25 @@ async def run_agent_pipeline(
                 new_message=content,
             ):
                 turn_count += 1
+
+                # ADK tracing: forward tool calls to SSE for real-time observability
+                if _adk_trace and event.content and event.content.parts:
+                    for _part in event.content.parts:
+                        _fc = getattr(_part, "function_call", None)
+                        if _fc and getattr(_fc, "name", None):
+                            push_sse_event(pipeline_id, "tool_called", {
+                                "agent": agent_getter,
+                                "tool": _fc.name,
+                            })
+
                 if event.is_final_response():
                     if event.content and event.content.parts:
                         final_response = event.content.parts[0].text
+                    if _adk_trace:
+                        push_sse_event(pipeline_id, "turn_ended", {
+                            "agent": agent_getter,
+                            "turns_used": turn_count,
+                        })
 
                 if turn_count >= max_turns:
                     print(
@@ -265,7 +412,8 @@ async def run_agent_pipeline(
                     continue
                 else:
                     print(f"Rate limit exhausted after {max_retries} attempts")
-                    return f"Error: API rate limit exceeded after {max_retries} retries."
+                    import json as _json_fallback
+                    return _json_fallback.dumps({"status": "error", "error": f"API rate limit exceeded after {max_retries} retries."})
             raise
 
     return final_response
@@ -320,7 +468,7 @@ async def upload_csv(file: UploadFile = File(...)):
             ),
         )
 
-    session_id = str(uuid.uuid4())[:12]
+    session_id = str(uuid.uuid4())
     
     file_basename = file.filename.rsplit(".", 1)[0]
     safe_folder = file_basename.replace(" ", "_").replace("-", "_").strip()[:80]
@@ -371,7 +519,7 @@ async def upload_csv(file: UploadFile = File(...)):
     state = SessionState(session_id)
     state.csv_path = csv_path
     state.csv_filename = norm_result["original_filename"]
-    state.output_folder = output_folder
+    state.output_folder = str(OUTPUT_DIR / output_folder)
     state.normalization = {
         "original_filename": norm_result["original_filename"],
         "original_format":   norm_result["original_format"],
@@ -536,7 +684,7 @@ async def discover_metrics(session_id: str):
     prompt = (
         f"Session ID: {session_id}\n"
         f"CSV file path: {state.csv_path}\n"
-        f"Output folder: output/{state.output_folder}\n\n"
+        f"Output folder: {state.output_folder}\n\n"
         f"PROFILER OUTPUT:\n{profile_summary}\n\n"
         f"{user_inst_block}"
         f"INSTRUCTIONS:\n"
@@ -638,7 +786,6 @@ async def run_pipeline_background(
         )
         print(f"INFO: Result: {result.get('status')}")
     except Exception as e:
-        import traceback
         print(f"ERROR: {str(e)}")
         traceback.print_exc()
         state.status = "error"
@@ -648,7 +795,6 @@ def run_pipeline_sync(
     session_id, csv_path, output_folder,
     approved, state
 ):
-    import asyncio
     asyncio.run(run_pipeline_background(
         session_id, csv_path, output_folder,
         approved, state
@@ -667,9 +813,16 @@ async def analyze(
             status_code=404,
             detail="Session not found"
         )
-    
+
+    # Guard against double-submit (e.g. user clicks Analyze twice rapidly)
+    if state.status in ("analyzing", "synthesizing", "building_report"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Analysis already in progress (status: {state.status}). Wait for it to complete."
+        )
+
     metrics = req_body.approved_metrics or req_body.custom_metrics
-    output_folder_path = str(OUTPUT_DIR / state.output_folder)
+    output_folder_path = state.output_folder
 
     if req_body.user_instructions:
         state.user_instructions = req_body.user_instructions
@@ -688,8 +841,79 @@ async def analyze(
         approved=metrics,
         state=state,
     )
-    
+    asyncio.create_task(_pipeline_watchdog(session_id))
+
     return {"status": "started", "session_id": session_id}
+
+
+@app.post("/clarify/{session_id}")
+async def submit_clarification(session_id: str, request: Request):
+    """
+    Receive user-confirmed column roles after a CLARIFICATION_NEEDED pause.
+    Updates state.semantic_map with the confirmed roles, posts CLARIFICATION_PROVIDED,
+    and re-triggers the /discover stage so the pipeline can proceed.
+    """
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if state.status != "clarification_needed":
+        raise HTTPException(status_code=409, detail=f"Session is not awaiting clarification (status: {state.status})")
+
+    body = await request.json()
+    confirmed_roles = body.get("column_roles", {})
+    if not confirmed_roles:
+        raise HTTPException(status_code=400, detail="column_roles required in request body")
+
+    # Merge confirmed roles into the existing semantic map
+    if not isinstance(state.semantic_map, dict):
+        state.semantic_map = {}
+    if "column_roles" not in state.semantic_map:
+        state.semantic_map["column_roles"] = {}
+    state.semantic_map["column_roles"].update(confirmed_roles)
+
+    # Post CLARIFICATION_PROVIDED so orchestrator / discovery can resume
+    from a2a_messages import create_message, Intent
+    state.post_message(create_message(
+        intent=Intent.CLARIFICATION_PROVIDED,
+        sender="frontend",
+        recipient="discovery_agent",
+        payload={"confirmed_column_roles": confirmed_roles},
+    ))
+
+    state.status = "uploaded"  # reset so /discover can run again
+    push_sse_event(session_id, "status_update", {"status": "clarification_provided", "message": "Column roles confirmed — re-running discovery."})
+
+    # Re-trigger discovery with the updated column roles
+    asyncio.create_task(_re_discover(session_id))
+    return {"status": "clarification_provided", "session_id": session_id}
+
+
+async def _re_discover(session_id: str) -> None:
+    """Re-run discovery after a clarification response."""
+    state = sessions.get(session_id)
+    if not state:
+        return
+    try:
+        from agents.orchestrator import run_full_pipeline
+        state.status = "discovering"
+        push_sse_event(session_id, "status_update", {"status": "discovering", "message": "Re-running discovery with confirmed column roles."})
+        await run_agent_pipeline(
+            f"{session_id}_rediscover",
+            (
+                f"Session ID: {session_id}\n"
+                f"csv_path: {state.csv_path}\n"
+                f"Profiler output already stored. Column roles confirmed by user: "
+                f"{state.semantic_map.get('column_roles', {})}\n"
+                f"Call tool_submit_analysis_plan now with a revised DAG."
+            ),
+            agent_getter="discovery",
+        )
+        push_sse_event(session_id, "status_update", {"status": "ready_to_analyze", "message": "Discovery complete — ready to analyze."})
+        state.status = "discovered"
+    except Exception as _e:
+        print(f"ERROR: _re_discover failed for {session_id}: {_e}")
+        state.status = "error"
+
 
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
@@ -733,6 +957,7 @@ async def sse_stream(session_id: str, request: Request):
     """
     async def event_generator():
         last_index = 0
+        _keepalive_counter = 0
         while True:
             if await request.is_disconnected():
                 break
@@ -740,14 +965,20 @@ async def sse_stream(session_id: str, request: Request):
             # Yield any new events since last check
             new_events = events[last_index:]
             for ev in new_events:
-                yield f"data: {json.dumps(ev)}\n\n"
+                yield f"data: {json.dumps(ev)}\n\n".encode("utf-8")
             last_index += len(new_events)
             # Check terminal condition: pipeline done AND all events sent
             state = sessions.get(session_id)
             if state and state.status in ("complete", "error") and last_index >= len(events):
-                yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': state.status}})}\n\n"
+                yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': state.status}})}\n\n".encode("utf-8")
+                _sse_events.pop(session_id, None)  # free memory once stream closes
                 break
-            await asyncio.sleep(0.8)
+            # Bug-11: reduced poll interval for faster event delivery;
+            # keepalive comment every ~5s prevents proxy/browser timeouts
+            _keepalive_counter += 1
+            if _keepalive_counter % 12 == 0:
+                yield b": keepalive\n\n"
+            await asyncio.sleep(0.4)
 
     from fastapi.responses import StreamingResponse
     return StreamingResponse(
@@ -762,7 +993,7 @@ async def sse_stream(session_id: str, request: Request):
 
 
 @app.post("/rerun-synthesis/{session_id}")
-async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
+async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, body: dict = None):
     """
     #5: Re-run synthesis (and critic + report) without re-running all analysis nodes.
     Useful when synthesis quality was poor or the user wants a fresh interpretation.
@@ -798,9 +1029,10 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
     state.status = "rerunning_synthesis"
     _sse_events[session_id] = []  # Fresh event stream
 
-    # Register event hook
-    from agents.orchestrator import _pipeline_event_hooks
-    _pipeline_event_hooks[session_id] = lambda evt, data: push_sse_event(session_id, evt, data)
+    # Reuse the existing event hook — already registered by run_pipeline_background.
+    # Do NOT overwrite it here: overwriting mid-stream would lose pending events.
+
+    user_instructions = (body or {}).get("instructions", "").strip()
 
     async def _do_rerun():
         try:
@@ -809,6 +1041,8 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
             effective_state = pipe_state or state
             dag = getattr(state, "dag", []) or []
             prompt, images = build_synthesis_prompt(session_id, effective_state, dag)
+            if user_instructions:
+                prompt = prompt + f"\n\nUSER INSTRUCTIONS FOR THIS SYNTHESIS:\n{user_instructions}\n"
 
             await run_agent_pipeline(
                 f"{session_id}_synthesis_rerun",
@@ -840,7 +1074,7 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
             # Re-run dag_builder
             await run_agent_pipeline(
                 f"{session_id}_report_rerun",
-                f"Session ID: {session_id}\nOutput folder: {str(OUTPUT_DIR / state.output_folder)}\n"
+                f"Session ID: {session_id}\nOutput folder: {state.output_folder}\n"
                 f"Call tool_build_report(session_id, output_folder) now.",
                 agent_getter="dag_builder",
             )
@@ -848,14 +1082,12 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks):
             state.status = "complete"
             print(f"INFO: Synthesis rerun complete for {session_id}")
         except Exception as _e:
-            import traceback
             print(f"ERROR: Synthesis rerun failed for {session_id}: {_e}")
             traceback.print_exc()
             state.status = "error"
 
     def _sync_rerun():
-        import asyncio as _aio
-        _aio.run(_do_rerun())
+        asyncio.run(_do_rerun())
 
     background_tasks.add_task(_sync_rerun)
     return {
@@ -1001,7 +1233,16 @@ async def chat(session_id: str, request: Request):
 
         context_parts.append("SYNTHESIS\n" + "\n\n".join(synth_parts))
 
-    # 4. Assemble prompt and call dedicated chat agent
+    # 4. Inject prior conversation turns (last 5 exchanges)
+    if state.conversation_history:
+        history_lines = []
+        for _q, _a in state.conversation_history[-5:]:
+            history_lines.append(f"User: {_q}\nAssistant: {_a}")
+        context_parts.append(
+            "PRIOR CONVERSATION (most recent first)\n" + "\n\n".join(history_lines)
+        )
+
+    # 5. Assemble prompt and call dedicated chat agent
     separator = "\n" + "=" * 60 + "\n"
     full_context = separator.join(context_parts)
     prompt = f"{full_context}\n\n{'=' * 60}\nUSER QUESTION: {message}"
@@ -1012,6 +1253,10 @@ async def chat(session_id: str, request: Request):
         agent_getter="chat",
         max_turns=4,
     )
+
+    # Persist this exchange so future turns can reference it
+    if response:
+        state.conversation_history.append((message, response))
 
     return {"session_id": session_id, "response": response}
 
@@ -1110,7 +1355,7 @@ async def add_metric(session_id: str, request: Request):
     merged_roles = {**base_roles, **{k: v for k, v in ai_roles.items() if v}}
 
     analysis_id   = f"C{len(state.results) + 1}"
-    output_folder = f"output/{state.output_folder}"
+    output_folder = state.output_folder
 
     try:
         from agents.orchestrator import execute_single_analysis
@@ -1187,7 +1432,7 @@ async def retry_node(session_id: str, node_id: str):
     analysis_type = node.get("analysis_type", "custom")
     description   = node.get("description", analysis_type)
     column_roles  = state.semantic_map.get("column_roles", {})
-    output_folder = f"output/{state.output_folder}"
+    output_folder = state.output_folder
 
     # Remove from failed_nodes so it's treated as fresh
     state.failed_nodes.discard(node_id)
@@ -1235,7 +1480,7 @@ async def refresh_report(session_id: str):
         from agents.dag_builder import tool_build_report
         result = tool_build_report(
             session_id=session_id,
-            output_folder=f"output/{state.output_folder}",
+            output_folder=state.output_folder,
         )
         return {"status": "success", "chart_count": result.get("chart_count", 0)}
     except Exception as e:
@@ -1284,14 +1529,14 @@ async def get_report(session_id: str):
     )
     
     if not report_artifact:
-        report_path = OUTPUT_DIR / state.output_folder / "report.html"
+        report_path = Path(state.output_folder) / "report.html"
         if not report_path.exists():
             raise HTTPException(status_code=404, detail="Report not yet generated")
     else:
         if "path" in report_artifact:
             report_path = Path(report_artifact["path"])
         else:
-            report_path = OUTPUT_DIR / state.output_folder / "report.html"
+            report_path = Path(state.output_folder) / "report.html"
 
     return FileResponse(report_path, media_type="text/html")
 
@@ -1344,15 +1589,20 @@ async def api_get_pipeline_status(session_id: str):
         for node in state.dag:
             nid = node["id"]
             if nid in state.results:
-                status = "complete"
-                error = ""
+                res = state.results[nid]
+                if isinstance(res, dict) and res.get("status") == "error":
+                    status = "failed"
+                    error = res.get("error") or res.get("top_finding") or "Execution failed"
+                else:
+                    status = "complete"
+                    error = ""
             elif hasattr(state, "failed_nodes") and nid in state.failed_nodes:
                 status = "failed"
                 error = "Execution failed"
             else:
                 status = "pending"
                 error = ""
-                
+
             node_status_list.append({
                 "id": nid,
                 "type": node.get("analysis_type", "unknown"),
@@ -1360,8 +1610,6 @@ async def api_get_pipeline_status(session_id: str):
                 "error": error
             })
             
-    import json as _json
-
     raw_response = {
         "session_id": session_id,
         "pipeline_status": state.status,
@@ -1373,7 +1621,7 @@ async def api_get_pipeline_status(session_id: str):
     # Sanitize the entire response in one pass — catches numpy.float64, datetime,
     # coroutine objects, or any other non-JSON-serializable type via default=str.
     try:
-        return _json.loads(_json.dumps(raw_response, default=str))
+        return json.loads(json.dumps(raw_response, default=str))
     except Exception as _e:
         # Absolute fallback — return minimal safe response
         return {

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 sys.path.insert(
@@ -14,14 +15,61 @@ from tools.code_executor import (
 from tools.model_config import get_model
 
 
+def _build_library_ref() -> str:
+    """Generate the AVAILABLE LIBRARY FUNCTIONS block from LIBRARY_REGISTRY at import time."""
+    lines = []
+    for atype, meta in LIBRARY_REGISTRY.items():
+        fn = meta.get("function", "")
+        args = [a for a in meta.get("required_args", []) if a != "csv_path"]
+        args_str = ", ".join(args) if args else "(no extra args)"
+        lines.append(f"{atype} → {fn} → {args_str}")
+    return "\n".join(lines)
+
+_LIBRARY_REF = _build_library_ref()
+
+
+def _coder_after_model_callback(callback_context, llm_response):
+    """Validate that the coder's response contains a Python code block.
+
+    If the model response is missing a ```python ... ``` block, return a
+    corrective LlmResponse that instructs the model to reformat.  Returning
+    None keeps the original response unchanged.
+    """
+    text = ""
+    if llm_response.content and llm_response.content.parts:
+        for part in llm_response.content.parts:
+            text += getattr(part, "text", "") or ""
+
+    if text and not re.search(r"```python", text, re.IGNORECASE):
+        from google.adk.models.llm_response import LlmResponse
+        from google.genai import types
+        corrective = (
+            "Your previous response did not contain a ```python ... ``` code block. "
+            "You MUST respond with ONLY a single Python code block in the format:\n"
+            "```python\n"
+            "import pandas as pd\n\n"
+            "def analyze(csv_path: str) -> dict:\n"
+            "    ...\n"
+            "```\n"
+            "No explanations, no prose — only the code block."
+        )
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[types.Part(text=corrective)],
+            )
+        )
+    return None
+
+
 _coder_agent_instance = None
 
 
 def get_coder_agent():
     global _coder_agent_instance
     if _coder_agent_instance is None:
-        from google.adk.agents import Agent
-        _coder_agent_instance = Agent(
+        from google.adk.agents.llm_agent import LlmAgent
+        _coder_agent_instance = LlmAgent(
             name="coder_agent",
             model=get_model("coder"),
             description=(
@@ -52,28 +100,6 @@ def get_coder_agent():
                 "    # Your code here\n"
                 "```\n\n"
 
-                "## AVAILABLE LIBRARY FUNCTIONS (use these first)\n"
-                "analysis_type -> function -> required args (besides csv_path)\n"
-                "session_detection -> run_session_detection -> entity_col, time_col\n"
-                "funnel_analysis -> run_funnel_analysis -> entity_col, event_col, time_col\n"
-                "friction_detection -> run_friction_detection -> entity_col, event_col\n"
-                "survival_analysis -> run_survival_analysis -> entity_col, event_col\n"
-                "user_segmentation -> run_user_segmentation -> entity_col, event_col, time_col\n"
-                "transition_analysis -> run_transition_analysis -> entity_col, event_col, time_col\n"
-                "dropout_analysis -> run_dropout_analysis -> entity_col, event_col, time_col\n"
-                "sequential_pattern_mining -> run_sequential_pattern_mining -> entity_col, event_col\n"
-                "association_rules -> run_association_rules -> entity_col, event_col\n"
-                "distribution_analysis -> run_distribution_analysis -> col\n"
-                "categorical_analysis -> run_categorical_analysis -> col\n"
-                "correlation_matrix -> run_correlation_matrix -> (no extra args)\n"
-                "anomaly_detection -> run_anomaly_detection -> col\n"
-                "missing_data_analysis -> run_missing_data_analysis -> (no extra args)\n"
-                "trend_analysis -> run_trend_analysis -> time_col, value_col\n"
-                "cohort_analysis -> run_cohort_analysis -> entity_col, time_col, value_col\n"
-                "rfm_analysis -> run_rfm_analysis -> entity_col, time_col, value_col\n"
-                "pareto_analysis -> run_pareto_analysis -> category_col, value_col\n"
-                "event_taxonomy -> run_event_taxonomy -> event_col\n\n"
-
                 "## OUTPUT FORMAT (when writing raw code)\n"
                 "Return ONLY a Python code block:\n"
                 "```python\n"
@@ -89,31 +115,8 @@ def get_coder_agent():
                 "    }\n"
                 "```\n\n"
 
-                "## FULL LIBRARY FUNCTION REFERENCE (analysis_type → function → required args)\n"
-                "session_detection → run_session_detection → entity_col, time_col\n"
-                "funnel_analysis → run_funnel_analysis → entity_col, event_col, time_col\n"
-                "friction_detection → run_friction_detection → entity_col, event_col\n"
-                "survival_analysis → run_survival_analysis → entity_col, event_col\n"
-                "user_segmentation → run_user_segmentation → entity_col, event_col, time_col\n"
-                "transition_analysis → run_transition_analysis → entity_col, event_col, time_col\n"
-                "dropout_analysis → run_dropout_analysis → entity_col, event_col, time_col\n"
-                "sequential_pattern_mining → run_sequential_pattern_mining → entity_col, event_col\n"
-                "association_rules → run_association_rules → entity_col, event_col\n"
-                "distribution_analysis → run_distribution_analysis → col\n"
-                "categorical_analysis → run_categorical_analysis → col\n"
-                "correlation_matrix → run_correlation_matrix → (no extra args)\n"
-                "anomaly_detection → run_anomaly_detection → col\n"
-                "missing_data_analysis → run_missing_data_analysis → (no extra args)\n"
-                "trend_analysis → run_trend_analysis → time_col, value_col\n"
-                "cohort_analysis → run_cohort_analysis → entity_col, time_col, value_col\n"
-                "rfm_analysis → run_rfm_analysis → entity_col, time_col, value_col\n"
-                "pareto_analysis → run_pareto_analysis → category_col, value_col\n"
-                "event_taxonomy → run_event_taxonomy → event_col\n"
-                "user_journey_analysis → run_user_journey_analysis → entity_col, event_col\n"
-                "intervention_triggers → run_intervention_triggers → entity_col, event_col, time_col\n"
-                "session_classification → run_session_classification → entity_col, event_col, time_col\n"
-                "contribution_analysis → run_contribution_analysis → group_col, value_col\n"
-                "cross_tab_analysis → run_cross_tab_analysis → col_a, col_b\n\n"
+                f"## AVAILABLE LIBRARY FUNCTIONS (analysis_type → function → required args)\n"
+                f"{_LIBRARY_REF}\n\n"
 
                 "## CUSTOM ANALYSIS (for analysis types not in the library above)\n"
                 "If `library_function` is NOT provided AND `analysis_type` is not in the library reference above, "
@@ -155,5 +158,6 @@ def get_coder_agent():
                 "- `ValueError: NaT/NaN in datetime` → Add `pd.to_datetime(df[col], errors='coerce').dropna()` before processing.\n"
             ),
             tools=[],
+            after_model_callback=_coder_after_model_callback,
         )
     return _coder_agent_instance

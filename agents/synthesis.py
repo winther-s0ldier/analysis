@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import threading
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..")
@@ -10,6 +11,7 @@ from a2a_messages import create_message, Intent
 
 
 _synthesis_store: dict = {}
+_synthesis_lock = threading.Lock()
 
 # Stores the LLM's reasoning notes from the most recent synthesis attempt.
 # On rejection, these are injected back into the retry so the LLM builds
@@ -420,7 +422,8 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
             warnings_found.append(f"INSIGHT[{i}]: how_to_fix steps are empty.")
 
     # Check entity segments / personas if a segment section was included
-    personas = synthesis.get("personas", {}).get("personas", [])
+    _p = synthesis.get("personas", {})
+    personas = _p.get("personas", []) if isinstance(_p, dict) else _p
     if synthesis.get("personas") is not None and not personas:
         warnings_found.append("WEAK: personas section present but no archetypes defined.")
 
@@ -439,10 +442,11 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
     }
 
 
-def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_notes: str = "") -> str:
+def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_notes: str = "", output_folder: str = "") -> str:
     """
     Submit the complete synthesis result.
     MUST be called as the last step.
+    output_folder: absolute path to the session output directory (passed in the prompt in A2A mode).
     reasoning_notes: brief summary of your key deductions (2-3 sentences).
     These are stored and injected back on retry so you build on prior thinking.
     Runs DataLog grounding validation before storing.
@@ -453,8 +457,82 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
             if lines[0].startswith("```"): lines = lines[1:]
             if lines and lines[-1].startswith("```"): lines = lines[:-1]
             synthesis_json_str = "\n".join(lines).strip()
+            
+        import re
+        match = re.search(r'```(?:json)?\s*(.*?)\s*```', synthesis_json_str, re.DOTALL)
+        if match:
+            synthesis_json_str = match.group(1)
+        else:
+            first_brace = synthesis_json_str.find('{')
+            last_brace = synthesis_json_str.rfind('}')
+            if first_brace != -1 and last_brace != -1:
+                synthesis_json_str = synthesis_json_str[first_brace:last_brace+1]
 
-        synthesis = json.loads(synthesis_json_str)
+        def _repair_json(s):
+            # 1. Smart quotes -> straight quotes
+            s = s.replace('\u201c', '"').replace('\u201d', '"')
+            s = s.replace('\u2018', "'").replace('\u2019', "'")
+            # 2. Trailing commas before } or ]
+            s = re.sub(r',\s*([}\]])', r'\1', s)
+            # 3. Extract first complete JSON object (handles "extra data" / double objects)
+            first_open = s.find('{')
+            if first_open != -1:
+                depth = 0
+                for i in range(first_open, len(s)):
+                    if s[i] == '{': depth += 1
+                    elif s[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            s = s[:i+1]
+                            break
+            # 4. Balance unclosed brackets
+            open_b = s.count('{'); close_b = s.count('}')
+            if open_b > close_b: s += '}' * (open_b - close_b)
+            open_sq = s.count('['); close_sq = s.count(']')
+            if open_sq > close_sq: s += ']' * (open_sq - close_sq)
+            # 5. Fix invalid \escape sequences (e.g. \_word from column names)
+            valid_esc = set('"\\bfnrtu/')
+            out = []
+            i = 0
+            while i < len(s):
+                if s[i] == '\\' and i + 1 < len(s) and s[i+1] not in valid_esc:
+                    out.append('\\\\')
+                else:
+                    out.append(s[i])
+                i += 1
+            s = ''.join(out)
+            # 6. Escape unescaped control characters inside JSON strings
+            result = []
+            in_str = False
+            i = 0
+            while i < len(s):
+                c = s[i]
+                if c == '"' and (i == 0 or s[i-1] != '\\'):
+                    in_str = not in_str
+                    result.append(c)
+                elif in_str and c == '\n':
+                    result.append('\\n')
+                elif in_str and c == '\r':
+                    result.append('\\r')
+                elif in_str and c == '\t':
+                    result.append('\\t')
+                else:
+                    result.append(c)
+                i += 1
+            return ''.join(result)
+
+        try:
+            synthesis = json.loads(synthesis_json_str)
+        except json.JSONDecodeError as _jde:
+            _repaired = _repair_json(synthesis_json_str)
+            try:
+                synthesis = json.loads(_repaired)
+                print(f"[Synthesis] JSON repaired (original error: {_jde.msg} at char {_jde.pos})")
+            except json.JSONDecodeError as _jde2:
+                raise json.JSONDecodeError(
+                    f"JSON parse failed after repair. Original: {_jde.msg}. After repair: {_jde2.msg}",
+                    _jde2.doc, _jde2.pos
+                ) from _jde2
 
         # --- MINIMUM QUALITY GUARD ---
         # Reject synthesis that is too shallow and force a retry.
@@ -591,40 +669,68 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
         synthesis["_qc_passed"] = True
 
         # Store synthesis FIRST — before any print statements that could crash on Windows cp1252
-        _synthesis_store[session_id] = synthesis
+        with _synthesis_lock:
+            _synthesis_store[session_id] = synthesis
 
-        from main import sessions
-        state = sessions.get(session_id)
+        try:
+            from main import sessions
+            state = sessions.get(session_id)
+        except Exception:
+            state = None
         if state:
             state.synthesis = synthesis
-            # File-based backup: write to absolute output path so dag_builder can recover.
-            # state.output_folder is just the folder name (e.g. "Commuter_Users_Event_data"),
-            # so resolve it against the ADK root rather than the process CWD.
-            try:
+
+        # Write file cache — works in BOTH single-server and A2A multi-server mode.
+        # In A2A mode state is None, so we fall back to the _a2a_sessions.json registry
+        # that orchestrator writes before calling any A2A agent.
+        try:
+            import os as _os
+            _abs_out = None
+            # Source A: output_folder parameter (A2A mode — LLM extracts from prompt)
+            if output_folder and output_folder.strip():
+                _abs_out = output_folder.strip()
+            # Source B: state.output_folder (single-server mode)
+            if not _abs_out and state:
                 _out = getattr(state, "output_folder", None)
                 if _out:
-                    import os as _os
                     _adk_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-                    _abs_out = _os.path.join(_adk_root, "output", _out)
-                    _tmp = _os.path.join(_abs_out, "_synthesis_cache.json")
-                    _os.makedirs(_abs_out, exist_ok=True)
-                    with open(_tmp, "w", encoding="utf-8") as _f:
-                        json.dump(synthesis, _f)
-                    print(f"INFO: synthesis cache written to {_tmp}")
-            except Exception as _ce:
-                print(f"WARNING: synthesis cache write failed: {_ce}")
-            msg = create_message(
-                sender="synthesis_agent",
-                recipient="orchestrator",
-                intent=Intent.SYNTHESIS_COMPLETE,
-                payload={
-                    "critical_count": synthesis.get("intervention_strategies", {}).get("critical_count", 0),
-                    "persona_count": synthesis.get("personas", {}).get("persona_count", 0),
-                    "connection_count": synthesis.get("cross_metric_connections", {}).get("connection_count", 0),
-                },
-                session_id=session_id,
-            )
-            state.post_message(msg)
+                    _abs_out = _os.path.join(_adk_root, "output", _out) if not _os.path.isabs(_out) else _out
+            # Source C: A2A session registry fallback
+            if not _abs_out:
+                try:
+                    from agent_servers.a2a_orchestrator import lookup_session
+                    _abs_out = lookup_session(session_id) or None
+                except Exception:
+                    pass
+            if _abs_out:
+                _os.makedirs(_abs_out, exist_ok=True)
+                _tmp = _os.path.join(_abs_out, "_synthesis_cache.json")
+                with open(_tmp, "w", encoding="utf-8") as _f:
+                    json.dump(synthesis, _f)
+                print(f"INFO: synthesis cache written to {_tmp}")
+            else:
+                print(f"WARNING: synthesis cache not written — output_folder unknown for {session_id}")
+        except Exception as _ce:
+            print(f"WARNING: synthesis cache write failed: {_ce}")
+            if state:
+                try:
+                    _int = synthesis.get("intervention_strategies", {})
+                    _per = synthesis.get("personas", {})
+                    _cmc = synthesis.get("cross_metric_connections", {})
+                    msg = create_message(
+                        sender="synthesis_agent",
+                        recipient="orchestrator",
+                        intent=Intent.SYNTHESIS_COMPLETE,
+                        payload={
+                            "critical_count": _int.get("critical_count", 0) if isinstance(_int, dict) else 0,
+                            "persona_count": _per.get("persona_count", 0) if isinstance(_per, dict) else len(synthesis.get("personas", [])),
+                            "connection_count": _cmc.get("connection_count", 0) if isinstance(_cmc, dict) else len(synthesis.get("cross_metric_connections", [])),
+                        },
+                        session_id=session_id,
+                    )
+                    state.post_message(msg)
+                except Exception:
+                    pass
 
         # Safe logging after synthesis is already stored
         try:
@@ -672,7 +778,9 @@ def get_synthesis_agent():
                 "   - DEPENDENT nodes (has depends_on): a child node result is caused or constrained by its parent — reason causally, not just correlationally.\n"
                 "   - AMPLIFYING pairs: two independent nodes that converge on the same entity stage — both findings reinforce the same conclusion.\n"
                 "   - CONTRADICTING signals: one node shows critical severity but a related node shows low impact — explain the discrepancy, do not ignore it.\n"
-                "4. Build your synthesis JSON and call `tool_submit_synthesis(session_id, synthesis_json_str, reasoning_notes)` where "
+                "4. Build your synthesis JSON and call `tool_submit_synthesis(session_id=<session_id>, synthesis_json_str=<json>, "
+                "output_folder=<output_folder from prompt>, reasoning_notes=<2-3 sentence summary>)`. "
+                "The output_folder and session_id are provided at the top of your prompt — copy them exactly. "
                 "reasoning_notes is a 2-3 sentence plain-English summary of your key deductions (e.g. 'Node A1 showed 70% bounce rate which I connected to A5 dropout peak...'). "
                 "This is stored and fed back to you if the submission is rejected, so you can build on it rather than starting over.\n\n"
 

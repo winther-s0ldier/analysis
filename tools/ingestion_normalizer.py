@@ -1,18 +1,3 @@
-"""
-Ingestion Normalizer — converts any supported file format
-into a clean single-table CSV before the Profiler Agent runs.
-
-Supported formats:
-    .csv    -> clean headers, strip BOM, handle encoding
-    .xlsx   -> first non-empty sheet, skip junk rows at top
-    .xls    -> same as xlsx
-    .json   -> auto-flatten nested structure to tabular
-    .jsonl  -> one JSON object per line -> tabular
-    .parquet → direct conversion
-
-This sits BEFORE the Profiler Agent in the pipeline.
-Output is always a clean UTF-8 CSV at a deterministic path.
-"""
 import os
 import json
 import pandas as pd

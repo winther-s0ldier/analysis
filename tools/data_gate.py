@@ -1,26 +1,3 @@
-"""
-data_gate.py — Pre-Flight Data Quality Gate
-============================================
-Runs immediately after upload, before any LLM call or pipeline execution.
-
-Checks performed:
-  1. File sanity       — row count, column count, not empty
-  2. Null density      — warn if >30% of any column is null, block if >90%
-  3. Duplicate rows    — warn if >20% of rows are exact duplicates
-  4. Type consistency  — detect columns whose values are a mix of types
-  5. Schema drift      — compare column fingerprint against schema_registry.json
-                         to detect renames or structural changes since last run
-
-Returns:
-  {
-    "gate_result": "pass" | "warn" | "block",
-    "checks": { check_name: { result, detail } },
-    "warnings": [ str ],   # non-fatal issues
-    "errors":   [ str ],   # fatal issues that block the pipeline
-    "schema_drift": { "detected": bool, "added": [...], "removed": [...] }
-  }
-"""
-
 import os
 import json
 import hashlib

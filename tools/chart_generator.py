@@ -1,7 +1,3 @@
-"""
-Chart Generator Tool — creates matplotlib/plotly charts for various analysis types.
-Used by the DAG Builder Agent.
-"""
 import os
 import pandas as pd
 import matplotlib

@@ -1,8 +1,4 @@
-"""
-Analysis Library — pre-built, tested algorithms.
-Called by Coder Agent instead of generating from scratch.
-Every function returns a standardized result envelope.
-"""
+import math
 import pandas as pd
 import numpy as np
 import os
@@ -12,6 +8,37 @@ from datetime import datetime
 from a2a_messages import AnalysisResult
 import warnings
 warnings.filterwarnings('ignore')
+
+
+def _json_safe(obj):
+    """Recursively sanitize a result dict so it is always JSON-serialisable.
+    Handles numpy scalars, NaN/Inf floats, pandas NA, and other non-JSON types.
+    Called automatically by _make_result and _make_error_result.
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(x) for x in obj]
+    # Unwrap numpy / pandas scalar types (numpy.int64, numpy.float32, etc.)
+    if hasattr(obj, 'item'):
+        try:
+            obj = obj.item()
+        except Exception:
+            return str(obj)
+    if obj is None:
+        return None
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (bool, int, str)):
+        return obj
+    # Catch pandas NA, numpy arrays, Timestamps, etc.
+    s = str(obj)
+    if s in ("<NA>", "nan", "NaN", "inf", "-inf", "Inf"):
+        return None
+    # If it looks like a plain number string, return as-is; otherwise stringify
+    return s
 
 DEFAULT_SESSION_MARKERS = {
     # Generic process / sequence starters (domain-agnostic)
@@ -70,8 +97,9 @@ LIBRARY_REGISTRY = {
     "cohort_analysis": {
         "function":      "run_cohort_analysis",
         "required_args": ["csv_path", "entity_col", "time_col", "value_col"],
+        "optional_args": ["cohort_window"],
         "col_role":      "entity_time_value",
-        "description":   "Groups users by their first-seen date (cohort) and tracks their activity in subsequent periods. Measures whether users acquired in different time windows behave differently. A declining cohort curve is the earliest signal of product-market fit erosion.",
+        "description":   "Groups users by their first-seen date (cohort) and tracks their activity in subsequent periods. Measures whether users acquired in different time windows behave differently. A declining cohort curve is the earliest signal of product-market fit erosion. Optional: cohort_window='W' for weekly, 'D' for daily, 'Q' for quarterly (default 'M' monthly).",
     },
     "session_detection": {
         "function":      "run_session_detection",
@@ -196,18 +224,19 @@ LIBRARY_REGISTRY = {
 }
 
 
-def _make_result(analysis_type: str, data: dict, 
+def _make_result(analysis_type: str, data: dict,
                   top_finding: str, severity: str,
-                  confidence: float, 
+                  confidence: float,
                   chart_ready_data: dict,
                   enables: list = None) -> dict:
     """
-    Standard result envelope. Every library function 
+    Standard result envelope. Every library function
     returns this exact structure.
     Severity: critical | high | medium | low | info
     Confidence: 0.0 to 1.0
+    Always passes through _json_safe so results are guaranteed JSON-serialisable.
     """
-    return {
+    return _json_safe({
         "analysis_type": analysis_type,
         "status": "success",
         "data": data,
@@ -222,12 +251,12 @@ def _make_result(analysis_type: str, data: dict,
             "anomalies": "",
             "recommendation": ""
         }
-    }
+    })
 
 
 def _make_error_result(analysis_type: str, error: str, status: str = "error") -> dict:
     """Return a properly-shaped envelope for error / insufficient-data cases."""
-    return {
+    return _json_safe({
         "analysis_type": analysis_type,
         "status": status,
         "data": {},
@@ -243,7 +272,7 @@ def _make_error_result(analysis_type: str, error: str, status: str = "error") ->
             "recommendation": ""
         },
         "error": error,
-    }
+    })
 
 
 def run_distribution_analysis(csv_path: str, col: str) -> dict:
@@ -291,26 +320,45 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
     
     try:
         from scipy import stats as scipy_stats
-        sample = data.sample(min(500, len(data)), 
+        sample = data.sample(min(500, len(data)),
                               random_state=42)
         stat, p_value = scipy_stats.shapiro(sample)
         stats["normality_p_value"] = round(float(p_value), 6)
         stats["is_normal"] = p_value > 0.05
+
+        # 95% confidence interval for the mean
+        ci = scipy_stats.t.interval(
+            confidence=0.95,
+            df=len(data) - 1,
+            loc=float(data.mean()),
+            scale=scipy_stats.sem(data),
+        )
+        stats["mean_ci_95"] = [round(float(ci[0]), 4), round(float(ci[1]), 4)]
     except Exception:
         stats["normality_p_value"] = None
         stats["is_normal"] = None
+        stats["mean_ci_95"] = None
     
     hist, bin_edges = np.histogram(data, bins=30)
     
     severity = "high" if outlier_pct > 10 else \
                "medium" if outlier_pct > 5 else "low"
     
+    _ci = stats.get("mean_ci_95")
+    _ci_str = f" (95% CI [{_ci[0]}, {_ci[1]}])" if _ci else ""
+    _norm = stats.get("is_normal")
+    if _norm is None:
+        _normal_str = "normality unknown"
+    elif bool(_norm):
+        _normal_str = "normally distributed"
+    else:
+        _normal_str = "not normally distributed"
     top_finding = (
-        f"{col}: mean={stats['mean']}, "
+        f"{col}: mean={stats['mean']}{_ci_str}, "
         f"median={stats['median']}, "
         f"std={stats['std']}. "
         f"{outlier_pct}% outliers detected "
-        f"({'not ' if stats.get('is_normal') else ''}normally distributed)."
+        f"({_normal_str})."
     )
     
     return _make_result(
@@ -411,45 +459,88 @@ def run_correlation_matrix(csv_path: str,
         return _make_error_result("correlation_matrix", "Need at least 2 numeric columns", "insufficient_data")
     
     pearson = numeric_df.corr(method='pearson')
-    
+
+    # Compute p-values for each correlation pair
+    _n = len(numeric_df.dropna())
+    def _corr_pvalue(r, n):
+        import math
+        if n <= 2 or abs(r) >= 1.0:
+            return 1.0
+        t_stat = r * math.sqrt((n - 2) / max(1 - r ** 2, 1e-15))
+        try:
+            from scipy import stats as _sc
+            return float(_sc.t.sf(abs(t_stat), df=n - 2) * 2)
+        except Exception:
+            return 1.0
+
     notable = []
     cols_list = list(pearson.columns)
+    raw_pvals = []
+    raw_pairs = []
     for i in range(len(cols_list)):
-        for j in range(i+1, len(cols_list)):
+        for j in range(i + 1, len(cols_list)):
             val = pearson.iloc[i, j]
-            if abs(val) > 0.4:
-                notable.append({
-                    "col1": cols_list[i],
-                    "col2": cols_list[j],
-                    "pearson": round(float(val), 4),
-                    "strength": "strong" if abs(val) > 0.7 
-                                else "moderate",
-                    "direction": "positive" if val > 0 
-                                  else "negative"
-                })
-    
+            pv = _corr_pvalue(float(val), _n)
+            raw_pvals.append(pv)
+            raw_pairs.append((i, j, float(val)))
+
+    # Bonferroni correction
+    m = len(raw_pvals)
+    bonf_pvals = [min(p * m, 1.0) for p in raw_pvals]
+
+    for idx, (i, j, val) in enumerate(raw_pairs):
+        if abs(val) > 0.4:
+            notable.append({
+                "col1": cols_list[i],
+                "col2": cols_list[j],
+                "pearson": round(val, 4),
+                "p_value": round(raw_pvals[idx], 6),
+                "p_value_bonferroni": round(bonf_pvals[idx], 6),
+                "significant": bonf_pvals[idx] < 0.05,
+                "strength": "strong" if abs(val) > 0.7 else "moderate",
+                "direction": "positive" if val > 0 else "negative",
+            })
+
     notable.sort(key=lambda x: abs(x["pearson"]), reverse=True)
+
+    # VIF — multicollinearity check (only when ≥ 3 numeric cols and enough rows)
+    vif_data = []
+    try:
+        if numeric_df.shape[1] >= 3 and len(numeric_df.dropna()) > numeric_df.shape[1]:
+            from statsmodels.stats.outliers_influence import variance_inflation_factor as _vif
+            _clean = numeric_df.dropna()
+            _vals = _clean.values
+            for _k, _col in enumerate(cols_list):
+                vif_data.append({
+                    "col": _col,
+                    "vif": round(float(_vif(_vals, _k)), 3),
+                })
+    except Exception:
+        vif_data = []
     
+    sig_notable = [x for x in notable if x.get("significant", True)]
     top_finding = (
         f"Correlation analysis on {len(cols_list)} numeric columns. "
-        f"{len(notable)} notable correlations found "
-        f"(|r| > 0.4). "
-        + (f"Strongest: {notable[0]['col1']} ↔ "
-           f"{notable[0]['col2']} "
-           f"(r={notable[0]['pearson']})" 
+        f"{len(notable)} notable correlations found (|r| > 0.4); "
+        f"{len(sig_notable)} survive Bonferroni correction. "
+        + (f"Strongest: {notable[0]['col1']} \u2194 {notable[0]['col2']} "
+           f"(r={notable[0]['pearson']}, p={notable[0]['p_value']:.4f})"
            if notable else "No strong correlations detected.")
     )
-    
+    high_vif = [v for v in vif_data if v["vif"] > 5]
+
     return _make_result(
         analysis_type="correlation",
         data={
             "columns": cols_list,
             "pearson_matrix": {
-                col: {c: round(float(v), 4) 
+                col: {c: round(float(v), 4)
                       for c, v in pearson[col].items()}
                 for col in pearson.columns
             },
             "notable_correlations": notable[:10],
+            "vif": vif_data,
+            "high_vif_cols": high_vif,
         },
         top_finding=top_finding,
         severity="medium" if notable else "low",
@@ -457,7 +548,7 @@ def run_correlation_matrix(csv_path: str,
         chart_ready_data={
             "type": "correlation_heatmap",
             "columns": cols_list,
-            "matrix": [[round(float(pearson.iloc[i,j]), 4) 
+            "matrix": [[round(float(pearson.iloc[i, j]), 4)
                         for j in range(len(cols_list))]
                        for i in range(len(cols_list))],
         }
@@ -687,6 +778,24 @@ def run_trend_analysis(
                     ),
                 })
 
+    # Mann-Whitney U test on largest changepoint: is the before/after shift significant?
+    changepoint_p = None
+    if changepoints:
+        try:
+            from scipy import stats as _sc
+            _best_cp = max(changepoints, key=lambda x: abs(x["shift"]))
+            _ci = _best_cp["index"]
+            _cw = max(5, len(values) // 10)
+            _left_w  = values.iloc[max(0, _ci - _cw):_ci].values
+            _right_w = values.iloc[_ci:min(len(values), _ci + _cw)].values
+            if len(_left_w) >= 3 and len(_right_w) >= 3:
+                _, changepoint_p = _sc.mannwhitneyu(_left_w, _right_w, alternative="two-sided")
+                changepoint_p = round(float(changepoint_p), 6)
+                _best_cp["p_value"] = changepoint_p
+                _best_cp["significant"] = changepoint_p < 0.05
+        except Exception:
+            pass
+
     first_val = float(values.iloc[0])
     last_val  = float(values.iloc[-1])
     pct_change = round(
@@ -704,6 +813,10 @@ def run_trend_analysis(
             f"(p={mk_result['p_value']:.4f})."
             if mk_result and mk_result["significant"]
             else "Trend is not statistically significant."
+        )
+        + (
+            f" Largest changepoint is statistically significant (Mann-Whitney p={changepoint_p:.4f})."
+            if changepoint_p is not None and changepoint_p < 0.05 else ""
         )
     )
 
@@ -726,8 +839,9 @@ def run_trend_analysis(
             "last_value":     round(last_val, 4),
             "mean":           round(float(values.mean()), 4),
             "std":            round(float(values.std()), 4),
-            "mann_kendall":   mk_result,
-            "changepoints":   changepoints[:5],
+            "mann_kendall":        mk_result,
+            "changepoints":        changepoints[:5],
+            "changepoint_p_value": changepoint_p,
         },
         top_finding=top_finding,
         severity=severity,
@@ -871,11 +985,13 @@ def run_cohort_analysis(
     entity_col: str,
     time_col: str,
     value_col: str,
+    cohort_window: str = "M",
 ) -> dict:
     """
     Cohort analysis: groups entities by first appearance
     period and tracks retention/value over time.
     Works for any entity + datetime + value structure.
+    cohort_window: "D" (daily), "W" (weekly), "M" (monthly, default), "Q" (quarterly)
     """
     df = pd.read_csv(csv_path, low_memory=False)
 
@@ -885,7 +1001,8 @@ def run_cohort_analysis(
 
     df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
     df = df.dropna(subset=[entity_col, time_col])
-    df["_period"] = df[time_col].dt.to_period("M")
+    _cw = cohort_window if cohort_window in ("D", "W", "M", "Q") else "M"
+    df["_period"] = df[time_col].dt.to_period(_cw)
 
     first_period = (
         df.groupby(entity_col)["_period"]
@@ -1576,6 +1693,21 @@ def run_survival_analysis(
     pct_10   = round(reach_10 / total_sessions * 100, 1)
     pct_20   = round(reach_20 / total_sessions * 100, 1)
 
+    # Log-rank test: compare survival of short vs long sessions
+    # Split at median — test whether the two halves have significantly different
+    # survival distributions (a simple but informative significance check).
+    logrank_p = None
+    try:
+        from scipy import stats as _sc
+        median_len = float(np.median(session_lengths))
+        short = session_lengths[session_lengths < median_len]
+        long_ = session_lengths[session_lengths >= median_len]
+        if len(short) > 5 and len(long_) > 5:
+            _, logrank_p = _sc.mannwhitneyu(short, long_, alternative="two-sided")
+            logrank_p = round(float(logrank_p), 6)
+    except Exception:
+        logrank_p = None
+
     top_finding = (
         f"Session survival: {total_sessions:,} sessions. "
         f"Median session length: {median_length} events. "
@@ -1587,6 +1719,9 @@ def run_survival_analysis(
             f"({critical['dropout_rate']:.1f}% leave)."
             if critical else ""
         )
+        + (f" Short vs long session distributions significantly different "
+           f"(Mann-Whitney p={logrank_p:.4f})."
+           if logrank_p is not None and logrank_p < 0.05 else "")
     )
 
     severity = (
@@ -1624,13 +1759,14 @@ def run_survival_analysis(
     return _make_result(
         analysis_type="survival_analysis",
         data={
-            "total_sessions":   total_sessions,
-            "median_length":    median_length,
+            "total_sessions":    total_sessions,
+            "median_length":     median_length,
             "pct_reach_step_10": pct_10,
             "pct_reach_step_20": pct_20,
-            "critical_dropoff": critical,
-            "survival_curve":   survival_curve,
+            "critical_dropoff":  critical,
+            "survival_curve":    survival_curve,
             "max_steps_analyzed": max_steps,
+            "logrank_p_value":   logrank_p,
             "narrative": narrative,
         },
         top_finding=top_finding,
@@ -1952,6 +2088,49 @@ def run_sequential_pattern_mining(
         if p["sequence"][0] == p["sequence"][1]
     ]
 
+    # Outcome correlation: correlate pattern occurrence with session depth
+    # (longer sessions as a proxy for successful/engaged sessions)
+    outcome_correlations = []
+    try:
+        from scipy import stats as _sc
+        session_depths = df.groupby(session_col).size()
+        for pat in all_patterns[:10]:
+            seq = pat["sequence"]
+            if len(seq) < 2:
+                continue
+            # Binary: does this session contain the bigram/trigram?
+            def _has_pattern(grp):
+                events = grp[event_col].tolist()
+                for _i in range(len(events) - len(seq) + 1):
+                    if events[_i:_i + len(seq)] == seq:
+                        return 1
+                return 0
+            has_pat = df.groupby(session_col).apply(_has_pattern)
+            common_idx = session_depths.index.intersection(has_pat.index)
+            if len(common_idx) < 10:
+                continue
+            depths = session_depths[common_idx].values
+            flags = has_pat[common_idx].values
+            if flags.sum() == 0 or flags.sum() == len(flags):
+                continue
+            corr, pval = _sc.pointbiserialr(flags, depths)
+            outcome_correlations.append({
+                "sequence": seq,
+                "depth_correlation": round(float(corr), 4),
+                "p_value": round(float(pval), 6),
+                "significant": pval < 0.05,
+                "interpretation": (
+                    "positive — sessions with this pattern tend to be longer"
+                    if corr > 0.1
+                    else "negative — sessions with this pattern tend to exit early"
+                    if corr < -0.1
+                    else "neutral"
+                ),
+            })
+        outcome_correlations.sort(key=lambda x: abs(x["depth_correlation"]), reverse=True)
+    except Exception:
+        outcome_correlations = []
+
     top_finding = (
         f"Sequential mining: {total_seqs:,} sessions, "
         f"{len(all_patterns)} frequent patterns found "
@@ -1996,12 +2175,13 @@ def run_sequential_pattern_mining(
     return _make_result(
         analysis_type="sequential_pattern_mining",
         data={
-            "total_sequences":   total_seqs,
-            "patterns_found":    len(all_patterns),
-            "repetition_loops":  len(loops),
-            "top_patterns":      all_patterns,
-            "loop_patterns":     loops[:5],
-            "min_support_used":  min_support,
+            "total_sequences":    total_seqs,
+            "patterns_found":     len(all_patterns),
+            "repetition_loops":   len(loops),
+            "top_patterns":       all_patterns,
+            "loop_patterns":      loops[:5],
+            "min_support_used":   min_support,
+            "outcome_correlations": outcome_correlations,
             "narrative": narrative,
         },
         top_finding=top_finding,
@@ -2889,6 +3069,43 @@ def run_event_taxonomy(
         cat = classify_event(evt)
         mapping[evt] = cat
         category_counts[cat] += count
+
+    # LLM reclassification: re-classify events that landed in "other" category.
+    # Only triggers when >5 ambiguous events exist. Falls back to keyword result on any error.
+    _ambiguous = [evt for evt, cat in mapping.items() if cat == "other"]
+    if len(_ambiguous) > 5:
+        try:
+            import google.genai as _genai_tax
+            import json as _json_tax
+            _gc_tax = _genai_tax.Client()
+            _valid_cats = [
+                "authentication", "search", "selection", "transaction",
+                "navigation", "error", "notification", "onboarding", "social", "other"
+            ]
+            _tax_prompt = (
+                f"Classify these event names into one of these categories: "
+                f"{', '.join(_valid_cats)}.\n"
+                f"Events: {_ambiguous[:40]}\n"
+                f"Return ONLY a JSON object mapping event_name → category string. "
+                f"Use only the categories listed above."
+            )
+            _tax_resp = _gc_tax.models.generate_content(
+                model="gemini-2.0-flash", contents=_tax_prompt
+            )
+            import re as _re_tax
+            _tax_text = _tax_resp.text.strip()
+            _tax_match = _re_tax.search(r'\{[^}]+\}', _tax_text, _re_tax.DOTALL)
+            if _tax_match:
+                _remapped = _json_tax.loads(_tax_match.group())
+                for _evt, _new_cat in _remapped.items():
+                    if _evt in mapping and _new_cat in _valid_cats and _new_cat != "other":
+                        mapping[_evt] = _new_cat
+                # Recompute category_counts from updated mapping
+                category_counts = defaultdict(int)
+                for _evt2, _count2 in event_counts.items():
+                    category_counts[mapping.get(_evt2, "other")] += _count2
+        except Exception:
+            pass  # keep keyword classification as-is
 
     total_events = sum(category_counts.values())
     cat_distribution = {

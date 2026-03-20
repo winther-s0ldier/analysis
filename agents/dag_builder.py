@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 from datetime import datetime
@@ -19,7 +20,7 @@ def get_report_result(session_id: str) -> dict | None:
 
 
 
-def tool_build_report(session_id: str, output_folder: str) -> dict:
+def tool_build_report(session_id: str, output_folder: str, tool_context=None) -> dict:
     """
     Collect artifacts and assemble the final HTML report in one step.
     """
@@ -35,16 +36,32 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
             dataset_type = getattr(state, "dataset_type", "")
             csv_filename = getattr(state, "csv_filename", "")
 
+        # Source 0: ToolContext state — most reliable when running inside SequentialAgent.
+        # Synthesis and critic both write here before dag_builder runs.
+        if tool_context is not None:
+            try:
+                _tc_synth = tool_context.state.get("synthesis")
+                if _tc_synth:
+                    synthesis = _tc_synth
+                    print(f"INFO: dag_builder got synthesis from ToolContext.state for {session_id}")
+                _tc_critique = tool_context.state.get("critique")
+                if _tc_critique and synthesis:
+                    synthesis["_critic_review"] = _tc_critique
+                    print(f"INFO: dag_builder injected critique from ToolContext.state for {session_id}")
+            except Exception:
+                pass
+
         # Source 1: _synthesis_store is the most reliable — read it FIRST.
         # state.synthesis may be empty if the background thread's state reference
         # differs from what synthesis agent wrote, so don't rely on it alone.
         try:
             from agents.synthesis import get_synthesis_result
-            synthesis = get_synthesis_result(session_id) or {}
-            if synthesis:
+            _store_synth = get_synthesis_result(session_id)
+            if _store_synth:
+                synthesis = _store_synth
                 print(f"INFO: dag_builder got synthesis from _synthesis_store for {session_id}")
         except Exception:
-            synthesis = {}
+            pass
 
         # Source 2: fall back to state.synthesis if store was empty
         if not synthesis and state:
@@ -65,8 +82,26 @@ def tool_build_report(session_id: str, output_folder: str) -> dict:
             except Exception:
                 pass
 
+        # Source 4: A2A mode — inject _critic_cache.json into synthesis if not already present
+        if synthesis and not synthesis.get("_critic_review"):
+            try:
+                _critic_cache_path = os.path.join(output_folder, "_critic_cache.json")
+                if os.path.exists(_critic_cache_path):
+                    with open(_critic_cache_path, "r", encoding="utf-8") as _ccf:
+                        _file_crit = json.load(_ccf)
+                    if _file_crit:
+                        synthesis["_critic_review"] = _file_crit
+                        print(f"INFO: [A2A] dag_builder injected critic review from file cache for {session_id}")
+            except Exception:
+                pass
+
         if not synthesis:
             print(f"WARNING: dag_builder found no synthesis for {session_id} — report will have no insights.")
+            return {
+                "status": "error",
+                "error": "Synthesis not available. Cannot build report without insights. Re-run synthesis first.",
+                "session_id": session_id,
+            }
 
         if state:
             for aid, result in state.results.items():
@@ -249,11 +284,27 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         _critic_h = (
             f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">'
             f'<span class="badge {_verdict_class}" style="font-size:13px;padding:5px 12px;">{_verdict_label}</span>'
-            f'<span style="font-size:12px;color:#666;">Confidence adjustment: {int(_cr_conf * 100)}%</span>'
+            f'<span style="font-size:12px;color:#666;">Confidence: {int(_cr_conf * 100)}%</span>'
             f'</div>'
             + (f'<p style="font-size:13px;color:#555;margin-bottom:14px;">{_cr_verdict}</p>' if _cr_verdict else "")
             + _chal_html
         )
+        # Reliability badge injected into the report header
+        _conf_pct = int(_cr_conf * 100)
+        if _conf_pct >= 90:
+            _badge_color = "#27ae60"
+        elif _conf_pct >= 70:
+            _badge_color = "#e67e22"
+        else:
+            _badge_color = "#c0392b"
+        _reliability_badge = (
+            f'<span style="display:inline-block;margin-top:8px;padding:3px 10px;'
+            f'border-radius:12px;background:{_badge_color};color:#fff;'
+            f'font-size:11px;font-family:system-ui,sans-serif;font-weight:600;letter-spacing:0.3px;">'
+            f'Peer Review: {_conf_pct}% reliable</span>'
+        )
+    else:
+        _reliability_badge = ""
 
     st = synthesis.get("intervention_strategies", {})
     if isinstance(st, list):
@@ -323,8 +374,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             continue
         # Scan ai_summary and root_cause_hypothesis for [AX] node citations
         _text = str(_ins.get("ai_summary", "")) + str(_ins.get("root_cause_hypothesis", "")) + str(_ins.get("title", ""))
-        import re as _re
-        for _m in _re.findall(r'\[A(\d+)\]', _text):
+        for _m in re.findall(r'\[A(\d+)\]', _text):
             _nid = f"A{_m}"
             if _nid not in _insight_index:
                 _insight_index[_nid] = _ins
@@ -557,6 +607,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     <div class="header">
         <h1>{title}</h1>
         <p>Dataset: {dataset_type}&nbsp;&nbsp;|&nbsp;&nbsp;Generated: {generated}&nbsp;&nbsp;|&nbsp;&nbsp;Session: {session_id}</p>
+        {_reliability_badge}
     </div>
     {get_sect_labeled("executive_summary", ex_h)}
     {get_sect_labeled("key_findings", conv_h)}

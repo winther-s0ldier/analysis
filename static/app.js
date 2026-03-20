@@ -1,4 +1,4 @@
-let sessionId = null;
+﻿let sessionId = null;
 let outputFolder = null;
 let pendingFile = null;
 let renderedCharts = new Set();
@@ -204,6 +204,78 @@ function startProcessingStatus(phase) {
     }, 2500);
 }
 
+function showClarificationPanel(data) {
+    const ambiguous = (data?.ambiguous_nodes || []);
+    const message = data?.message || 'Please confirm column roles to continue.';
+    const colRoles = ['entity_col', 'time_col', 'event_col', 'value_col', 'outcome_col'];
+
+    // Get all CSV columns from the profiler output if available
+    let allCols = [];
+    if (window._lastProfileCols && Array.isArray(window._lastProfileCols)) {
+        allCols = window._lastProfileCols;
+    }
+
+    const roleOptions = colRoles.map(role => {
+        const opts = ['(none)', ...allCols].map(c =>
+            `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`
+        ).join('');
+        return `
+          <div class="clarification-row">
+            <label>${role}</label>
+            <select data-role="${escapeHtml(role)}" class="clarification-select">
+              ${opts}
+            </select>
+          </div>`;
+    }).join('');
+
+    const panelHtml = `
+      <div class="clarification-panel" id="clarificationPanel">
+        <div class="clarification-header">Column Role Confirmation Required</div>
+        <p class="clarification-msg">${escapeHtml(message)}</p>
+        ${ambiguous.length ? `<p class="clarification-affected">Affected analyses: ${ambiguous.map(n => escapeHtml(n.analysis_type)).join(', ')}</p>` : ''}
+        <div class="clarification-roles">${roleOptions}</div>
+        <button class="clarification-submit" onclick="submitClarification()">Confirm &amp; Continue</button>
+      </div>`;
+
+    addAIMessage(panelHtml, true);
+}
+
+async function submitClarification() {
+    const selects = document.querySelectorAll('.clarification-select');
+    const columnRoles = {};
+    selects.forEach(sel => {
+        const val = sel.value;
+        if (val && val !== '(none)') {
+            columnRoles[sel.dataset.role] = val;
+        }
+    });
+
+    if (Object.keys(columnRoles).length === 0) {
+        alert('Please assign at least one column role before continuing.');
+        return;
+    }
+
+    const btn = document.querySelector('.clarification-submit');
+    if (btn) { btn.disabled = true; btn.textContent = 'Submitting…'; }
+
+    try {
+        const resp = await fetch(`/clarify/${sessionId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ column_roles: columnRoles }),
+        });
+        if (!resp.ok) throw new Error(await resp.text());
+        const panel = document.getElementById('clarificationPanel');
+        if (panel) panel.closest('.ai-message, .message-bubble, .chat-bubble') ?.remove();
+        addAIMessage('Column roles confirmed. Re-running discovery…');
+        // Re-open SSE stream to track the re-discover progress
+        startSSEStream();
+    } catch (err) {
+        addAIMessage(`Clarification submission failed: ${escapeHtml(String(err))}`);
+        if (btn) { btn.disabled = false; btn.textContent = 'Confirm & Continue'; }
+    }
+}
+
 function stopProcessingStatus() {
     clearInterval(_rotatingInterval);
     processingStatus.classList.add('hidden');
@@ -263,7 +335,7 @@ dropOverlay.addEventListener('drop', e => {
 });
 dropOverlay.addEventListener('dragover', e => e.preventDefault());
 
-/* ─── Send ───────────────────────────────────────────────────── */
+/*  —  —  —  Send  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 sendBtn.addEventListener('click', handleSend);
 chatInput.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
@@ -273,7 +345,7 @@ chatInput.addEventListener('input', () => {
     chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + 'px';
 });
 
-/* ─── Sidebar Toggle ─────────────────────────────────────────── */
+/*  —  —  —  Sidebar Toggle  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 const sidebarEl = $('#sidebar');
 const sidebarExpand = $('#sidebar-expand');
 
@@ -286,7 +358,7 @@ sidebarExpand?.addEventListener('click', () => {
     sidebarExpand.classList.add('hidden');
 });
 
-/* ─── Core Functions ─────────────────────────────────────────── */
+/*  —  —  —  Core Functions  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 function attachFile(file) {
     pendingFile = file;
     fileAttachName.textContent = file.name;
@@ -326,6 +398,9 @@ async function handleSend() {
 async function uploadAndAnalyze(file, instructions) {
     setProgress(10);
     startProcessingStatus('upload');
+    // Show ring immediately from upload  —  visible for entire pipeline
+    if (progressRing) progressRing.classList.remove('hidden');
+    updateProgressRingStage('upload');
 
     const formData = new FormData();
     formData.append('file', file);
@@ -337,7 +412,7 @@ async function uploadAndAnalyze(file, instructions) {
 
         sessionId = data.session_id;
         outputFolder = data.output_folder || data.session_id;
-        // No session saved to storage — fresh start on reload
+        // No session saved to storage  —  fresh start on reload
 
         if (instructions) {
             try {
@@ -352,9 +427,10 @@ async function uploadAndAnalyze(file, instructions) {
         updateStage(1, 'complete');
         setProgress(25);
 
-        /* ── Profile ── */
+        /*  —  —  Profile  —  —  */
         updateStage(2, 'active');
         startProcessingStatus('profile');
+        updateProgressRingStage('profiling');
 
         const profileRes = await fetch(`/profile/${sessionId}`, { method: 'POST' });
         const profileData = await profileRes.json();
@@ -364,9 +440,10 @@ async function uploadAndAnalyze(file, instructions) {
         setProgress(45);
         addProfileMessage(profileData);
 
-        /* ── Discover ── */
+        /*  —  —  Discover  —  —  */
         updateStage(3, 'active');
         startProcessingStatus('discover');
+        updateProgressRingStage('discovering');
 
         const discoverRes = await fetch(`/discover/${sessionId}`, { method: 'POST' });
         const discoverData = await discoverRes.json();
@@ -396,32 +473,35 @@ async function runAnalysis() {
     _terminalNodeStates = {};
     _terminalTotalNodes = 0;
     _warnedMessages = new Set();
-    if (progressRing) { progressRing.classList.add('hidden'); progressRing.classList.remove('complete'); }
+    if (progressRing) { progressRing.classList.remove('complete'); }
+    updateProgressRingStage('analyzing');
 
     fetch(`/analyze/${sessionId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ request: 'Analyze all discovered metrics.', custom_metrics: [] }),
     }).then(() => {
-        // Show ring immediately — don't wait for first status poll
-        if (progressRing) progressRing.classList.remove('hidden');
-        updateProgressRing(0, 1);
         // Prime the terminal card and ring before any charts arrive
         updatePipelineStatusPanel();
     });
 
     pollStartTime = Date.now();
+    _finishCalled = false;     // reset for new run
+    _hasReport = false;        // reset — a fresh run hasn't generated a report yet
+    _renderInProgress = false; // reset render lock
     if (pollInterval) clearInterval(pollInterval);
 
     // --- #12: Try SSE stream first; fall back to polling if unavailable ---
     startSSEStream();
 }
 
-// #12: SSE stream — receives real-time events from the pipeline backend.
+// #12: SSE stream  —  receives real-time events from the pipeline backend.
 // Falls back to polling if connection fails (e.g. proxy timeout, server restart).
 let _activeSSE = null;
+let _finishCalled = false;   // guard: ensure finishPipeline() runs at most once per session
+let _hasReport = false;      // set true only when report_ready fires with a real path
 function startSSEStream() {
-    if (_activeSSE) { try { _activeSSE.close(); } catch(e) {} }
+    if (_activeSSE) { try { _activeSSE.close(); } catch (e) { } }
 
     const evtSource = new EventSource(`/stream/${sessionId}`);
     _activeSSE = evtSource;
@@ -440,12 +520,30 @@ function startSSEStream() {
             updateMetricCards(nodeStatuses);
             // Keep stage indicator updated
             updateStage(4, 'active');
-        } else if (ev.type === 'synthesis_complete') {
+        } else if (ev.type === 'synthesis_started') {
+            updateStage(4, 'complete');
             updateStage(5, 'active');
             startProcessingStatus('synthesize');
+            updateProgressRingStage('synthesizing');
+        } else if (ev.type === 'synthesis_complete') {
+            updateStage(4, 'complete');  // belt-and-suspenders: mark Analyze done if synthesis_started was missed
+            updateStage(5, 'complete');
+            updateProgressRingStage('synthesizing');
+            startProcessingStatus('synthesize');
         } else if (ev.type === 'report_ready') {
+            _hasReport = true;           // only fires when an actual report path exists
             updateStage(6, 'active');
+            updateProgressRingStage('building_report');
             startProcessingStatus('report');
+        } else if (ev.type === 'node_failed') {
+            const nodeId = ev.data?.node_id || 'unknown';
+            const errMsg = ev.data?.error || 'unknown error';
+            addAIMessage(`⚠️ Analysis ${nodeId} could not complete: ${errMsg}. Other analyses will continue  —  results for this node will be unavailable.`);
+        } else if (ev.type === 'report_error') {
+            const errMsg = ev.data?.error || 'Report build failed';
+            addAIMessage(`Report could not be generated: ${errMsg}`);
+            addRerunSynthesisButton();
+            stopProcessingStatus();
         } else if (ev.type === 'stream_end') {
             evtSource.close();
             _activeSSE = null;
@@ -453,22 +551,26 @@ function startSSEStream() {
             setProgress(100);
             const status = ev.data?.status || 'complete';
             if (status === 'complete') {
-                await finishPipeline();
+                updateProgressRingStage('complete');
+                if (!_finishCalled) { _finishCalled = true; await finishPipeline(); }
             } else {
                 addAIMessage('Pipeline encountered an error. Some results may be available.');
             }
+        } else if (ev.type === 'status_update' && ev.data?.status === 'clarification_needed') {
+            evtSource.close();
+            _activeSSE = null;
+            stopProcessingStatus();
+            showClarificationPanel(ev.data);
         }
     };
 
     evtSource.onerror = () => {
         evtSource.close();
         _activeSSE = null;
-        if (!_streamReceived) {
-            // SSE never connected — fall back to polling immediately
-            console.warn('SSE unavailable, falling back to polling');
-            _startPolling();
-        }
-        // If we already received events, pipeline is likely done — don't re-poll
+        // Always fall back to polling  —  handles both "never connected" and
+        // "stream dropped before stream_end was processed" (which leaves synthesis invisible)
+        console.warn('SSE error/closed, falling back to polling');
+        _startPolling();
     };
 
     // Safety timeout: if no stream_end received in MAX_POLL_TIME, switch to polling
@@ -503,11 +605,14 @@ function _startPolling() {
             await updatePipelineStatusPanel();
             const phase = { analyzing: 'analyze', synthesizing: 'synthesize', building_report: 'report' }[status.session_status];
             if (phase) startProcessingStatus(phase);
+            // Update ring with overall pipeline stage
+            if (status.session_status) updateProgressRingStage(status.session_status);
             if (status.session_status === 'complete') {
                 clearInterval(pollInterval);
                 stopProcessingStatus();
                 setProgress(100);
-                await finishPipeline();
+                updateProgressRingStage('complete');
+                if (!_finishCalled) { _finishCalled = true; await finishPipeline(); }
             } else if (status.session_status === 'error') {
                 clearInterval(pollInterval);
                 stopProcessingStatus();
@@ -537,7 +642,7 @@ async function updatePipelineStatusPanel() {
 
         const nodes = data.nodes || [];
 
-        // ── Terminal card ──────────────────────────────────────────
+        //  —  —  Terminal card  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
         if (nodes.length > 0) {
             if (!_terminalCard) {
                 _terminalTotalNodes = nodes.length;
@@ -546,7 +651,7 @@ async function updatePipelineStatusPanel() {
             updateTerminalCard(nodes);
         }
 
-        // ── Circular progress ring ─────────────────────────────────
+        //  —  —  Circular progress ring  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
         const completed = nodes.filter(n => n.status === 'complete' || n.status === 'failed').length;
         const total = nodes.length || 1;
         if (nodes.length > 0) {
@@ -554,7 +659,7 @@ async function updatePipelineStatusPanel() {
             updateProgressRing(completed, total);
         }
 
-        // ── Gate warnings → AI chat (once each) ───────────────────
+        //  —  —  Gate warnings → AI chat (once each)  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
         const warnings = data.gate_result?.warnings || [];
         warnings.forEach(w => {
             const key = 'warn:' + w;
@@ -564,13 +669,13 @@ async function updatePipelineStatusPanel() {
             }
         });
 
-        // ── Monitor alerts → AI chat (once each) ──────────────────
+        //  —  —  Monitor alerts → AI chat (once each)  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
         const alerts = data.alerts || [];
         alerts.forEach(a => {
             const key = 'alert:' + a.event + ':' + JSON.stringify(a.data);
             if (!_warnedMessages.has(key)) {
                 _warnedMessages.add(key);
-                addAIMessage(`🔔 [${a.event}] ${JSON.stringify(a.data)}`);
+                addAIMessage(`ðŸ”” [${a.event}] ${JSON.stringify(a.data)}`);
             }
         });
 
@@ -579,7 +684,7 @@ async function updatePipelineStatusPanel() {
     }
 }
 
-/* ─── Terminal Card ──────────────────────────────────────────── */
+/*  —  —  —  Terminal Card  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 function addTerminalCard(nodeCount) {
     const wrapper = document.createElement('div');
     wrapper.className = 'msg msg-ai';
@@ -598,7 +703,7 @@ function addTerminalCard(nodeCount) {
                     <div class="t-dot"></div>
                     <div class="t-dot"></div>
                     <div class="t-dot"></div>
-                    <span class="msg-terminal-title">pipeline — analysis</span>
+                    <span class="msg-terminal-title">pipeline  —  analysis</span>
                 </div>
                 <div class="msg-terminal-body" id="terminal-body"></div>
                 <div class="msg-terminal-footer">
@@ -633,7 +738,10 @@ function updateTerminalCard(nodes) {
         const labelCls = isOk ? 't-label-ok' : isRun ? 't-label-run' : isFail ? 't-label-fail' : 't-label-pend';
         const icon = isOk ? '✓' : isRun ? '⟳' : isFail ? '✗' : '·';
         const statusText = isOk ? 'done' : isRun ? 'running…' : isFail ? 'failed' : 'waiting';
-        const label = (n.type || n.id || '').replace(/_/g, ' ');
+        const typeLabel = (n.type || n.id || '').replace(/_/g, ' ');
+        const nodeId = (n.id || '').toUpperCase();
+        const label = nodeId && n.type ? `${nodeId} · ${typeLabel}` : typeLabel;
+        const errorTip = isFail && n.error ? ` title="${escapeHtml(n.error)}"` : '';
 
         let row = document.querySelector(`#terminal-body .t-line[data-node-id="${n.id}"]`);
         if (!row) {
@@ -644,8 +752,8 @@ function updateTerminalCard(nodes) {
         }
         row.innerHTML = `
             <span class="t-icon ${statusCls}">${icon}</span>
-            <span class="t-line-type ${labelCls}">${escapeHtml(label)}</span>
-            <span class="t-status-text ${statusCls}">${statusText}</span>
+            <span class="t-line-type ${labelCls}"${errorTip}>${escapeHtml(label)}</span>
+            <span class="t-status-text ${statusCls}"${errorTip}>${statusText}</span>
         `;
 
         if (isOk || isFail) completed++;
@@ -659,25 +767,60 @@ function updateTerminalCard(nodes) {
     if (cursor) cursor.style.display = allDone ? 'none' : '';
 }
 
-/* ─── Circular Progress Ring ─────────────────────────────────── */
+/*  —  —  —  Circular Progress Ring  —  overall pipeline %  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
+// Stage → base percentage of the full pipeline
+const STAGE_PCT = {
+    upload:         5,
+    profiling:      15,
+    discovering:    30,
+    analyzing:      30,   // slides from 30→75 as nodes complete
+    synthesizing:   80,
+    building_report:90,
+    complete:       100,
+};
+let _ringCurrentStage = 'upload';
+let _ringNodesDone    = 0;
+let _ringNodesTotal   = 0;
+
+function _calcOverallPct() {
+    if (_ringCurrentStage === 'analyzing' && _ringNodesTotal > 0) {
+        const nodeFraction = _ringNodesDone / _ringNodesTotal;
+        return Math.round(30 + nodeFraction * 45); // 30 → 75
+    }
+    return STAGE_PCT[_ringCurrentStage] ?? 5;
+}
+
 function updateProgressRing(completed, total) {
-    if (!ringFill || !ringLabel) return;
-    const circumference = 138.23; // 2π × 22
-    const fraction = total > 0 ? completed / total : 0;
+    // Legacy call from node-completion path  —  update node counters then redraw
+    _ringNodesDone  = completed;
+    _ringNodesTotal = total;
+    _drawProgressRing(_calcOverallPct());
+}
+
+function updateProgressRingStage(stage) {
+    _ringCurrentStage = stage;
+    if (stage !== 'analyzing') { _ringNodesDone = 0; _ringNodesTotal = 0; }
+    _drawProgressRing(_calcOverallPct());
+}
+
+function _drawProgressRing(pct) {
+    if (!ringFill || !ringLabel || !progressRing) return;
+    const circumference = 138.23; // 2Ï€ Ã— 22
+    const fraction = Math.min(pct, 100) / 100;
     ringFill.style.strokeDashoffset = circumference * (1 - fraction);
 
-    const allDone = total > 0 && completed >= total;
-    if (allDone) {
+    if (pct >= 100) {
         progressRing.classList.add('complete');
         ringLabel.textContent = '✓';
     } else {
-        ringLabel.textContent = `${completed}/${total}`;
+        progressRing.classList.remove('complete');
+        ringLabel.textContent = `${pct}%`;
     }
 }
 
 function updateMetricCards(nodeStatuses) {
     Object.entries(nodeStatuses).forEach(([nodeId, status]) => {
-        const card = $(`[data-node-id="${nodeId}"]`);
+        const card = document.querySelector(`.card-metric[data-node-id="${nodeId}"]`);
         if (!card) return;
         card.dataset.status = status;
         if (status === 'complete') {
@@ -701,7 +844,10 @@ function updateMetricCards(nodeStatuses) {
     });
 }
 
+let _renderInProgress = false;
 async function renderNewCharts() {
+    if (_renderInProgress) return;   // don't pile up concurrent fetches
+    _renderInProgress = true;
     try {
         const res = await fetch(`/results/${sessionId}`);
         if (!res.ok) return;
@@ -711,7 +857,7 @@ async function renderNewCharts() {
             if (result.chart_path && !renderedCharts.has(result.analysis_id)) {
                 renderedCharts.add(result.analysis_id);
                 addChartMessage(result);
-                const card = $(`[data-node-id="${result.analysis_id}"]`);
+                const card = document.querySelector(`.card-metric[data-node-id="${result.analysis_id}"]`);
                 if (card) {
                     const finding = card.querySelector('.card-metric-finding');
                     if (finding) {
@@ -723,6 +869,8 @@ async function renderNewCharts() {
         });
     } catch (err) {
         console.error('Chart fetch error:', err);
+    } finally {
+        _renderInProgress = false;
     }
 }
 
@@ -735,16 +883,16 @@ async function finishPipeline() {
         const synthesis = await res.json();
         stopProcessingStatus();
 
-        // Normalize synthesis sections — handle flat array OR {key: [...]} wrapper object
+        // Normalize synthesis sections  —  handle flat array OR {key: [...]} wrapper object
         // (LLM sometimes returns a bare list; this prevents silent render failures)
-        const di  = Array.isArray(synthesis.detailed_insights)       ? { insights:    synthesis.detailed_insights }        : (synthesis.detailed_insights       || {});
-        const ps  = Array.isArray(synthesis.personas)                 ? { personas:    synthesis.personas }                 : (synthesis.personas                 || {});
-        const inv = Array.isArray(synthesis.intervention_strategies)  ? { strategies:  synthesis.intervention_strategies }  : (synthesis.intervention_strategies  || {});
-        const cx  = Array.isArray(synthesis.cross_metric_connections) ? { connections: synthesis.cross_metric_connections } : (synthesis.cross_metric_connections  || {});
+        const di = Array.isArray(synthesis.detailed_insights) ? { insights: synthesis.detailed_insights } : (synthesis.detailed_insights || {});
+        const ps = Array.isArray(synthesis.personas) ? { personas: synthesis.personas } : (synthesis.personas || {});
+        const inv = Array.isArray(synthesis.intervention_strategies) ? { strategies: synthesis.intervention_strategies } : (synthesis.intervention_strategies || {});
+        const cx = Array.isArray(synthesis.cross_metric_connections) ? { connections: synthesis.cross_metric_connections } : (synthesis.cross_metric_connections || {});
 
         // Render synthesis sections in order: detailed → personas → interventions → connections → summary → narrative
-        if (di.insights?.length)    addDetailedInsightsMessage(di);
-        if (ps.personas?.length)    addPersonasMessage(ps);
+        if (di.insights?.length) addDetailedInsightsMessage(di);
+        if (ps.personas?.length) addPersonasMessage(ps);
         if (inv.strategies?.length) addInterventionsMessage(inv);
         if (cx.connections?.length) addCrossConnectionsMessage(cx);
         if (synthesis.executive_summary) {
@@ -759,25 +907,82 @@ async function finishPipeline() {
             addCriticReviewMessage(synthesis._critic_review);
         }
 
-        addAIMessageHTML(`
-            <p>Analysis complete. You can view the full report or continue asking questions.</p>
-            <div class="card-actions" style="margin-top: 12px;">
-                <button class="btn btn-primary" onclick="window.open('/report/${sessionId}', '_blank')">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-                    View Report
-                </button>
-                <button class="btn btn-ghost" onclick="downloadReport()">Download HTML</button>
-            </div>
-        `);
+        // Build reliability badge from critic verdict (shown inline next to report button)
+        let reliabilityBadge = '';
+        if (synthesis._critic_review) {
+            const cr = synthesis._critic_review;
+            const approved = cr.approved !== false;
+            const conf = typeof cr.confidence_adjustment === 'number' ? cr.confidence_adjustment : 1;
+            const confPct = Math.round(conf * 100);
+            const badgeColor = approved && conf >= 0.8 ? 'var(--success)' : conf >= 0.6 ? 'var(--warning)' : 'var(--error)';
+            const badgeLabel = approved ? `✓ Reliable · ${confPct}%` : `⚠ Issues Found · ${confPct}%`;
+            reliabilityBadge = `<span class="reliability-badge" style="background:${badgeColor}15;color:${badgeColor};border:1px solid ${badgeColor}40;border-radius:6px;padding:3px 10px;font-size:11px;font-weight:600;letter-spacing:0.03em;">${badgeLabel}</span>`;
+        }
 
-        // --- #5: Rerun synthesis button ---
-        addRerunSynthesisButton();
+        // Fallback: if SSE missed report_ready (race condition), check via HTTP HEAD
+        if (!_hasReport) {
+            try {
+                const hRes = await fetch(`/report/${sessionId}`, { method: 'HEAD' });
+                if (hRes.ok) _hasReport = true;
+            } catch (_) { }
+        }
+
+        if (_hasReport) {
+            addAIMessageHTML(`
+                <p>Analysis complete. Full report is ready.</p>
+                ${reliabilityBadge ? `<div style="margin-bottom:10px;">${reliabilityBadge}</div>` : ''}
+                <div class="card-actions" style="margin-top: 12px;">
+                    <button class="btn btn-primary" onclick="window.open('/report/${sessionId}', '_blank')">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                        Open Full Report
+                    </button>
+                    <button class="btn btn-ghost" onclick="downloadReport()">Download HTML</button>
+                </div>
+            `);
+            addReportEmbed(sessionId);
+        } else {
+            addAIMessageHTML(`
+                <p>Analysis complete. Synthesis results are available below.</p>
+                ${reliabilityBadge ? `<div style="margin-bottom:10px;">${reliabilityBadge}</div>` : ''}
+            `);
+        }
+
+        // "Improve Synthesis" is only shown on failure or user request — not here.
     } catch (err) {
         stopProcessingStatus();
         console.error('Synthesis error:', err);
     }
 
     chatInput.placeholder = 'Ask about the analysis results…';
+}
+
+function addReportEmbed(sid) {
+    const el = createAIMessageEl();
+    const content = el.querySelector('.msg-ai-content');
+    content.innerHTML = `
+        <div class="report-embed-card">
+            <div class="report-embed-header">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                </svg>
+                <span>Analysis Report</span>
+                <button class="report-embed-toggle" onclick="toggleReportEmbed(this)" title="Expand / Collapse">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
+                </button>
+            </div>
+            <div class="report-embed-body collapsed">
+                <iframe src="/report/${sid}" class="report-iframe" sandbox="allow-scripts allow-same-origin" loading="lazy"></iframe>
+            </div>
+        </div>`;
+    chatContainer.appendChild(el);
+    scrollToBottom();
+}
+
+function toggleReportEmbed(btn) {
+    const body = btn.closest('.report-embed-card').querySelector('.report-embed-body');
+    const isCollapsed = body.classList.toggle('collapsed');
+    btn.querySelector('svg polyline').setAttribute('points', isCollapsed ? '6 9 12 15 18 9' : '6 15 12 9 18 15');
+    if (!isCollapsed) scrollToBottom();
 }
 
 async function sendChatMessage(text) {
@@ -797,7 +1002,7 @@ async function sendChatMessage(text) {
     }
 }
 
-/* ─── Message Builders ───────────────────────────────────────── */
+/*  —  —  —  Message Builders  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 function addUserMessage(text, isFileMsg = false) {
     const el = document.createElement('div');
     el.className = 'msg msg-user';
@@ -829,15 +1034,11 @@ function addProfileMessage(profileData) {
     const c = profileData.classification || {};
     const cols = p.columns || [];
 
-    // ── Column type counts ───────────────────────────────────────────
     const colTypes = p.column_types || {};
     const numericCount = (colTypes.numeric || []).length;
     const catCount = (colTypes.categorical || []).length;
     const datetimeCount = (colTypes.datetime || []).length;
 
-    // ── Unique entities (domain-agnostic) ────────────────────────────
-    // Use the entity_col identified by the profiler; fall back to the
-    // categorical column with the highest unique_count.
     const colRoles = p.column_roles || c.column_roles || {};
     let uniqueEntities = null;
     let entityLabel = 'Unique Records';
@@ -859,7 +1060,7 @@ function addProfileMessage(profileData) {
         }
     }
 
-    // ── Unique categories (event/category column) ────────────────────
+    //  —  —  Unique categories (event/category column)  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
     let uniqueCategories = null;
     let catLabel = 'Unique Categories';
     if (colRoles.event_col) {
@@ -872,7 +1073,6 @@ function addProfileMessage(profileData) {
         }
     }
 
-    // ── Data completeness (cell-level: non-null cells / total cells) ─
     let completeness = null;
     const rowCount = p.row_count || 0;
     if (cols.length > 0 && rowCount > 0) {
@@ -881,11 +1081,11 @@ function addProfileMessage(profileData) {
         completeness = ((nonNullCells / totalCells) * 100).toFixed(1);
     }
 
-    // ── Date span ────────────────────────────────────────────────────
+    //  —  —  Date span  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
     const dtCol = cols.find(col => col.type_category === 'datetime');
     const dateSpanDays = dtCol?.stats?.date_range_days;
 
-    // ── Memory ───────────────────────────────────────────────────────
+    //  —  —  Memory  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
     const memMb = p.memory_mb;
     let memDisplay = null;
     if (memMb != null) {
@@ -894,7 +1094,7 @@ function addProfileMessage(profileData) {
             : memMb.toFixed(1) + ' MB';
     }
 
-    // ── Build stat cards ─────────────────────────────────────────────
+    //  —  —  Build stat cards  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
     const cards = [
         { val: p.row_count?.toLocaleString() || '0', label: 'Rows' },
         { val: p.column_count || '0', label: 'Columns' },
@@ -906,7 +1106,7 @@ function addProfileMessage(profileData) {
     if (memDisplay) cards.push({ val: memDisplay, label: 'Memory' });
     if (c?.dataset_type) cards.push({ val: c.dataset_type.replace(/_/g, ' '), label: 'Type' });
 
-    // ── Column type pills ────────────────────────────────────────────
+    //  —  —  Column type pills  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  — 
     const pills = [];
     if (numericCount) pills.push({ count: numericCount, label: 'numeric', cls: 'pill-numeric' });
     if (catCount) pills.push({ count: catCount, label: 'categorical', cls: 'pill-cat' });
@@ -983,10 +1183,10 @@ function addChartMessage(result) {
     const ins = result.insight_summary || {};
     const nav = result.narrative || {};
 
-    // Build detail block — show all available insight fields, no fallback duplication
+    // Build detail block  —  show all available insight fields, no fallback duplication
     const detailRows = [];
-    // Decision-maker takeaway is the most valuable per-node LLM insight — show it first
-    if (ins.decision_maker_takeaway) detailRows.push(`<div class="chart-detail-row chart-detail-dm"><span class="chart-detail-label">&#128161; Key Insight</span><span>${escapeHtml(ins.decision_maker_takeaway)}</span></div>`);
+    // Decision-maker takeaway is the most valuable per-node LLM insight  —  show it first
+    if (ins.decision_maker_takeaway) detailRows.push(`<div class="chart-detail-row chart-detail-dm"><span class="chart-detail-label">Key Insight</span><span>${escapeHtml(ins.decision_maker_takeaway)}</span></div>`);
     if (ins.key_finding) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Key Finding</span><span>${escapeHtml(ins.key_finding)}</span></div>`);
     if (ins.top_values) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Notable Values</span><span>${escapeHtml(ins.top_values)}</span></div>`);
     if (ins.anomalies) detailRows.push(`<div class="chart-detail-row"><span class="chart-detail-label">Anomalies</span><span>${escapeHtml(ins.anomalies)}</span></div>`);
@@ -1012,14 +1212,14 @@ function addChartMessage(result) {
             ${detailHtml}
         </div>
     `;
-    // Auto-resize iframe to full chart height (same-origin — no CORS restriction)
+    // Auto-resize iframe to full chart height (same-origin  —  no CORS restriction)
     const iframe = content.querySelector('iframe');
     if (iframe) {
         iframe.addEventListener('load', function () {
             try {
                 const h = this.contentDocument.documentElement.scrollHeight;
                 if (h > 100) this.style.height = h + 'px';
-            } catch (e) { /* cross-origin fallback — keep CSS default */ }
+            } catch (e) { /* cross-origin fallback  —  keep CSS default */ }
         });
     }
     chatContainer.appendChild(el);
@@ -1110,7 +1310,7 @@ function addConversationalReportMessage(report) {
                 html += renderTable(tableBlock);
                 continue;
             }
-            // normal line — inline markdown
+            // normal line  —  inline markdown
             const rendered = escapeHtml(line)
                 .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
                 .replace(/^•\s+|^-\s+/, '• ');
@@ -1191,7 +1391,7 @@ function addCriticReviewMessage(critic) {
             ${verdict ? `<p class="critic-verdict">${escapeHtml(verdict)}</p>` : ''}
             <div class="critic-challenges">
                 ${challenges.length
-                    ? challenges.map(c => `
+            ? challenges.map(c => `
                         <div class="critic-challenge">
                             <div class="critic-challenge-top">
                                 <span class="badge ${c.severity === 'high' ? 'high' : c.severity === 'low' ? 'low' : 'medium'}">${escapeHtml((c.severity || 'medium').toUpperCase())}</span>
@@ -1199,52 +1399,71 @@ function addCriticReviewMessage(critic) {
                             </div>
                             <div class="critic-issue">${escapeHtml(c.issue || '')}</div>
                         </div>`).join('')
-                    : '<p class="critic-none">No significant issues found — synthesis is well-grounded.</p>'
-                }
+            : '<p class="critic-none">No significant issues found  —  synthesis is well-grounded.</p>'
+        }
             </div>
         </div>`;
     chatContainer.appendChild(el);
     scrollToBottom();
 }
 
-// --- #5: Re-run synthesis button ---
+// --- #5: Re-run synthesis (shown only on failure) ---
 function addRerunSynthesisButton() {
     const el = createAIMessageEl();
     const content = el.querySelector('.msg-ai-content');
     content.innerHTML = `
-        <div style="padding: 4px 0;">
-            <button class="rerun-btn" id="rerun-synthesis-btn" onclick="triggerSynthesisRerun(this)">
-                &#8635; Re-run Synthesis
-            </button>
-            <span style="font-size:12px;color:#888;margin-left:10px;">
-                Reanalyse all findings without re-running analyses
-            </span>
+        <div class="rerun-synthesis-card">
+            <p style="margin:0 0 10px;font-size:13px;color:var(--text-secondary);">
+                Would you like to re-run the synthesis? You can add instructions to guide the analysis.
+            </p>
+            <div class="rerun-synthesis-input-row">
+                <input type="text" class="rerun-synthesis-input"
+                    placeholder="What would you like more of? (optional)"
+                    onkeydown="if(event.key==='Enter')triggerSynthesisRerun(this.closest('.rerun-synthesis-card').querySelector('.rerun-btn'))" />
+                <button class="rerun-btn" onclick="triggerSynthesisRerun(this)">&#8635; Re-run Synthesis</button>
+            </div>
         </div>`;
     chatContainer.appendChild(el);
     scrollToBottom();
+    setTimeout(() => el.querySelector('.rerun-synthesis-input')?.focus(), 100);
 }
 
 async function triggerSynthesisRerun(btn) {
+    const card = btn.closest('.rerun-synthesis-card');
+    const input = card?.querySelector('.rerun-synthesis-input');
+    const instructions = input?.value?.trim() || '';
+
     btn.disabled = true;
     btn.textContent = 'Running…';
+    if (input) input.disabled = true;
+
     try {
-        const r = await fetch(`/rerun-synthesis/${sessionId}`, { method: 'POST' });
+        const r = await fetch(`/rerun-synthesis/${sessionId}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ instructions }),
+        });
         if (r.ok) {
-            addAIMessage('Synthesis restarting — new insights will appear shortly.');
-            // Reset rendered charts tracking so synthesis results refresh
+            const msg = instructions
+                ? `Synthesis restarting with your instructions: "${instructions}"`
+                : 'Synthesis restarting — new insights will appear shortly.';
+            addAIMessage(msg);
             pollStartTime = Date.now();
-            // Re-subscribe to SSE stream for new events
+            _finishCalled = false;
+            _hasReport = false;
             startSSEStream();
         } else {
             const err = await r.json().catch(() => ({}));
             addAIMessage(`Rerun failed: ${err.detail || r.status}`);
             btn.disabled = false;
             btn.textContent = '&#8635; Re-run Synthesis';
+            if (input) input.disabled = false;
         }
     } catch (e) {
         addAIMessage(`Rerun error: ${e.message}`);
         btn.disabled = false;
         btn.textContent = '&#8635; Re-run Synthesis';
+        if (input) input.disabled = false;
     }
 }
 
@@ -1355,7 +1574,7 @@ function createAIMessageEl() {
     return el;
 }
 
-/* ─── Custom Analysis ────────────────────────────────────────── */
+/*  —  —  —  Custom Analysis  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 async function addCustomAnalysis() {
     const text = prompt('Describe the custom analysis you want to run:');
     if (!text) return;
@@ -1436,7 +1655,7 @@ async function addCustomAnalysis() {
             }
 
         } else if (data.status === 'unsupported') {
-            // AI says the data doesn't support this — show what's missing
+            // AI says the data doesn't support this  —  show what's missing
             setCardStatus('✗ Data doesn\'t support this', 'failed');
             const card = document.querySelector(`[data-node-id="${customId}"]`);
             if (card) {
@@ -1445,7 +1664,7 @@ async function addCustomAnalysis() {
             }
 
             const missing = data.missing_requirements || [];
-            let msg = `**Can't run this analysis** — ${data.reason || 'The available data doesn\'t support it.'}`;
+            let msg = `**Can't run this analysis**  —  ${data.reason || 'The available data doesn\'t support it.'}`;
             if (missing.length) {
                 msg += `\n\n**To run this you'd need:**\n${missing.map(r => `• ${r}`).join('\n')}`;
             }
@@ -1461,7 +1680,7 @@ async function addCustomAnalysis() {
     }
 }
 
-/* ─── Report Download ────────────────────────────────────────── */
+/*  —  —  —  Report Download  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 window.downloadReport = async function () {
     try {
         // Refresh report first so any custom analyses added after the pipeline are included
@@ -1486,7 +1705,7 @@ window.downloadReport = async function () {
     }
 };
 
-/* ─── Node Retry ─────────────────────────────────────────────── */
+/*  —  —  —  Node Retry  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 window.retryNode = async function (nodeId, btnEl) {
     if (!sessionId) return;
     const card = $(`[data-node-id="${nodeId}"]`);
@@ -1536,7 +1755,7 @@ window.retryNode = async function (nodeId, btnEl) {
     }
 };
 
-/* ─── Helpers ────────────────────────────────────────────────── */
+/*  —  —  —  Helpers  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  —  */
 function formatText(text) {
     return text
         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
@@ -1571,13 +1790,7 @@ function formatSize(bytes) {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-/* ─── Text-Selection Ask Popup ───────────────────────────────────────────────
-   When the user highlights any text inside the chat, a floating pill appears
-   above the selection. Clicking it sends the selected text as a user question
-   to the existing /chat endpoint — exactly like ChatGPT's "Ask about this".
-────────────────────────────────────────────────────────────────────────────── */
 (function initSelectionPopup() {
-    // Build the popup pill once and reuse it
     const popup = document.createElement('div');
     popup.id = 'sel-popup';
     popup.className = 'sel-popup hidden';
@@ -1616,7 +1829,7 @@ function formatSize(bytes) {
         const top = rect.top - 48; // 44px pill height + 4px gap
 
         popup.style.left = left + 'px';
-        popup.style.top  = top  + 'px';
+        popup.style.top = top + 'px';
         popup.classList.remove('hidden');
     }
 
@@ -1647,7 +1860,7 @@ function formatSize(bytes) {
     window.addEventListener('scroll', hidePopup, { passive: true });
     if (chatContainer) chatContainer.addEventListener('scroll', hidePopup, { passive: true });
 
-    // Main action — send selection as a chat question
+    // Main action  —  send selection as a chat question
     document.getElementById('sel-ask-btn').addEventListener('click', () => {
         const text = _pendingText || window.getSelection().toString().trim();
         if (!text) { hidePopup(); return; }
@@ -1672,3 +1885,4 @@ function formatSize(bytes) {
         scrollToBottom();
     });
 })();
+

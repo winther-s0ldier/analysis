@@ -35,6 +35,21 @@ def tool_profile_and_classify(
     if "error" in raw_profile:
         return {"error": raw_profile["error"]}
 
+    # Store immediately so get_profile_result() always returns valid data.
+    # profile_csv already runs programmatic classification (infer_column_semantics +
+    # classify_dataset), so we have row_count/column_count/dataset_type right now.
+    # The LLM can still refine the classification — this is just a safe fallback.
+    _profile_store[session_id] = {
+        "status": "success",
+        "raw_profile": raw_profile,
+        "classification": {
+            "dataset_type": raw_profile.get("dataset_type", "tabular_generic"),
+            "column_roles": raw_profile.get("column_roles", {}),
+            "confidence": raw_profile.get("confidence", 0.0),
+            "recommended_analyses": raw_profile.get("recommended_analyses", []),
+        },
+    }
+
     return {
         "raw_profile": raw_profile
     }

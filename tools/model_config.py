@@ -1,12 +1,8 @@
-
-"""
-Model Configuration — central model registry.
-All agent files import get_model() from here.
-"""
-import os
+﻿import os
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
-FLASH = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.0-flash")
+FLASH = os.getenv("GEMINI_FLASH_MODEL", "gemini-3.1-pro-preview")
+PRO   = os.getenv("GEMINI_PRO_MODEL",   "gemini-3.1-pro-preview")
 
 _AGENT_MODELS = {
     "orchestrator": MODEL,
@@ -16,8 +12,7 @@ _AGENT_MODELS = {
     "synthesis":    MODEL,
     "dag_builder":  MODEL,
     "chat":         MODEL,
-    # Critic uses Flash — higher RPM limits, plenty smart for text review
-    "critic":       FLASH,
+    "critic":       MODEL,
 }
 
 

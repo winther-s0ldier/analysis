@@ -4,13 +4,24 @@
       "user_uuid": "object",
       "event_name": "object",
       "category": "object",
+      "event_time": "object"
+    },
+    "hash": "b669860d7e82dd7f",
+    "last_successful_run": "2026-03-20T13:22:47.407830",
+    "csv_path": "Z:\\ADK\\uploads\\Commuter_Users_Event_data_ed0526_normalized.csv"
+  },
+  "tabular_generic": {
+    "fingerprint": {
+      "user_uuid": "object",
+      "event_name": "object",
+      "category": "object",
       "event_time": "object",
       "event_date": "object",
       "event_day": "object",
       "event_time_only": "object"
     },
     "hash": "7230c9197eeaad26",
-    "last_successful_run": "2026-03-14T13:05:34.622112",
-    "csv_path": "Z:\\ADK\\uploads\\cleaned_events_ca79ff_normalized.csv"
+    "last_successful_run": "2026-03-20T17:03:11.976629",
+    "csv_path": "Z:\\ADK\\uploads\\cleaned_events_324e5d_normalized.csv"
   }
 }

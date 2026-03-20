@@ -29,13 +29,12 @@ class Intent:
     BUILD_REPORT = "BUILD_REPORT"
     REPORT_READY = "REPORT_READY"
 
-    INSTALL_REQUIRED = "INSTALL_REQUIRED"
-    INSTALL_COMPLETE = "INSTALL_COMPLETE"
-    CLARIFICATION_NEEDED = "CLARIFICATION_NEEDED"
-    CLARIFICATION_PROVIDED = "CLARIFICATION_PROVIDED"
     STATUS_UPDATE = "STATUS_UPDATE"
     ERROR = "ERROR"
     TASK_COMPLETE = "TASK_COMPLETE"
+
+    CLARIFICATION_NEEDED = "CLARIFICATION_NEEDED"
+    CLARIFICATION_PROVIDED = "CLARIFICATION_PROVIDED"
 
 
 class NodeStatus:
@@ -115,6 +114,63 @@ def get_messages_from(
     ]
 
 
+def get_messages_to(
+    message_log: List[Any],
+    recipient: str,
+) -> List[Any]:
+    """Get all messages addressed to a specific recipient."""
+    return [
+        m for m in message_log
+        if (m.get("recipient") if isinstance(m, dict) else m.recipient) == recipient
+    ]
+
+
+class MessageMailbox:
+    """
+    Per-recipient indexed view of a message log.
+
+    Builds a dict index on construction so all lookups are O(1) instead of
+    O(n) scans over the flat message_log list.  Recreate when the log grows.
+
+    Usage:
+        mb = MessageMailbox(state.message_log)
+        msgs = mb.inbox("orchestrator")
+        last = mb.latest("orchestrator", intent=Intent.ANALYSIS_COMPLETE)
+    """
+
+    def __init__(self, message_log: List[Any]) -> None:
+        self._index: Dict[str, List[Any]] = {}
+        for msg in message_log:
+            r = (msg.get("recipient") if isinstance(msg, dict) else msg.recipient) or ""
+            self._index.setdefault(r, []).append(msg)
+
+    def inbox(self, recipient: str) -> List[Any]:
+        """All messages addressed to *recipient*, in arrival order."""
+        return self._index.get(recipient, [])
+
+    def latest(self, recipient: str, intent: str = None) -> Optional[Any]:
+        """Most recent message to *recipient*, optionally filtered by intent."""
+        msgs = self.inbox(recipient)
+        if intent:
+            msgs = [
+                m for m in msgs
+                if (m.get("intent") if isinstance(m, dict) else m.intent) == intent
+            ]
+        if not msgs:
+            return None
+        return sorted(
+            msgs,
+            key=lambda m: (m.get("timestamp") if isinstance(m, dict) else m.timestamp) or "",
+        )[-1]
+
+    def unread(self, recipient: str, after_timestamp: str) -> List[Any]:
+        """Messages to *recipient* with timestamp > *after_timestamp*."""
+        return [
+            m for m in self.inbox(recipient)
+            if ((m.get("timestamp") if isinstance(m, dict) else m.timestamp) or "") > after_timestamp
+        ]
+
+
 def get_latest_message(
     message_log: List[Any],
     intent: str = None,
@@ -130,7 +186,15 @@ def get_latest_message(
         matches = [m for m in matches if (m.get("intent") if isinstance(m, dict) else m.intent) == intent]
     if sender:
         matches = [m for m in matches if (m.get("sender") if isinstance(m, dict) else m.sender) == sender]
-    return matches[-1] if matches else None
+    if not matches:
+        return None
+    # Sort by timestamp (ISO8601 string — lexicographic sort is correct)
+    # Ensures chronologically latest message is returned even if delivered out of order
+    matches = sorted(
+        matches,
+        key=lambda m: (m.get("timestamp") if isinstance(m, dict) else m.timestamp) or "",
+    )
+    return matches[-1]
 
 
 def get_completed_analysis_ids(
@@ -139,7 +203,7 @@ def get_completed_analysis_ids(
     """
     Returns list of analysis_ids that have sent
     ANALYSIS_COMPLETE messages.
-    Used by Orchestrator for dependency resolution.
+    A2A sole source of truth for completed nodes.
     """
     complete_msgs = get_messages_by_intent(
         message_log, Intent.ANALYSIS_COMPLETE
@@ -147,6 +211,24 @@ def get_completed_analysis_ids(
     return [
         (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
         for m in complete_msgs
+        if (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
+    ]
+
+
+def get_failed_analysis_ids(
+    message_log: List[Any],
+) -> List[str]:
+    """
+    Returns list of analysis_ids that have sent
+    ANALYSIS_FAILED messages.
+    A2A sole source of truth for failed nodes.
+    """
+    failed_msgs = get_messages_by_intent(
+        message_log, Intent.ANALYSIS_FAILED
+    )
+    return [
+        (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
+        for m in failed_msgs
         if (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
     ]
 

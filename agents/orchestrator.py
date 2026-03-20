@@ -1,16 +1,25 @@
 import os
+import re
 import sys
 import json
+import math
+import copy
 import asyncio
 import logging
+import random
+import difflib
+import functools
+import traceback
 from typing import Optional, List, Dict, Any
 
-logging.basicConfig(
-    filename='pipeline.log',
-    level=logging.DEBUG,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    encoding='utf-8'
+from logging.handlers import RotatingFileHandler as _RotatingFileHandler
+_log_handler = _RotatingFileHandler(
+    'pipeline.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
 )
+_log_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s'))
+# INFO level silences the thousands of DEBUG traces from ADK/A2A internals
+# while preserving all our own INFO/WARNING/ERROR messages.
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..")
@@ -25,9 +34,24 @@ from a2a_messages import (
     get_latest_message,
     is_dependency_resolved,
     get_completed_analysis_ids,
+    get_failed_analysis_ids,
 )
 from tools.analysis_library import LIBRARY_REGISTRY
 from tools.model_config import get_model
+
+try:
+    from google.adk.agents.sequential_agent import SequentialAgent as _SequentialAgent
+    from google.adk.agents.loop_agent import LoopAgent as _LoopAgent
+    _SEQUENTIAL_AVAILABLE = True
+except ImportError:
+    _SequentialAgent = None
+    _LoopAgent = None
+    _SEQUENTIAL_AVAILABLE = False
+
+# A2A multi-server mode: Google A2A is the default and only supported mode.
+# Each agent runs as its own HTTP server (ports 8001-8006).
+# Set USE_A2A_MULTISERVER=false in environment only to disable (not recommended).
+_USE_A2A_MULTISERVER = os.getenv("USE_A2A_MULTISERVER", "true").lower() != "false"
 
 
 _pipeline_store: dict = {}
@@ -38,8 +62,55 @@ _pipeline_event_hooks: dict = {}
 
 # --- #11: Global reasoning thread (session_id -> list of completed node summaries) ---
 # Accumulates findings from ALL completed nodes; injected into subsequent node prompts
-# so every analysis knows what has already been discovered — even without a depends_on edge.
+# so every analysis knows what has already been discovered  - even without a depends_on edge.
 _global_threads: dict = {}
+
+# ---------------------------------------------------------------------------
+# Shared Gemini client  - lazy singleton, avoids re-instantiating on every node
+# ---------------------------------------------------------------------------
+_genai_client = None
+
+
+def _get_llm_client():
+    global _genai_client
+    if _genai_client is None:
+        import google.genai as _genai
+        _genai_client = _genai.Client()
+    return _genai_client
+
+
+async def _llm_generate_with_retry(
+    contents: str,
+    model: str,
+    label: str = "LLM",
+    max_attempts: int = 3,
+    backoff_base: float = 15.0,
+):
+    """Call Gemini generate_content with automatic retry on rate-limit errors.
+
+    Replaces the three identical for-loop retry patterns scattered across this
+    file. Raises on non-rate-limit errors and after exhausting all attempts.
+    """
+    client = _get_llm_client()
+    resp = None
+    for _attempt in range(max_attempts):
+        try:
+            resp = client.models.generate_content(model=model, contents=contents)
+            break
+        except Exception as _err:
+            _err_s = str(_err).lower()
+            if (
+                any(x in _err_s for x in ("429", "rate", "quota", "exhausted"))
+                and _attempt < max_attempts - 1
+            ):
+                _wait = backoff_base * (_attempt + 1)
+                print(f"WARNING: [{label}] Rate-limit on attempt {_attempt + 1}, retrying in {_wait:.0f}s")
+                await asyncio.sleep(_wait)
+            else:
+                raise
+    if resp is None:
+        raise RuntimeError(f"[{label}] No response after {max_attempts} attempts")
+    return resp
 
 
 def get_pipeline_state(
@@ -66,6 +137,62 @@ def create_pipeline_state(
     return state
 
 
+_pre_dag_agent_instance = None
+_post_dag_agent_instance = None
+_synthesis_critic_loop_instance = None
+
+
+def get_pre_dag_agent():
+    """SequentialAgent: profiler â†’ discovery."""
+    global _pre_dag_agent_instance
+    if _pre_dag_agent_instance is not None:
+        return _pre_dag_agent_instance
+    if not _SEQUENTIAL_AVAILABLE:
+        raise RuntimeError("google.adk.agents.sequential_agent not available")
+    from agents.profiler import get_profiler_agent
+    from agents.discovery import get_discovery_agent
+    _pre_dag_agent_instance = _SequentialAgent(
+        name="pre_dag_pipeline",
+        description="Profile dataset then build analysis plan",
+        sub_agents=[get_profiler_agent(), get_discovery_agent()],
+    )
+    return _pre_dag_agent_instance
+
+
+def _get_synthesis_critic_loop():
+    """LoopAgent: synthesis â†’ critic, exits when critic sets escalate=True (approved)."""
+    global _synthesis_critic_loop_instance
+    if _synthesis_critic_loop_instance is not None:
+        return _synthesis_critic_loop_instance
+    if not _SEQUENTIAL_AVAILABLE:
+        raise RuntimeError("google.adk.agents.loop_agent not available")
+    from agents.synthesis import get_synthesis_agent
+    from agents.critic import get_critic_agent
+    _synthesis_critic_loop_instance = _LoopAgent(
+        name="synthesis_critic_loop",
+        description="Synthesize results then critique; retries synthesis if critic rejects (max 2 iterations)",
+        sub_agents=[get_synthesis_agent(), get_critic_agent()],
+        max_iterations=1,
+    )
+    return _synthesis_critic_loop_instance
+
+
+def get_post_dag_agent():
+    """SequentialAgent: [synthesisâ†’critic loop] â†’ dag_builder."""
+    global _post_dag_agent_instance
+    if _post_dag_agent_instance is not None:
+        return _post_dag_agent_instance
+    if not _SEQUENTIAL_AVAILABLE:
+        raise RuntimeError("google.adk.agents.sequential_agent not available")
+    from agents.dag_builder import get_dag_builder_agent
+    _post_dag_agent_instance = _SequentialAgent(
+        name="post_dag_pipeline",
+        description="Run synthesis-critic loop until approved, then build HTML report",
+        sub_agents=[_get_synthesis_critic_loop(), get_dag_builder_agent()],
+    )
+    return _post_dag_agent_instance
+
+
 def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
     """
     Build the synthesis agent prompt + image_paths list from current session state.
@@ -75,8 +202,6 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
     Returns:
         (synthesis_prompt: str, image_paths: list[str])
     """
-    import math, json as _json
-
     dag = dag or getattr(state, "dag", []) or []
 
     def _clean(obj):
@@ -87,19 +212,8 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
         if isinstance(obj, (bool, int, float, str)) or obj is None: return obj
         return str(obj)
 
-    _rich_results = []
-    for _nid, _res in state.results.items():
-        if not isinstance(_res, dict): continue
-        _rich_results.append({
-            "analysis_id":     _nid,
-            "analysis_type":   _res.get("analysis_type", "unknown"),
-            "top_finding":     _res.get("top_finding", ""),
-            "severity":        _res.get("severity", "info"),
-            "confidence":      _res.get("confidence", 0.0),
-            "data":            _res.get("data", {}),
-            "insight_summary": _res.get("insight_summary", {}),
-        })
-    _rich_summary = _json.dumps(_clean(_rich_results), indent=2) if _rich_results else "[]"
+    # _rich_summary removed  - fact sheet already contains all key numbers.
+    # Sending full raw results was bloating the prompt to 50K+ tokens on large datasets.
 
     try:
         from agents.synthesis import _extract_node_facts as _efs
@@ -113,7 +227,7 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
             _atype = _res.get("analysis_type", "unknown")
             _nid   = _atype_to_id.get(_atype, _aid)
             _fact_sheet[_nid] = _efs(_nid, _aid, _res)
-        _fact_json = _json.dumps(_clean(_fact_sheet), indent=2)
+        _fact_json = json.dumps(_clean(_fact_sheet), indent=2)
     except Exception as _e:
         _fact_json = "{}"
         print(f"WARNING: fact_sheet build failed in build_synthesis_prompt: {_e}")
@@ -145,7 +259,34 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
             f"Rows: {_raw.get('row_count', 'unknown')} | "
             f"Columns: {_raw.get('column_count', 'unknown')} | "
             f"Type: {getattr(state, 'dataset_type', '')}\n"
-            f"Column roles: {_json.dumps(_col_roles, default=str)}\n"
+            f"Column roles: {json.dumps(_col_roles, default=str)}\n"
+        )
+
+    # Normality warning: if any distribution result is non-normal and a correlation
+    # matrix was also run, warn synthesis to prefer Spearman over Pearson for those cols.
+    _non_normal_cols = []
+    _has_corr = any(
+        isinstance(_r, dict) and _r.get("analysis_type") == "correlation_matrix"
+        for _r in state.results.values()
+    )
+    for _nid, _res in state.results.items():
+        if not isinstance(_res, dict): continue
+        if _res.get("analysis_type") == "distribution_analysis":
+            _d = _res.get("data", {})
+            _stats = _d.get("stats", {}) if isinstance(_d, dict) else {}
+            if _stats.get("is_normal") is False:
+                _col_name = _d.get("col", _nid) if isinstance(_d, dict) else _nid
+                _non_normal_cols.append(f"{_nid} ({_col_name})")
+    _normality_warning = ""
+    if _non_normal_cols:
+        _normality_warning = (
+            f"\n== NORMALITY WARNING ==\n"
+            f"Non-normally distributed columns: {', '.join(_non_normal_cols)}.\n"
+            + (
+                "Pearson correlations and parametric p-values for these columns may be unreliable. "
+                "Prefer citing Spearman r when discussing correlations for these columns.\n"
+                if _has_corr else ""
+            )
         )
 
     prompt = (
@@ -153,29 +294,24 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
         f"Dataset type: {getattr(state, 'dataset_type', '')}\n"
         f"Total analyses completed: {len(state.results)}\n"
         f"{_profile}"
+        f"{_normality_warning}"
         f"{_user_goal}"
         f"\n== DAG DEPENDENCY GRAPH (use this to reason causally) ==\n"
         f"{_dag_graph}\n"
-        f"\n== PRE-EXTRACTED FACT SHEET (cite ONLY these numbers — do not invent) ==\n"
+        f"\n== PRE-EXTRACTED FACT SHEET (cite ONLY these numbers  - do not invent) ==\n"
         f"{_fact_json}\n\n"
-        f"== FULL ANALYSIS RESULTS (raw — for additional context) ==\n"
-        f"{_rich_summary}\n\n"
-        f"INSTRUCTIONS:\n"
-        f"1. Call tool_aggregate_results(session_id) to get column_roles context (required).\n"
-        f"2. Before writing anything, reason step-by-step: what did each node find? "
-        f"What is surprising? What connects across nodes? THEN build your synthesis.\n"
-        f"3. Use the DAG DEPENDENCY GRAPH to identify causal chains "
-        f"(child node results are constrained by their parent — reason causally).\n"
-        f"4. Look closely at the provided chart images. Describe visual trends natively.\n"
-        f"5. SELF-REVIEW before calling tool_submit_synthesis: "
-        f"(a) every insight cites a [NodeID] with a specific number, "
-        f"(b) cross_metric_connections has entries citing 2 different node pairs, "
-        f"(c) conversational_report contains '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
-        f"6. Call tool_submit_synthesis(session_id, synthesis_json_str)."
+        f"INSTRUCTIONS (complete all steps in order):\n"
+        f"1. Call tool_aggregate_results(session_id) to get column_roles context.\n"
+        f"2. Think briefly: most surprising finding, strongest node interaction, top bottleneck. "
+        f"Keep thinking to 3-5 sentences. Do NOT write a long essay.\n"
+        f"3. Build the synthesis JSON using the fact sheet above. "
+        f"Cite [NodeID] + specific number for every insight. "
+        f"conversational_report MUST contain '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
+        f"4. Call tool_submit_synthesis(session_id, synthesis_json_str) immediately after step 3."
     )
 
     images = []
-    for _res in state.results.values():
+    for _nid, _res in state.results.items():
         if not isinstance(_res, dict): continue
         cp = _res.get("chart_file_path")
         if cp:
@@ -199,7 +335,7 @@ async def run_full_pipeline(
 
     Stage 1: Profile (profiler_agent)
     Stage 2: Discover (discovery_agent)
-    Stage 3: Execute DAG (coder_agent × N)
+    Stage 3: Execute DAG (coder_agent Ã- N)
     Stage 4: Synthesize (synthesis_agent)
     Stage 5: Build Report (dag_builder_agent)
 
@@ -239,38 +375,55 @@ async def run_full_pipeline(
     try:
         from main import run_agent_pipeline, extract_json
 
-        _update_session_status(state, "profiling")
+        # Always register session in A2A mode so synthesis/critic/dag_builder
+        # can look up output_folder from _a2a_sessions.json — even when profiler
+        # result is reused from cache and the else branch is skipped.
+        if _USE_A2A_MULTISERVER:
+            from agent_servers.a2a_orchestrator import register_session as _reg_session
+            _reg_session(session_id, output_folder)
 
-        profiler_prompt = (
-            f"csv_path: {csv_path}\n"
-            f"session_id: {session_id}\n"
-            f"Call tool_profile_and_classify now."
-        )
-
-        profiler_response = await run_agent_pipeline(
-            f"{session_id}_profile",
-            profiler_prompt,
-            agent_getter="profiler",
-        )
-        profiler_data = extract_json(profiler_response)
-
-        if not profiler_data or \
-           profiler_data.get("status") != "success":
-            return {
-                "status": "error",
-                "error":  "Profiling failed",
-                "detail": profiler_data,
+        # Skip profiler if /profile already ran and populated state
+        if getattr(state, "raw_profile", None):
+            print(f"INFO: Reusing /profile result for {session_id}")
+            profiler_data = {
+                "status": "success",
+                "raw_profile": state.raw_profile,
+                "classification": state.semantic_map or {},
             }
+        else:
+            _update_session_status(state, "profiling")
 
-        state.raw_profile  = profiler_data.get(
-            "raw_profile", {}
-        )
-        state.semantic_map = profiler_data.get(
-            "classification", {}
-        )
-        state.dataset_type = profiler_data.get(
-            "classification", {}
-        ).get("dataset_type", "")
+            profiler_prompt = (
+                f"csv_path: {csv_path}\n"
+                f"session_id: {session_id}\n"
+                f"Call tool_profile_and_classify now."
+            )
+
+            if _USE_A2A_MULTISERVER:
+                from agent_servers.a2a_orchestrator import (
+                    call_profiler as _a2a_profiler,
+                )
+                print(f"INFO: [{session_id}] Calling profiler via A2A HTTP")
+                profiler_response = await _a2a_profiler(session_id, csv_path)
+            else:
+                profiler_response = await run_agent_pipeline(
+                    f"{session_id}_profile",
+                    profiler_prompt,
+                    agent_getter="profiler",
+                )
+            profiler_data = extract_json(profiler_response)
+
+            if not profiler_data or \
+               profiler_data.get("status") != "success":
+                return {
+                    "status": "error",
+                    "error":  "Profiling failed",
+                    "detail": profiler_data,
+                }
+
+            state.raw_profile  = profiler_data.get("raw_profile", {})
+            state.semantic_map = profiler_data.get("classification", {})
+            state.dataset_type = profiler_data.get("classification", {}).get("dataset_type", "")
 
         _post_message(
             state, "profiler_agent", "discovery_agent",
@@ -318,13 +471,27 @@ async def run_full_pipeline(
             active_policy = {}
             policy_context = ""
 
+        _profiler_confidence = classification.get("confidence", 1.0)
+        _confidence_warning = ""
+        if _profiler_confidence < 0.7:
+            _confidence_warning = (
+                f"\nâšWARNING: LOW PROFILER CONFIDENCE ({_profiler_confidence:.2f}): "
+                f"The dataset type classification is uncertain. "
+                f"Apply conservative feasibility rules: "
+                f"(a) prefer analyses with no required column roles over behavioral ones, "
+                f"(b) mark any node requiring entity_col or time_col as feasibility=LOW if those roles are ambiguous, "
+                f"(c) cap the DAG at 5 nodes maximum, "
+                f"(d) include missing_data_analysis and distribution_analysis as the first two nodes.\n"
+            )
+
         discovery_prompt = (
             f"Session ID: {session_id}\n"
             f"CSV file path: {csv_path}\n"
             f"Output folder: {output_folder}\n\n"
             f"PROFILER OUTPUT:\n{profile_summary}\n\n"
-            + (f"{policy_context}\n\n" if policy_context else "") +
-            f"INSTRUCTIONS:\n"
+            + (f"{policy_context}\n\n" if policy_context else "")
+            + (_confidence_warning if _confidence_warning else "")
+            + f"INSTRUCTIONS:\n"
             f"1. Reason about the data and the policy context above.\n"
             f"2. Construct a JSON DAG of MetricSpec nodes (id, name, analysis_type, library_function, column_roles, depends_on).\n"
             f"3. Call tool_submit_analysis_plan(session_id, dag_json_str) with your JSON result.\n"
@@ -332,7 +499,7 @@ async def run_full_pipeline(
 
         # Reuse the plan already set on state.dag by the /discover endpoint.
         # get_analysis_plan() uses .pop() so it is consumed after the /discover
-        # call — reading it again here would return None. state.dag is the
+        # call  - reading it again here would return None. state.dag is the
         # correct source of truth: set at main.py:/discover after the agent runs.
         if getattr(state, "dag", None):
             plan = {
@@ -342,15 +509,38 @@ async def run_full_pipeline(
             }
             print(f"INFO: Reusing /discover plan with {len(state.dag)} nodes for {session_id}")
         else:
-            # No prior plan — run discovery from scratch (e.g. direct /analyze call)
+            # No prior plan  - run discovery from scratch (e.g. direct /analyze call)
             from agents.discovery import get_analysis_plan
-            discovery_response = await run_agent_pipeline(
-                f"{session_id}_discovery",
-                discovery_prompt,
-                agent_getter="discovery",
-            )
+            if _USE_A2A_MULTISERVER:
+                from agent_servers.a2a_orchestrator import call_discovery as _a2a_discovery
+                print(f"INFO: [{session_id}] Calling discovery via A2A HTTP")
+                discovery_response = await _a2a_discovery(
+                    session_id=session_id,
+                    csv_path=csv_path,
+                    output_folder=output_folder,
+                    profile_summary=profile_summary,
+                    policy_context=policy_context,
+                    confidence_warning=_confidence_warning,
+                )
+            else:
+                discovery_response = await run_agent_pipeline(
+                    f"{session_id}_discovery",
+                    discovery_prompt,
+                    agent_getter="discovery",
+                )
 
-            plan = get_analysis_plan(session_id)
+            if _USE_A2A_MULTISERVER:
+                # Discovery ran on a separate process  - read plan from file cache
+                try:
+                    _plan_cache_path = os.path.join(output_folder, "_plan_cache.json")
+                    with open(_plan_cache_path, "r", encoding="utf-8") as _pcf:
+                        plan = json.load(_pcf)
+                    print(f"INFO: [A2A] loaded plan cache: {len(plan.get('dag', []))} nodes")
+                except Exception as _pce:
+                    print(f"WARNING: [A2A] plan cache read failed: {_pce}")
+                    plan = None
+            else:
+                plan = get_analysis_plan(session_id)
 
             if not plan or not plan.get("dag"):
                 return {
@@ -411,92 +601,75 @@ async def run_full_pipeline(
         from tools.monitor import check_failure_threshold
         check_failure_threshold(session_id, results["total"], len(results["failed"]))
 
-        # Build synthesis prompt via shared helper (also used by /rerun-synthesis — #5)
+        # A2A mode: write node results to file so critic server can build fact_sheet
+        if _USE_A2A_MULTISERVER:
+            try:
+                _results_payload = {
+                    aid: res for aid, res in state.results.items()
+                    if isinstance(res, dict) and res.get("status") == "success"
+                }
+                _results_cache_path = os.path.join(output_folder, "_results_cache.json")
+                with open(_results_cache_path, "w", encoding="utf-8") as _rcf:
+                    json.dump(_results_payload, _rcf)
+                print(f"INFO: [A2A] results cache written: {len(_results_payload)} nodes for {session_id}")
+            except Exception as _rce:
+                print(f"WARNING: [A2A] results cache write failed: {_rce}")
+
+        # Build synthesis prompt via shared helper (also used by /rerun-synthesis  - #5)
         synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag)
 
-        # --- Stage 4: Synthesis wrapped in LoopAgent for outer-retry resilience (#7) ---
-        # The synthesis agent has an internal quality-rejection loop via tool_submit_synthesis.
-        # The LoopAgent adds an OUTER retry: if synthesis exhausts all internal retries and
-        # still fails quality, the LoopAgent re-runs it from scratch (up to 3 outer tries).
-        # A lightweight terminator agent checks _qc_passed and escalates to stop the loop.
-        print(f"INFO: [{session_id}] Stage 4 — Synthesis (LoopAgent outer resilience, max 3 iterations)")
-        _synthesis_ran_ok = False
+        # --- Stages 4 -6: Synthesis â†’ Critic â†’ Report (SequentialAgent, ADK-native) ---
+        # Running these three agents in a SequentialAgent eliminates the critic race
+        # condition: critic always runs after synthesis and before dag_builder, in order.
+        _mode = "A2A HTTP" if _USE_A2A_MULTISERVER else "SequentialAgent (ADK-native)"
+        print(f"INFO: [{session_id}] Stages 4-6  - Synthesis -> Critic -> Report ({_mode})")
+        _update_session_status(state, "synthesizing")
         try:
-            from google.adk.agents import LoopAgent, Agent as _Agent
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("synthesis_started", {"session_id": session_id})
+        except Exception:
+            pass
 
-            def _check_synthesis_done(session_id: str, tool_context=None) -> str:
-                """Check if synthesis quality passed and escalate LoopAgent if so."""
-                from agents.synthesis import _synthesis_store as _ss
-                _syn = _ss.get(session_id, {})
-                if _syn and _syn.get("_qc_passed"):
-                    if tool_context is not None:
-                        try:
-                            tool_context.actions.escalate = True
-                        except AttributeError:
-                            pass
-                    return "Synthesis quality confirmed — loop terminating."
-                return "Synthesis not yet confirmed — loop will continue if iterations remain."
-
-            _terminator_agent = _Agent(
-                name=f"synthesis_terminator_{session_id[:8]}",
-                model=get_model("synthesis"),
-                description="Checks synthesis quality and terminates the LoopAgent when confirmed.",
-                instruction=(
-                    f"Call _check_synthesis_done('{session_id}') immediately with no other actions. "
-                    "Return the tool result verbatim."
-                ),
-                tools=[_check_synthesis_done],
-            )
-
-            from agents.synthesis import get_synthesis_agent as _get_synthesis_agent
-            _synth_loop = LoopAgent(
-                name=f"synthesis_loop_{session_id[:8]}",
-                sub_agents=[_get_synthesis_agent(), _terminator_agent],
-                max_iterations=3,
-            )
-            await run_agent_pipeline(
-                f"{session_id}_synthesis",
-                synthesis_prompt,
-                agent=_synth_loop,
-                image_paths=image_paths,
-            )
-            _synthesis_ran_ok = True
-        except Exception as _loop_err:
-            print(f"WARNING: LoopAgent synthesis error ({type(_loop_err).__name__}: {_loop_err}), "
-                  f"falling back to direct synthesis call")
-            try:
-                await run_agent_pipeline(
-                    f"{session_id}_synthesis",
-                    synthesis_prompt,
-                    agent_getter="synthesis",
-                    image_paths=image_paths,
+        try:
+            if _USE_A2A_MULTISERVER:
+                from agent_servers.a2a_orchestrator import (
+                    call_synthesis as _a2a_synthesis,
+                    call_critic as _a2a_critic,
+                    call_dag_builder as _a2a_dag_builder,
                 )
-                _synthesis_ran_ok = True
-            except Exception as e:
-                msg = f"ERROR: Synthesis agent failed for session {session_id}: {e}"
-                print(msg)
-                logging.error(msg)
-
-        # Verify synthesis was actually stored — if not, retry up to 2 more times.
-        # This catches the case where the agent returned but hit a rate limit internally
-        # and never called tool_submit_synthesis (so _synthesis_store is still empty).
-        from agents.synthesis import _synthesis_store as _ss_check
-        _syn_retry = 0
-        while not _ss_check.get(session_id) and _syn_retry < 2:
-            _syn_retry += 1
-            _wait = 30 * _syn_retry
-            print(f"WARNING: Synthesis not in store after run — waiting {_wait}s then retrying "
-                  f"(attempt {_syn_retry}/2)")
-            await asyncio.sleep(_wait)
-            try:
-                await run_agent_pipeline(
-                    f"{session_id}_synthesis_retry{_syn_retry}",
-                    synthesis_prompt,
-                    agent_getter="synthesis",
-                    image_paths=image_paths,
+                print(f"INFO: [{session_id}] Calling synthesis via A2A HTTP")
+                await _a2a_synthesis(session_id, output_folder, synthesis_prompt)
+                print(f"INFO: [{session_id}] Calling critic via A2A HTTP")
+                await _a2a_critic(session_id)
+                print(f"INFO: [{session_id}] Calling dag_builder via A2A HTTP")
+                await _a2a_dag_builder(session_id, output_folder)
+            else:
+                post_dag_prompt = (
+                    f"Session ID: {session_id}\n"
+                    f"Output folder: {output_folder}\n"
+                    f"{synthesis_prompt}\n\n"
+                    f"After synthesizing, review the synthesis for quality, then build the HTML report "
+                    f"by calling tool_build_report(session_id='{session_id}', output_folder='{output_folder}')."
                 )
-            except Exception as _sr_err:
-                print(f"WARNING: Synthesis retry {_syn_retry} failed: {_sr_err}")
+                await asyncio.wait_for(
+                    run_agent_pipeline(
+                        f"{session_id}_post_dag",
+                        post_dag_prompt,
+                        agent=get_post_dag_agent(),
+                        image_paths=image_paths,
+                        max_turns=150,  # synthesis+critic+dag_builder need headroom
+                    ),
+                    timeout=900.0,
+                )
+        except asyncio.TimeoutError:
+            msg = f"ERROR: Post-DAG pipeline timed out (>900s) for session {session_id}"
+            print(msg)
+            logging.error(msg)
+        except Exception as e:
+            msg = f"ERROR: Post-DAG pipeline failed for session {session_id}: {type(e).__name__}: {e}"
+            print(msg)
+            logging.error(msg)
 
         # Push synthesis SSE event
         try:
@@ -506,118 +679,51 @@ async def run_full_pipeline(
         except Exception:
             pass
 
-        # --- Stage 4.5: Adversarial Critic Review (#8) — NON-BLOCKING ---
-        # Fired as a background task so dag_builder runs immediately.
-        # Uses Flash model (higher RPM) to avoid rate-limiting the main pipeline.
-        # When critic finishes it injects its result into _synthesis_store directly.
-        async def _run_critic_bg(sid: str):
-            try:
-                from agents.critic import get_critic_store_result
-                _crit_prompt = (
-                    f"session_id: {sid}\n"
-                    "Review the synthesis for this session. "
-                    "Call tool_get_synthesis_for_critique first, "
-                    "then submit your critique via tool_submit_critique."
-                )
-                await run_agent_pipeline(
-                    f"{sid}_critic",
-                    _crit_prompt,
-                    agent_getter="critic",
-                    max_turns=8,
-                )
-                _crit = get_critic_store_result(sid)
-                if _crit:
-                    print(f"INFO: [Critic BG] approved={_crit.get('approved')}, "
-                          f"challenges={len(_crit.get('challenges', []))}")
-                    from agents.synthesis import _synthesis_store as _ss
-                    if sid in _ss:
-                        _ss[sid]["_critic_review"] = _crit
-                else:
-                    print(f"INFO: [Critic BG] No result for {sid}")
-            except Exception as _ce:
-                print(f"WARNING: [Critic BG] Failed (non-fatal): {type(_ce).__name__}: {_ce}")
+        if _USE_A2A_MULTISERVER:
+            import os as _os
+            _expected = _os.path.join(output_folder, "report.html")
+            if _os.path.exists(_expected):
+                report = {"status": "success", "report_path": _expected}
+            else:
+                report = {"status": "error", "error": f"A2A DAG Builder failed to synthesize report.html for {session_id}"}
+        else:
+            from agents.dag_builder import get_report_result
+            report = get_report_result(session_id)
+            
+        report_path = report.get("report_path") if report else None
 
-        print(f"INFO: [{session_id}] Stage 4.5 — Adversarial Critic (background, Flash model)")
-        _critic_task = asyncio.create_task(_run_critic_bg(session_id))
-
-        # Wait for state.synthesis to be populated before building the report.
-        # The synthesis LLM may need 2 turns (first call fails, retries succeed),
-        # and run_agent_pipeline returns after the first final response — which may
-        # be the failed call. This poll ensures we capture the successful retry.
-        _synthesis_wait_secs = 0
-        while not bool(state.synthesis) and _synthesis_wait_secs < 8:
-            # Also try to recover from _synthesis_store directly on each tick
+        # Bug-10: if dag_builder returned an error (e.g. synthesis was missing),
+        # push a specific SSE error event so the frontend can show a clear message
+        # instead of silently spinning on a missing report.
+        if not report or report.get("status") == "error":
+            _report_err = (report.get("error", "Report not generated") if report
+                           else "dag_builder returned no result")
+            print(f"ERROR: [{session_id}] Report build failed: {_report_err}")
             try:
-                from agents.synthesis import get_synthesis_result
-                _stored = get_synthesis_result(session_id)
-                if _stored:
-                    state.synthesis = _stored
-                    print(f"INFO: Orchestrator recovered synthesis from _synthesis_store after {_synthesis_wait_secs}s")
-                    break
+                _evt_hook = _pipeline_event_hooks.get(session_id)
+                if _evt_hook:
+                    _evt_hook("report_error", {
+                        "session_id": session_id,
+                        "error": _report_err,
+                    })
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-            _synthesis_wait_secs += 0.5
-        if bool(state.synthesis):
-            print(f"INFO: Synthesis ready after {_synthesis_wait_secs}s wait.")
-        else:
-            print("WARNING: Synthesis not stored after 8s wait — report will have no insights.")
 
-        # --- Smart critic wait: up to 45s, exit as soon as result is stored ---
-        # Critic runs concurrently; we wait here so its result gets into the HTML report.
-        # Flash model is fast (usually 3-8s), so the pipeline almost never waits the full 45s.
+        # Push report_ready BEFORE setting state to "complete" to avoid a race
+        # where the SSE generator sends stream_end before report_ready reaches the frontend.
         try:
-            from agents.critic import get_critic_store_result as _gcsr
-            _critic_wait_secs = 0
-            while _critic_wait_secs < 45:
-                if _gcsr(session_id):
-                    print(f"INFO: Critic result ready after {_critic_wait_secs}s — injecting into report.")
-                    break
-                if _critic_task.done():
-                    break
-                await asyncio.sleep(1)
-                _critic_wait_secs += 1
-            else:
-                print(f"WARNING: Critic did not finish within 45s — report proceeds without critic review.")
-        except Exception as _cw_err:
-            print(f"WARNING: Critic wait error (non-fatal): {_cw_err}")
-
-        _update_session_status(
-            state, "building_report"
-        )
-
-        report_prompt = (
-            f"Session ID: {session_id}\n"
-            f"Output folder: {output_folder}\n"
-            f"Call tool_build_report(session_id, output_folder) now."
-        )
-
-        try:
-            await run_agent_pipeline(
-                f"{session_id}_report",
-                report_prompt,
-                agent_getter="dag_builder",
-            )
-        except Exception as e:
-            msg = f"ERROR: DAG builder agent failed for session {session_id}: {e}"
-            print(msg)
-            logging.error(msg)
-
-        from agents.dag_builder import get_report_result
-        report = get_report_result(session_id)
-        report_path = report.get(
-            "report_path"
-        ) if report else None
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook and report_path:
+                _evt_hook("report_ready", {"session_id": session_id, "report_path": str(report_path)})
+            _pipeline_event_hooks.pop(session_id, None)
+        except Exception:
+            pass
 
         _update_session_status(state, "complete")
 
-        # Push report SSE event (#12)
-        try:
-            _evt_hook = _pipeline_event_hooks.get(session_id)
-            if _evt_hook:
-                _evt_hook("report_ready", {"session_id": session_id, "report_path": str(report_path or "")})
-        except Exception:
-            pass
+        # Clean up per-session in-memory stores to prevent unbounded growth
+        _global_threads.pop(session_id, None)
+        _pipeline_store.pop(session_id, None)
 
         # Group A: Register the schema fingerprint so drift detection works on next run
         try:
@@ -648,7 +754,6 @@ async def run_full_pipeline(
         }
 
     except Exception as e:
-        import traceback
         return {
             "status": "error",
             "error":  str(e),
@@ -675,8 +780,7 @@ async def _execute_dag(
     results      = {}
     max_rounds   = len(dag) + 2
     round_num    = 0
-    completed    = set()
-    failed       = set()
+    # completed/failed sets removed  - A2A message log is sole source of truth
 
     # --- #11: Initialise global reasoning thread for this session ---
     _global_threads[session_id] = []
@@ -709,15 +813,7 @@ async def _execute_dag(
         )
 
         if result.get("status") == "success":
-            pipeline.mark_complete(node_id)
-            completed.add(node_id)
-            results[node_id] = result
-            msg = f"SUCCESS NODE {node_id}: chart={result.get('chart_file_path','NONE')}"
-            print(msg)
-            logging.info(msg)
-            
-            emit(session_id, "node_succeeded", {"node_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path'))})
-            
+            # A2A Phase 2: post message BEFORE marking state to eliminate divergence window
             _post_message(
                 state, "coder_agent", "orchestrator",
                 Intent.ANALYSIS_COMPLETE, session_id,
@@ -727,6 +823,12 @@ async def _execute_dag(
                     "status":        "complete",
                 }
             )
+            pipeline.mark_complete(node_id)
+            results[node_id] = result
+            msg = f"SUCCESS NODE {node_id}: chart={result.get('chart_file_path','NONE')}"
+            print(msg)
+            logging.info(msg)
+            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path'))})
             return True
 
         last_error = result.get("error", "Unknown error")
@@ -737,15 +839,15 @@ async def _execute_dag(
         logging.error(msg)
         emit(session_id, "node_failed_retry_pending", {"node_id": node_id, "error": last_error})
 
-        # ── Stage 4: Self-Correction Hook ──────────────────────────────────
+        # â"€â"€ Stage 4: Self-Correction Hook â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
         # Before blind retry, attempt to auto-correct column role mismatches.
         # Detects TypeError / KeyError patterns and rewrites column_roles
-        # using the LIBRARY_REGISTRY schema — zero extra LLM calls needed.
+        # using the LIBRARY_REGISTRY schema  - zero extra LLM calls needed.
         corrected_node = _attempt_column_role_correction(node, last_error)
         if corrected_node is not node:
             print(f"[Self-Correction] Node {node_id}: column_roles auto-corrected. Retrying with fixed roles.")
             logging.info(f"[Self-Correction] {node_id}: corrected column_roles={corrected_node.get('column_roles')}")
-        # ───────────────────────────────────────────────────────────────────
+        # â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
         retry = await _execute_single_node(
             session_id=session_id,
@@ -758,15 +860,7 @@ async def _execute_dag(
         )
 
         if retry.get("status") == "success":
-            pipeline.mark_complete(node_id)
-            completed.add(node_id)
-            results[node_id] = retry
-            msg = f"SUCCESS NODE {node_id} (retry): chart={retry.get('chart_file_path','NONE')}"
-            print(msg)
-            logging.info(msg)
-            
-            emit(session_id, "node_succeeded", {"node_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path'))})
-            
+            # A2A Phase 2: post message BEFORE marking state
             _post_message(
                 state, "coder_agent", "orchestrator",
                 Intent.ANALYSIS_COMPLETE, session_id,
@@ -779,6 +873,12 @@ async def _execute_dag(
                     "has_chart":     bool(retry.get("chart_file_path")),
                 }
             )
+            pipeline.mark_complete(node_id)
+            results[node_id] = retry
+            msg = f"SUCCESS NODE {node_id} (retry): chart={retry.get('chart_file_path','NONE')}"
+            print(msg)
+            logging.info(msg)
+            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path'))})
             return True
         else:
             msg = (f"ERROR NODE {node_id}: Retry also failed: "
@@ -786,11 +886,14 @@ async def _execute_dag(
                    f"error={retry.get('error', 'no error field')}")
             print(msg)
             logging.error(msg)
-            
             emit(session_id, "node_failed", {"node_id": node_id, "error": retry.get('error', 'no error field')}, severity="error")
-            
+            # A2A Phase 2: post failure message BEFORE marking state
+            _post_message(
+                state, "coder_agent", "orchestrator",
+                Intent.ANALYSIS_FAILED, session_id,
+                {"analysis_id": node_id, "error": retry.get("error", "")},
+            )
             pipeline.mark_failed(node_id)
-            failed.add(node_id)
             for other_node in dag:
                 if node_id in other_node.get("depends_on", []):
                     pipeline.mark_blocked(other_node["id"])
@@ -800,10 +903,10 @@ async def _execute_dag(
           round_num < max_rounds:
         round_num += 1
 
-        ready_nodes = pipeline.get_ready_to_run(
-            list(completed), list(failed)
-        )
-        print(f"INFO READY: {ready_nodes}")
+        _completed_ids = get_completed_analysis_ids(state.message_log)
+        _failed_ids    = get_failed_analysis_ids(state.message_log)
+        ready_nodes    = pipeline.get_ready_to_run(_completed_ids, _failed_ids)
+        print(f"INFO READY: {ready_nodes} (completed={len(_completed_ids)} failed={len(_failed_ids)})")
 
         if not ready_nodes:
             pending = [
@@ -815,32 +918,37 @@ async def _execute_dag(
                     pipeline.mark_blocked(node["id"])
             break
 
-        semaphore = asyncio.Semaphore(2)
-        
+        _max_parallel = int(os.environ.get("MAX_PARALLEL_NODES", "3"))
+        semaphore = asyncio.Semaphore(_max_parallel)
+
         async def run_with_semaphore(nid):
             async with semaphore:
                 return await run_node_with_retry(nid)
                 
         results_list = await asyncio.gather(*(run_with_semaphore(nid) for nid in ready_nodes), return_exceptions=True)
 
-        print(f"INFO DAG: Round complete. "
-              f"completed={len(completed)} "
-              f"failed={len(failed)}")
+        _c = get_completed_analysis_ids(state.message_log)
+        _f = get_failed_analysis_ids(state.message_log)
+        print(f"INFO DAG: Round complete. completed={len(_c)} failed={len(_f)}")
 
         for node_id, result in zip(ready_nodes, results_list):
             if isinstance(result, Exception):
-                import traceback
                 msg = (f"ERROR NODE {node_id}: Unhandled exception: "
                        f"{type(result).__name__}: {result}")
                 print(msg)
                 logging.error(msg)
                 traceback.print_exception(result)
+                # A2A Phase 2: post failure message BEFORE marking state
+                _post_message(
+                    state, "coder_agent", "orchestrator",
+                    Intent.ANALYSIS_FAILED, session_id,
+                    {"analysis_id": node_id, "error": str(result)},
+                )
                 pipeline.mark_failed(node_id)
-                failed.add(node_id)
 
     return {
-        "completed": list(completed),
-        "failed":    list(failed),
+        "completed": get_completed_analysis_ids(state.message_log),
+        "failed":    get_failed_analysis_ids(state.message_log),
         "total":     len(dag),
     }
 
@@ -891,6 +999,15 @@ async def _execute_single_node(
         )
         if os.path.exists(enriched):
             effective_csv = enriched
+
+    # --- Proactive Column Guard ---
+    # Validate column_roles against actual CSV headers BEFORE execution.
+    # Fixes typos, wrong case, and LLM-hallucinated column names via fuzzy matching.
+    # This eliminates most KeyError failures before they happen.
+    if column_roles:
+        column_roles = _validate_column_roles_against_csv(column_roles, effective_csv)
+        # Propagate the fix back to the node dict so retry also uses corrected names
+        node = {**node, "column_roles": column_roles}
 
     # --- #6: A2A Dependency Awareness ---
     # Built BEFORE the library/custom code split so ALL nodes (library-based
@@ -950,7 +1067,10 @@ async def _execute_single_node(
     ):
         for lib_type, entry in LIBRARY_REGISTRY.items():
             if entry["function"] == library_fn:
-                code = _build_library_call_code(lib_type, column_roles)
+                _extra = {}
+                if node.get("cohort_window"):
+                    _extra["cohort_window"] = node["cohort_window"]
+                code = _build_library_call_code(lib_type, column_roles, _extra)
                 break
 
     if not code:
@@ -975,7 +1095,6 @@ async def _execute_single_node(
             agent_getter="coder",
         )
 
-        import re
         code_match = re.search(r"```python\s*(.*?)\s*```", response, re.DOTALL)
         code = code_match.group(1) if code_match else response.strip()
 
@@ -992,13 +1111,21 @@ async def _execute_single_node(
         if not val["valid"]:
              return {"status": "error", "error": f"Validation failed: {val['issues']}"}
 
-        result = execute_analysis(
+        _exec_fn = functools.partial(
+            execute_analysis,
             code=code,
             csv_path=effective_csv,
             analysis_id=analysis_id,
             analysis_type=analysis_type,
             output_folder=output_folder,
         )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, _exec_fn),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            return {"status": "error", "error": "Execution timed out after 120s"}
 
         qual = validate_output_quality(result, analysis_type)
         if not qual["quality_pass"]:
@@ -1007,14 +1134,57 @@ async def _execute_single_node(
         submit_result(session_id, analysis_id, analysis_type, result)
         state.store_result(analysis_id, result)
 
+        # --- #10b: user_segmentation cluster naming ---
+        # After segmentation results are stored, fire a small LLM call that reads
+        # each cluster's characteristics and returns a human-readable segment name.
+        # The names are written back into result["data"]["segment_names"] in-place.
+        if analysis_type == "user_segmentation":
+            try:
+                _segments = (result.get("data") or {}).get("segments", [])
+                if _segments:
+                    _seg_descriptions = []
+                    for _seg in _segments[:8]:
+                        _seg_descriptions.append(
+                            f"Cluster {_seg.get('cluster_id', '?')}: "
+                            f"size={_seg.get('size', 0)}, "
+                            f"top_events={_seg.get('top_events', [])[:3]}, "
+                            f"mean_depth={_seg.get('mean_depth', 0)}"
+                        )
+                    _seg_prompt = (
+                        "You are naming user segments from a behavioral clustering analysis.\n"
+                        "For each cluster below, return ONE short, descriptive name (2-4 words).\n"
+                        "Names should reflect the user behavior pattern, not the numbers.\n"
+                        "Examples: 'Power Users', 'Window Shoppers', 'One-Time Visitors'.\n\n"
+                        + "\n".join(_seg_descriptions)
+                        + "\n\nReturn ONLY a JSON object: {\"0\": \"name\", \"1\": \"name\", ...}"
+                    )
+                    _seg_resp = await _llm_generate_with_retry(
+                        contents=_seg_prompt,
+                        model=get_model("coder"),
+                        label=f"{analysis_id}/seg-naming",
+                    )
+                    if _seg_resp:
+                        _seg_text = _seg_resp.text.strip()
+                        _seg_match = re.search(r'\{[^}]+\}', _seg_text, re.DOTALL)
+                        if _seg_match:
+                            _seg_names = json.loads(_seg_match.group())
+                            result["data"]["segment_names"] = _seg_names
+                            # Also annotate each segment dict
+                            for _seg in _segments:
+                                _cid = str(_seg.get("cluster_id", ""))
+                                if _cid in _seg_names:
+                                    _seg["name"] = _seg_names[_cid]
+                            state.store_result(analysis_id, result)
+                            print(f"INFO: [{analysis_id}] Segment names assigned: {_seg_names}")
+            except Exception as _seg_err:
+                print(f"WARNING: [{analysis_id}] Cluster naming failed: {_seg_err}")
+
         # --- #10: Per-node decision-maker insight ---
         # Immediately after the node result is stored, ask the LLM one focused
         # question: "what should a decision-maker act on from this result?"
         # Stored as insight_summary.decision_maker_takeaway and fed to synthesis
         # so it starts from pre-digested meaning, not raw numbers.
         try:
-            import google.genai as _genai
-            _dm_client = _genai.Client()
             _key_data = {
                 k: v for k, v in result.get("data", {}).items()
                 if isinstance(v, (int, float, str, bool)) and v is not None
@@ -1025,17 +1195,24 @@ async def _execute_single_node(
                 f"Key metrics: {json.dumps(_key_data, default=str)[:400]}\n"
                 + (_parent_context if _parent_context else "")
                 + (_global_ctx if _global_ctx else "")
-                + "\nWrite ONE sentence only — what is the single most important thing "
+                + "\nWrite ONE sentence only  - what is the single most important thing "
                 "a business decision-maker needs to act on from this result? "
                 "Be specific. Cite the actual number. "
                 "If prior analyses are shown above, connect this finding to the broader pattern. "
                 "Do not start with 'The analysis shows' or 'Based on'."
             )
-            _dm_resp = _dm_client.models.generate_content(
-                model=get_model("coder"),
+            _dm_resp = await _llm_generate_with_retry(
                 contents=_dm_prompt,
+                model=get_model("coder"),
+                label=f"{analysis_id}/dm-insight",
             )
             _dm_text = _dm_resp.text.strip().split('\n')[0]
+            # Enforce single-sentence constraint  - split on ". " to avoid
+            # cutting on decimal numbers (e.g. "3.5%") or abbreviations.
+            _parts = re.split(r'\.\s+', _dm_text)
+            _dm_text = _parts[0].strip()
+            if not _dm_text.endswith('.'):
+                _dm_text += '.'
 
             # Store on result and update state
             if not isinstance(result.get("insight_summary"), dict):
@@ -1109,7 +1286,7 @@ async def execute_single_analysis(
     state,
 ) -> dict:
     """
-    Public wrapper — execute one analysis node independently.
+    Public wrapper  - execute one analysis node independently.
     Used by the /add-metric and /retry endpoints in main.py.
     """
     from main import run_agent_pipeline
@@ -1133,23 +1310,32 @@ async def execute_single_analysis(
     )
 
 
-def _build_library_call_code(analysis_type: str, column_roles: dict) -> str:
+def _build_library_call_code(
+    analysis_type: str,
+    column_roles: dict,
+    extra_kwargs: dict = None,
+) -> str:
     """Build deterministic Python code to call a library function."""
     entry = LIBRARY_REGISTRY.get(analysis_type)
     if not entry:
         return ""
-    
+
     fn = entry["function"]
     args = []
     args.append("csv_path=csv_path")
-    
+
     for key, val in column_roles.items():
         if val:
             if key in entry["required_args"]:
                 args.append(f"{key}='{val}'")
-            
+
+    # Pass optional keyword arguments (e.g. cohort_window) when present
+    if extra_kwargs:
+        for k, v in extra_kwargs.items():
+            args.append(f"{k}='{v}'")
+
     arg_str = ", ".join(args)
-    
+
     code = (
         "import pandas as pd\n"
         "import numpy as np\n"
@@ -1175,8 +1361,6 @@ def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
     Returns a corrected node dict (copy) if a fix was found,
     or the original node object if no correction could be determined.
     """
-    import copy, re
-
     analysis_type = node.get("analysis_type", "")
     column_roles = node.get("column_roles", {})
     entry = LIBRARY_REGISTRY.get(analysis_type, {})
@@ -1201,7 +1385,7 @@ def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
             if existing_values:
                 corrected_roles[missing_arg] = existing_values[0]
                 fix_applied = True
-                print(f"[Self-Correction] Fixed missing arg '{missing_arg}' → '{existing_values[0]}'")
+                print(f"[Self-Correction] Fixed missing arg '{missing_arg}' â†’ '{existing_values[0]}'")
 
     # Pattern 2: Unexpected keyword argument (wrong role key name)
     unexpected_match = re.search(
@@ -1216,7 +1400,7 @@ def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
                 if req_arg not in corrected_roles:
                     corrected_roles[req_arg] = value
                     fix_applied = True
-                    print(f"[Self-Correction] Remapped '{bad_key}' → '{req_arg}' = '{value}'")
+                    print(f"[Self-Correction] Remapped '{bad_key}' â†’ '{req_arg}' = '{value}'")
                     break
 
     # Pattern 3: Ensure all required args are present (fill from existing values)
@@ -1233,6 +1417,65 @@ def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
 
     corrected = copy.deepcopy(node)
     corrected["column_roles"] = corrected_roles
+    return corrected
+
+
+def _validate_column_roles_against_csv(column_roles: dict, csv_path: str) -> dict:
+    """
+    Proactive column-name guard: checks every value in column_roles against the
+    actual CSV headers and fixes mismatches using fuzzy matching (difflib).
+
+    This runs BEFORE code execution  - it catches hallucinated column names that
+    the self-correction engine would only catch AFTER a failed attempt.
+
+    Returns a (possibly corrected) copy of column_roles.
+    If the CSV can't be read or roles are empty, returns the original unchanged.
+    """
+    if not column_roles or not csv_path:
+        return column_roles
+
+    try:
+        import pandas as _pd
+        actual_cols = list(_pd.read_csv(csv_path, nrows=0).columns)
+    except Exception:
+        return column_roles  # Can't validate  - don't block execution
+
+    if not actual_cols:
+        return column_roles
+
+    actual_lower = {c.lower(): c for c in actual_cols}  # for case-insensitive lookup
+    corrected = copy.copy(column_roles)
+    fixed = False
+
+    for role_key, col_name in column_roles.items():
+        if not isinstance(col_name, str) or not col_name:
+            continue
+        # Exact match  - fine
+        if col_name in actual_cols:
+            continue
+        # Case-insensitive match
+        if col_name.lower() in actual_lower:
+            canonical = actual_lower[col_name.lower()]
+            corrected[role_key] = canonical
+            fixed = True
+            print(f"[ColGuard] '{col_name}' â†’ '{canonical}' (case fix for role '{role_key}')")
+            logging.info(f"[ColGuard] case fix: '{col_name}' â†’ '{canonical}'")
+            continue
+        # Fuzzy match (Levenshtein-like via difflib)
+        matches = difflib.get_close_matches(col_name, actual_cols, n=1, cutoff=0.6)
+        if matches:
+            corrected[role_key] = matches[0]
+            fixed = True
+            print(f"[ColGuard] '{col_name}' â†’ '{matches[0]}' (fuzzy fix for role '{role_key}')")
+            logging.info(f"[ColGuard] fuzzy fix: '{col_name}' â†’ '{matches[0]}'")
+        else:
+            # No close match  - log a warning but don't block; the executor will surface the error
+            print(f"[ColGuard] WARNING: '{col_name}' (role '{role_key}') not found in CSV headers "
+                  f"and no close match found. CSV has: {actual_cols[:10]}")
+            logging.warning(f"[ColGuard] unresolved column: '{col_name}' for role '{role_key}'")
+
+    if not fixed:
+        return column_roles
     return corrected
 
 
@@ -1347,8 +1590,6 @@ def get_root_agent():
         from agents.profiler    import get_profiler_agent
         from agents.discovery   import get_discovery_agent
         from agents.coder       import get_coder_agent
-        from agents.synthesis   import get_synthesis_agent
-        from agents.dag_builder import get_dag_builder_agent
 
         _root_agent_instance = Agent(
             name="orchestrator",
@@ -1368,8 +1609,9 @@ def get_root_agent():
                 get_profiler_agent(),
                 get_discovery_agent(),
                 get_coder_agent(),
-                get_synthesis_agent(),
-                get_dag_builder_agent(),
             ],
         )
     return _root_agent_instance
+
+
+

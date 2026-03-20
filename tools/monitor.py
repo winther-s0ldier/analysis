@@ -1,14 +1,3 @@
-"""
-monitor.py — Lightweight In-Process Event Bus
-=============================================
-Provides a simple, session-scoped event stream for monitoring
-pipeline health, node failures, and synthesis quality.
-
-Events are stored in-memory (and eventually dumped to session state/report)
-so the user doesn't need external monitoring tools (Datadog/Sentry) for
-a local run.
-"""
-
 from typing import Dict, List, Any
 from datetime import datetime
 

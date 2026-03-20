@@ -1,8 +1,3 @@
-"""
-CSV Profiler Tool — reads a CSV and produces a raw factual profile.
-NO decision logic. NO metric suggestions. Just facts about the data.
-The Discovery Agent reasons over these facts to decide what analyses to run.
-"""
 import pandas as pd
 from typing import Any
 
@@ -23,6 +18,11 @@ def profile_csv(csv_path: str) -> dict:
     """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(csv_path, low_memory=False, encoding="latin-1")
+        except Exception as e:
+            return {"error": f"Failed to read CSV (encoding fallback failed): {str(e)}"}
     except Exception as e:
         return {"error": f"Failed to read CSV: {str(e)}"}
 

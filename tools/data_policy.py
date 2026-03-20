@@ -1,22 +1,3 @@
-"""
-data_policy.py — Stage 4 Policy Engine
-=======================================
-Loads a lightweight policy configuration (policy.json) and applies it
-to bias the Discovery DAG selection and Orchestrator behavior.
-
-Policy file format (data/policy.json):
-{
-    "focus": "revenue",           // revenue | retention | quality | engagement | none
-    "max_nodes": 8,               // cap on DAG nodes (default: 10)
-    "required_analyses": [],      // analysis types that MUST appear in every DAG
-    "excluded_analyses": [],      // analysis types to always skip
-    "outcome_col_override": null  // force a specific column as outcome_col
-}
-
-Usage:
-    from tools.data_policy import get_active_policy, apply_policy_to_dag
-"""
-
 import os
 import json
 from typing import Optional

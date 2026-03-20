@@ -1,10 +1,3 @@
-"""
-Code Executor — pure Python utilities for code validation,
-execution, chart generation, and result management.
-Extracted from agents/coder.py so agents stay thin.
-
-No LLM reasoning. No Analytics dependencies.
-"""
 import os
 import sys
 import ast

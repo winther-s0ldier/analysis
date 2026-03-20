@@ -1,9 +1,3 @@
-"""
-workflow_loader.py — Declarative YAML parser
-============================================
-Loads `data/workflow.yaml` to dynamically inject custom analyses
-into the LIBRARY_REGISTRY, and fetch dataset-specific policy overrides.
-"""
 import os
 import sys
 import yaml
