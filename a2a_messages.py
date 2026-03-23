@@ -416,9 +416,11 @@ class PipelineState:
             status = self.get_status(aid)
             if status in (NodeStatus.PENDING, NodeStatus.BLOCKED):
                 depends_on = node_data.get("depends_on") or [] if isinstance(node_data, dict) else []
-                if any(dep in failed_set for dep in depends_on):
-                    continue
-                if all(dep in completed_set for dep in depends_on):
+                # Treat failed dependencies as satisfied — dependent nodes run on raw data.
+                # This prevents session_detection failure from cascading and blocking all
+                # behavioral analyses, which gracefully fall back to the unenriched CSV.
+                resolved_set = completed_set | failed_set
+                if all(dep in resolved_set for dep in depends_on):
                     ready.append(aid)
         return ready
 

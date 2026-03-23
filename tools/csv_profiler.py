@@ -118,15 +118,9 @@ def profile_csv(csv_path: str) -> dict:
         "memory_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
     }
 
-    semantic_map = infer_column_semantics(result)
-    classification = classify_dataset(result, semantic_map)
-    result.update(classification)
-    result["semantic_map"] = semantic_map
-
-    print(f"INFO PROFILER: entity_col={result.get('column_roles',{}).get('entity_col')}")
-    print(f"INFO PROFILER: time_col={result.get('column_roles',{}).get('time_col')}")
-    print(f"INFO PROFILER: event_col={result.get('column_roles',{}).get('event_col')}")
-    print(f"INFO PROFILER: dataset_type={result.get('dataset_type')}")
+    # Semantic mapping and dataset classification are handled by the Profiler LLM Agent.
+    # The deprecated stubs below returned empty/wrong defaults and were overwriting
+    # whatever the LLM correctly populated — removed to fix profile corruption.
 
     return result
 

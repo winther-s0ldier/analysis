@@ -2,6 +2,7 @@ import os
 import sys
 import ast
 import json
+import logging
 import traceback
 from typing import Optional
 
@@ -83,8 +84,8 @@ def check_precomputed_result(
             precomputed = state.get_precomputed(analysis_type)
             if precomputed:
                 return {"exists": True, "result": precomputed}
-    except Exception:
-        pass
+    except Exception as _pre_err:
+        logging.warning(f"Precomputed result lookup failed for {analysis_type}: {_pre_err}")
     return {"exists": False, "result": None}
 
 
@@ -242,6 +243,11 @@ def execute_analysis(
             )
             if chart_path:
                 result["chart_file_path"] = chart_path
+                print(f"INFO: [{analysis_id}] Chart generated: {chart_path}")
+            else:
+                print(f"WARNING: [{analysis_id}] generate_chart() returned None despite chart_ready_data being present")
+        else:
+            print(f"INFO: [{analysis_id}] No chart_ready_data — skipping chart generation")
 
         flat = {
             "execution_status": "success",
@@ -379,8 +385,8 @@ def submit_result(
                 session_id=session_id,
             )
             state.post_message(msg)
-    except Exception:
-        pass
+    except Exception as _msg_err:
+        logging.warning(f"Failed to post ANALYSIS_COMPLETE message for {analysis_id}: {_msg_err}")
 
     return f"Result stored for {analysis_id} ({analysis_type}) in session {session_id}."
 
@@ -403,7 +409,19 @@ def generate_chart(
         output_folder = os.path.abspath(output_folder)
         os.makedirs(output_folder, exist_ok=True)
 
+        # Normalize generic chart type names the LLM may produce to internal handler names
+        _TYPE_ALIASES = {
+            "bar":       "bar_chart",
+            "scatter":   "generic_scatter",
+            "line":      "generic_line",
+            "histogram": "histogram_box",
+            "pie":       "pie_chart",
+            "donut":     "pie_chart",
+            "grouped_bar": "bar_chart",
+            "stacked_bar": "bar_chart",
+        }
         chart_type = chart_ready_data.get("type", "")
+        chart_type = _TYPE_ALIASES.get(chart_type, chart_type)
         print(f"DEBUG: Generating chart '{chart_type}' for {analysis_id} ({analysis_type}) -> {output_folder}")
         fig = None
 
@@ -808,12 +826,53 @@ def generate_chart(
                     hovertemplate="%{label}<br>%{value:,} sessions (%{percent})<extra></extra>",
                 ))
 
+        elif chart_type == "generic_scatter":
+            x = chart_ready_data.get("x", chart_ready_data.get("labels", []))
+            y = chart_ready_data.get("y", chart_ready_data.get("values", []))
+            if x and y:
+                fig = go.Figure(go.Scatter(
+                    x=x, y=y, mode="markers+lines",
+                    marker=dict(size=6, color="#6366F1"),
+                    hovertemplate="%{x}: %{y}<extra></extra>",
+                ))
+
+        elif chart_type == "generic_line":
+            x = chart_ready_data.get("x", chart_ready_data.get("labels", chart_ready_data.get("times", [])))
+            y = chart_ready_data.get("y", chart_ready_data.get("values", []))
+            if x and y:
+                fig = go.Figure(go.Scatter(
+                    x=x, y=y, mode="lines+markers",
+                    line=dict(color="#6366F1"),
+                    hovertemplate="%{x}: %{y}<extra></extra>",
+                ))
+
+        # ── Universal fallback: attempt to build a chart from any labels/values data ──
+        if fig is None:
+            # Try to auto-detect chart data from common key patterns
+            _labels = (chart_ready_data.get("labels") or chart_ready_data.get("x")
+                       or chart_ready_data.get("categories") or chart_ready_data.get("names") or [])
+            _values = (chart_ready_data.get("values") or chart_ready_data.get("y")
+                       or chart_ready_data.get("counts") or chart_ready_data.get("amounts") or [])
+            if _labels and _values and len(_labels) == len(_values):
+                print(f"INFO: generate_chart — using universal fallback for chart_type='{chart_type}' "
+                      f"(analysis_id={analysis_id})")
+                # If values are all numeric, use bar chart; otherwise scatter
+                try:
+                    [float(v) for v in _values]
+                    fig = go.Figure(go.Bar(
+                        x=_labels, y=_values,
+                        marker_color="#6366F1",
+                        hovertemplate="%{x}: %{y:,}<extra></extra>",
+                    ))
+                except (ValueError, TypeError):
+                    pass
+
         # ─────────────────────────────────────────────────────────────────────
 
         if fig is None:
             print(f"WARNING: generate_chart — no handler for chart_type='{chart_type}' "
                   f"(analysis_id={analysis_id}, analysis_type={analysis_type}). "
-                  f"Add a branch in code_executor.generate_chart() for this type.")
+                  f"Available keys in chart_ready_data: {list(chart_ready_data.keys())}")
             return None
 
         a_title = str(analysis_type or "Analysis").replace('_', ' ').title()

@@ -78,8 +78,10 @@ def register_custom_analyses(library_registry: Dict[str, Any]) -> None:
             
             # Inject into registry
             library_registry[name] = {
-                "function": func_name,         # the orchestrator _execute will look for this...
-                "_direct_fn": func,            # ...or we can stash the ref directly for execution
+                "function":     func_name,      # the orchestrator _execute will look for this...
+                "_direct_fn":   func,           # ...or we can stash the ref directly for execution
+                "_script_dir":  script_dir,     # needed by _build_library_call_code for custom imports
+                "_module_name": module_name,    # module to import from (not tools.analysis_library)
                 "required_args": item.get("required_args", []),
                 "col_role": item.get("col_role", "custom"),
                 "description": item.get("description", "Custom user analysis"),

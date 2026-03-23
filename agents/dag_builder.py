@@ -2,7 +2,10 @@ import os
 import re
 import sys
 import json
+import logging
 from datetime import datetime
+from typing import Annotated
+from pydantic import Field
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..")
@@ -20,7 +23,11 @@ def get_report_result(session_id: str) -> dict | None:
 
 
 
-def tool_build_report(session_id: str, output_folder: str, tool_context=None) -> dict:
+def tool_build_report(
+    session_id: Annotated[str, Field(description="Active pipeline session ID")],
+    output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.")],
+    tool_context=None,
+) -> dict:
     """
     Collect artifacts and assemble the final HTML report in one step.
     """
@@ -29,31 +36,36 @@ def tool_build_report(session_id: str, output_folder: str, tool_context=None) ->
     dataset_type = ""
     csv_filename = ""
 
+    # ── Source 0: in-process session state (only works when NOT in A2A subprocess) ──
+    state = None
     try:
         from main import sessions
         state = sessions.get(session_id)
         if state:
             dataset_type = getattr(state, "dataset_type", "")
             csv_filename = getattr(state, "csv_filename", "")
+            print(f"INFO: dag_builder got session state from main.sessions for {session_id}")
+    except Exception as _imp_err:
+        # Expected in A2A subprocess mode — main.py can't be imported cleanly.
+        # File-based sources below will provide the data instead.
+        print(f"INFO: dag_builder running without main.sessions (A2A mode): {_imp_err}")
 
-        # Source 0: ToolContext state — most reliable when running inside SequentialAgent.
-        # Synthesis and critic both write here before dag_builder runs.
-        if tool_context is not None:
-            try:
-                _tc_synth = tool_context.state.get("synthesis")
-                if _tc_synth:
-                    synthesis = _tc_synth
-                    print(f"INFO: dag_builder got synthesis from ToolContext.state for {session_id}")
-                _tc_critique = tool_context.state.get("critique")
-                if _tc_critique and synthesis:
-                    synthesis["_critic_review"] = _tc_critique
-                    print(f"INFO: dag_builder injected critique from ToolContext.state for {session_id}")
-            except Exception:
-                pass
+    # ── Source 1: ToolContext state (SequentialAgent in-process mode) ──
+    if tool_context is not None:
+        try:
+            _tc_synth = tool_context.state.get("synthesis")
+            if _tc_synth:
+                synthesis = _tc_synth
+                print(f"INFO: dag_builder got synthesis from ToolContext.state for {session_id}")
+            _tc_critique = tool_context.state.get("critique")
+            if _tc_critique and synthesis:
+                synthesis["_critic_review"] = _tc_critique
+                print(f"INFO: dag_builder injected critique from ToolContext.state for {session_id}")
+        except Exception:
+            pass
 
-        # Source 1: _synthesis_store is the most reliable — read it FIRST.
-        # state.synthesis may be empty if the background thread's state reference
-        # differs from what synthesis agent wrote, so don't rely on it alone.
+    # ── Source 2: _synthesis_store (in-process module-level dict) ──
+    if not synthesis:
         try:
             from agents.synthesis import get_synthesis_result
             _store_synth = get_synthesis_result(session_id)
@@ -63,46 +75,61 @@ def tool_build_report(session_id: str, output_folder: str, tool_context=None) ->
         except Exception:
             pass
 
-        # Source 2: fall back to state.synthesis if store was empty
-        if not synthesis and state:
-            synthesis = getattr(state, "synthesis", {}) or {}
-            if synthesis:
-                print(f"INFO: dag_builder got synthesis from state.synthesis for {session_id}")
+    # ── Source 3: state.synthesis (in-process session object) ──
+    if not synthesis and state:
+        synthesis = getattr(state, "synthesis", {}) or {}
+        if synthesis:
+            print(f"INFO: dag_builder got synthesis from state.synthesis for {session_id}")
 
-        # Source 3: file-based cache (output_folder is now an absolute path)
-        if not synthesis:
-            try:
-                _cache_path = os.path.join(output_folder, "_synthesis_cache.json")
-                if os.path.exists(_cache_path):
-                    with open(_cache_path, "r", encoding="utf-8") as _cf:
-                        _file_synth = json.load(_cf)
-                    if _file_synth:
-                        synthesis = _file_synth
-                        print(f"INFO: dag_builder recovered synthesis from file cache for {session_id}")
-            except Exception:
-                pass
+    # ── Source 4: file-based cache (CRITICAL for A2A subprocess mode) ──
+    if not synthesis:
+        try:
+            _cache_path = os.path.join(output_folder, "_synthesis_cache.json")
+            if os.path.exists(_cache_path):
+                with open(_cache_path, "r", encoding="utf-8") as _cf:
+                    _file_synth = json.load(_cf)
+                if _file_synth:
+                    synthesis = _file_synth
+                    print(f"INFO: dag_builder recovered synthesis from file cache for {session_id}")
+        except Exception as _cache_err:
+            print(f"WARNING: dag_builder failed to read _synthesis_cache.json: {_cache_err}")
 
-        # Source 4: A2A mode — inject _critic_cache.json into synthesis if not already present
-        if synthesis and not synthesis.get("_critic_review"):
-            try:
-                _critic_cache_path = os.path.join(output_folder, "_critic_cache.json")
-                if os.path.exists(_critic_cache_path):
-                    with open(_critic_cache_path, "r", encoding="utf-8") as _ccf:
-                        _file_crit = json.load(_ccf)
-                    if _file_crit:
-                        synthesis["_critic_review"] = _file_crit
-                        print(f"INFO: [A2A] dag_builder injected critic review from file cache for {session_id}")
-            except Exception:
-                pass
+    # ── Source 5: inject _critic_cache.json into synthesis if not already present ──
+    if synthesis and not synthesis.get("_critic_review"):
+        try:
+            _critic_cache_path = os.path.join(output_folder, "_critic_cache.json")
+            if os.path.exists(_critic_cache_path):
+                with open(_critic_cache_path, "r", encoding="utf-8") as _ccf:
+                    _file_crit = json.load(_ccf)
+                if _file_crit:
+                    synthesis["_critic_review"] = _file_crit
+                    print(f"INFO: [A2A] dag_builder injected critic review from file cache for {session_id}")
+        except Exception:
+            pass
 
-        if not synthesis:
-            print(f"WARNING: dag_builder found no synthesis for {session_id} — report will have no insights.")
-            return {
-                "status": "error",
-                "error": "Synthesis not available. Cannot build report without insights. Re-run synthesis first.",
-                "session_id": session_id,
-            }
+    # ── Read dataset metadata from file cache when state is unavailable (A2A mode) ──
+    if not dataset_type or not csv_filename:
+        try:
+            _meta_path = os.path.join(output_folder, "_dataset_meta.json")
+            if os.path.exists(_meta_path):
+                with open(_meta_path, "r", encoding="utf-8") as _mf:
+                    _meta = json.load(_mf)
+                dataset_type = _meta.get("dataset_type", dataset_type)
+                csv_filename = _meta.get("csv_filename", csv_filename)
+                print(f"INFO: dag_builder recovered dataset metadata from file cache for {session_id}")
+        except Exception:
+            pass
 
+    if not synthesis:
+        print(f"WARNING: dag_builder found no synthesis for {session_id} — report will have no insights.")
+        return {
+            "status": "error",
+            "error": "Synthesis not available. Cannot build report without insights. Re-run synthesis first.",
+            "session_id": session_id,
+        }
+
+    # ── Collect chart artifacts from session state ──
+    try:
         if state:
             for aid, result in state.results.items():
                 if not isinstance(result, dict):
@@ -122,8 +149,7 @@ def tool_build_report(session_id: str, output_folder: str, tool_context=None) ->
                         "decision_maker_takeaway": _ins_sum.get("decision_maker_takeaway", "") if isinstance(_ins_sum, dict) else "",
                     })
     except Exception as e:
-        print(f"WARNING: dag_builder state read failed: {e}")
-        pass
+        print(f"WARNING: dag_builder state chart collection failed: {e}")
 
     if os.path.exists(output_folder):
         for fname in os.listdir(output_folder):
@@ -150,7 +176,8 @@ def tool_build_report(session_id: str, output_folder: str, tool_context=None) ->
             try:
                 with open(chart_path, "r", encoding="utf-8") as cf:
                     content = cf.read()
-            except Exception: pass
+            except Exception as _cf_err:
+                logging.warning(f"Failed to read chart file {chart_path}: {_cf_err}")
         chart["_embedded_html"] = content
 
     html = _build_report_html(session_id, charts, synthesis, dataset_type, csv_filename)
@@ -182,7 +209,8 @@ def tool_build_report(session_id: str, output_folder: str, tool_context=None) ->
                 session_id=session_id
             )
             state.post_message(msg)
-    except Exception: pass
+    except Exception as _rpt_err:
+        logging.warning(f"Failed to post REPORT_READY message: {_rpt_err}")
     return {"status": "success", **res}
 
 
@@ -306,7 +334,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     else:
         _reliability_badge = ""
 
-    st = synthesis.get("intervention_strategies", {})
+    st = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
     if isinstance(st, list):
         strategies_list = st
     elif isinstance(st, dict):
@@ -334,11 +362,11 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         )
     st_h = "".join(st_chunks)
 
-    pe = synthesis.get("personas", {})
+    pe = synthesis.get("key_segments", synthesis.get("personas", {}))
     if isinstance(pe, list):
         personas_list = pe
     elif isinstance(pe, dict):
-        personas_list = pe.get("personas", [])
+        personas_list = pe.get("segments", pe.get("personas", []))
     else:
         personas_list = []
     pe_chunks = []
@@ -372,12 +400,11 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     for _ins in _all_insights:
         if not isinstance(_ins, dict):
             continue
-        # Scan ai_summary and root_cause_hypothesis for [AX] node citations
+        # Scan ai_summary and root_cause_hypothesis for [AX] / [CX] node citations
         _text = str(_ins.get("ai_summary", "")) + str(_ins.get("root_cause_hypothesis", "")) + str(_ins.get("title", ""))
-        for _m in re.findall(r'\[A(\d+)\]', _text):
-            _nid = f"A{_m}"
-            if _nid not in _insight_index:
-                _insight_index[_nid] = _ins
+        for _m in re.findall(r'\[([AC]\d+)\]', _text):
+            if _m not in _insight_index:
+                _insight_index[_m] = _ins
 
     ch_chunks = []
     for c in charts:
@@ -525,9 +552,9 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         "key_findings":            "Key Findings",
         "detailed_insights":       "Detailed Insights",
         "adversarial_review":      "&#128269; Adversarial Review",
-        "personas":                "User Profiles",
+        "key_segments":            "Key Segments",
         "cross_metric_connections":"Cross-Metric Connections",
-        "intervention_strategies": "Intervention Strategies",
+        "recommendations":         "Recommendations",
         "analysis_charts":         "Analysis Charts",
     }
 
@@ -613,9 +640,9 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     {get_sect_labeled("key_findings", conv_h)}
     {get_sect_labeled("detailed_insights", di_h)}
     {get_sect_labeled("adversarial_review", _critic_h)}
-    {get_sect_labeled("personas", pe_h)}
+    {get_sect_labeled("key_segments", pe_h)}
     {get_sect_labeled("cross_metric_connections", cx_h)}
-    {get_sect_labeled("intervention_strategies", st_h)}
+    {get_sect_labeled("recommendations", st_h)}
     {get_sect_labeled("analysis_charts", ch_h)}
     <div style="text-align:center; color:#aaa; font-size:12px; margin-top:28px; font-family:system-ui,sans-serif;">
         Analytics Report &mdash; {generated}

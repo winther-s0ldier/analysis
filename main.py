@@ -15,22 +15,25 @@ if _raw_key:
 else:
     print("WARNING: Gemini API Key NOT found in environment!")
 
+import time
 import uuid
 import json
 import re
 import asyncio
 import traceback
+from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Body
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from tools.redis_client import get_redis, redis_available
 
 sys.path.insert(0, os.path.dirname(__file__))
 from agents.orchestrator import (
@@ -65,7 +68,63 @@ except ImportError:
         "Install with: pip install kaleido"
     )
 
-app = FastAPI(title="Agentic Analytics", description="Multi-Agent CSV Analytics System")
+_agent_server_procs: list = []
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ────────────────────────────────────────────────────────────────
+    # Restore sessions persisted in Redis from a previous run
+    _restore_sessions_from_redis()
+
+    # Start A2A agent sub-servers when USE_A2A_MULTISERVER is enabled
+    if os.getenv("USE_A2A_MULTISERVER", "true").lower() != "false":
+        import subprocess
+        _server_script = str(Path(__file__).parent / "agent_servers" / "server_base.py")
+        _log_dir = Path(__file__).parent / "logs"
+        _log_dir.mkdir(exist_ok=True)
+        for _agent_name, _port in [("synthesis", 8004), ("critic", 8005), ("dag_builder", 8006)]:
+            try:
+                _log_out = open(_log_dir / f"{_agent_name}.log", "a", encoding="utf-8")
+                proc = subprocess.Popen(
+                    [sys.executable, _server_script, "--agent", _agent_name, "--port", str(_port)],
+                    stdout=_log_out,
+                    stderr=_log_out,
+                )
+                _agent_server_procs.append(proc)
+                print(f"INFO: Started {_agent_name} A2A server (PID {proc.pid}) on port {_port}")
+            except Exception as _e:
+                print(f"WARNING: Could not start {_agent_name} A2A server: {_e}")
+
+    # Start hourly session eviction loop
+    _eviction_task = asyncio.create_task(_cleanup_stale_sessions())
+
+    yield  # ← server is running
+
+    # ── Shutdown ───────────────────────────────────────────────────────────────
+    _eviction_task.cancel()
+
+    for proc in _agent_server_procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    # Multi-worker guard: sessions{} is in-process memory — unsafe across workers
+    # unless Redis is available (Redis becomes the shared source of truth).
+    worker_count = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    if worker_count > 1 and not redis_available():
+        print(
+            f"ERROR: Multiple workers (WEB_CONCURRENCY={worker_count}) require Redis. "
+            f"Either start Redis or set WEB_CONCURRENCY=1."
+        )
+
+
+app = FastAPI(
+    title="Agentic Analytics",
+    description="Multi-Agent CSV Analytics System",
+    lifespan=lifespan,
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- A2A endpoints: root pipeline + each individual agent ---
@@ -143,20 +202,6 @@ async def list_a2a_agents():
     }
 
 
-@app.on_event("startup")
-async def _startup_checks() -> None:
-    """Validate runtime environment on startup."""
-    # Multi-worker guard: sessions{} is in-process memory — sharing it across
-    # multiple workers causes session loss and race conditions. Fail fast.
-    worker_count = int(os.environ.get("WEB_CONCURRENCY", "1"))
-    if worker_count > 1:
-        print(
-            f"ERROR: This server uses in-process session state and cannot run "
-            f"with multiple workers (WEB_CONCURRENCY={worker_count}). "
-            f"Set WEB_CONCURRENCY=1 or remove it."
-        )
-        sys.exit(1)
-
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
@@ -168,6 +213,7 @@ session_service = InMemorySessionService()
 class SessionState:
     def __init__(self, session_id: str):
         self.session_id = session_id
+        self.created_at: float = time.time()   # unix timestamp — used for TTL eviction
         self.csv_path: str = ""
         self.csv_filename: str = ""
         self.output_folder: str = ""
@@ -204,8 +250,7 @@ class SessionState:
         if recipient:
             self._mailbox.setdefault(recipient, []).append(d)
 
-    def get_messages_for(self, recipient: str,
-                          unread_only: bool = False) -> list:
+    def get_messages_for(self, recipient: str) -> list:
         # A2A Phase 2: use indexed mailbox instead of full scan
         return list(self._mailbox.get(recipient, []))
     
@@ -226,21 +271,133 @@ class SessionState:
     
     def to_dict(self) -> dict:
         return {
-            "session_id": self.session_id,
-            "csv_path": self.csv_path,
-            "csv_filename": self.csv_filename,
-            "output_folder": self.output_folder,
-            "status": self.status,
-            "dataset_type": self.dataset_type,
-            "dag": self.dag,
-            "approved_metrics": self.approved_metrics,
-            "results": self.results,
-            "synthesis": self.synthesis,
-            "artifacts": self.artifacts,
-            "message_count": len(self.message_log)
+            "session_id":           self.session_id,
+            "created_at":           self.created_at,
+            "csv_path":             self.csv_path,
+            "csv_filename":         self.csv_filename,
+            "output_folder":        self.output_folder,
+            "status":               self.status,
+            "dataset_type":         self.dataset_type,
+            "dag":                  self.dag,
+            "approved_metrics":     self.approved_metrics,
+            "results":              self.results,
+            "failed_nodes":         list(self.failed_nodes),
+            "synthesis":            self.synthesis,
+            "artifacts":            self.artifacts,
+            "raw_profile":          self.raw_profile,
+            "semantic_map":         self.semantic_map,
+            "discovery":            self.discovery,
+            "gate_result":          self.gate_result,
+            "user_instructions":    self.user_instructions,
+            "conversation_history": self.conversation_history,
+            "message_count":        len(self.message_log),
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionState":
+        state = cls(d["session_id"])
+        state.created_at           = d.get("created_at", time.time())
+        state.csv_path             = d.get("csv_path", "")
+        state.csv_filename         = d.get("csv_filename", "")
+        state.output_folder        = d.get("output_folder", "")
+        state.status               = d.get("status", "uploaded")
+        state.dataset_type         = d.get("dataset_type", "")
+        state.dag                  = d.get("dag", [])
+        state.approved_metrics     = d.get("approved_metrics", [])
+        state.results              = d.get("results", {})
+        state.failed_nodes         = set(d.get("failed_nodes", []))
+        state.synthesis            = d.get("synthesis", {})
+        state.artifacts            = d.get("artifacts", [])
+        state.raw_profile          = d.get("raw_profile", {})
+        state.semantic_map         = d.get("semantic_map", {})
+        state.discovery            = d.get("discovery", {})
+        state.gate_result          = d.get("gate_result", {})
+        state.user_instructions    = d.get("user_instructions", "")
+        state.conversation_history = d.get("conversation_history", [])
+        return state
+
 sessions: Dict[str, SessionState] = {}
+
+_SESSION_TTL = 86400      # 24 hours — Redis TTL
+_SESSION_MAX_AGE = 86400  # 24 hours — in-memory eviction threshold
+_SESSION_PREFIX = "adk:session:"
+
+
+async def _cleanup_stale_sessions() -> None:
+    """Hourly background task: evict sessions older than _SESSION_MAX_AGE from memory.
+
+    Without this the sessions{} dict grows unboundedly — each entry can hold
+    MBs of raw_profile, results, and synthesis data across many sessions.
+    Redis handles its own TTL; this mirrors that behaviour for in-process memory.
+    """
+    while True:
+        await asyncio.sleep(3600)  # run every hour
+        now = time.time()
+        stale = [
+            sid for sid, state in list(sessions.items())
+            if (now - getattr(state, "created_at", now)) > _SESSION_MAX_AGE
+        ]
+        for sid in stale:
+            sessions.pop(sid, None)
+            _sse_events.pop(sid, None)
+            # Evict per-session agent stores that are not self-evicting.
+            # _plan_store and _profile_store use .pop() on read, so they clean
+            # themselves up.  _synthesis_store, _reasoning_store, and _critic_store
+            # use .get() / direct assignment and accumulate indefinitely otherwise.
+            try:
+                from agents.synthesis import _synthesis_store, _reasoning_store
+                _synthesis_store.pop(sid, None)
+                _reasoning_store.pop(sid, None)
+            except Exception as _evict_err:
+                print(f"WARNING: [Eviction] synthesis store cleanup failed for {sid}: {_evict_err}")
+            try:
+                from agents.critic import _critic_store
+                _critic_store.pop(sid, None)
+            except Exception as _evict_err:
+                print(f"WARNING: [Eviction] critic store cleanup failed for {sid}: {_evict_err}")
+        if stale:
+            print(f"INFO: [Eviction] Removed {len(stale)} stale session(s) from memory")
+
+
+def _redis_key(session_id: str) -> str:
+    return f"{_SESSION_PREFIX}{session_id}"
+
+
+def _persist_session(state: SessionState) -> None:
+    """Write session state to Redis. No-op if Redis is unavailable."""
+    r = get_redis()
+    if not r:
+        return
+    try:
+        r.set(_redis_key(state.session_id), json.dumps(state.to_dict()), ex=_SESSION_TTL)
+    except Exception as e:
+        print(f"WARNING: Redis persist failed for {state.session_id}: {e}")
+
+
+def _restore_sessions_from_redis() -> None:
+    """On startup, reload any sessions persisted in Redis into the in-memory dict."""
+    r = get_redis()
+    if not r:
+        return
+    try:
+        keys = r.keys(f"{_SESSION_PREFIX}*")
+        restored = 0
+        for key in keys:
+            raw = r.get(key)
+            if not raw:
+                continue
+            try:
+                d = json.loads(raw)
+                state = SessionState.from_dict(d)
+                sessions[state.session_id] = state
+                restored += 1
+            except Exception as e:
+                print(f"WARNING: Could not restore session from Redis key {key}: {e}")
+        if restored:
+            print(f"INFO: Restored {restored} session(s) from Redis")
+    except Exception as e:
+        print(f"WARNING: Redis session restore failed: {e}")
+
 
 # --- #12: SSE event store — thread-safe list per session ---
 # Background pipeline thread appends events; SSE endpoint reads them.
@@ -264,10 +421,20 @@ async def _pipeline_watchdog(session_id: str) -> None:
 
 
 def push_sse_event(session_id: str, event_type: str, data: dict) -> None:
-    """Push a real-time event to the SSE stream for a session."""
+    """Push a real-time event to the SSE stream for a session.
+
+    Sanitizes data through JSON round-trip with default=str to convert
+    numpy/pandas types that would crash the SSE generator's json.dumps.
+    """
     if session_id not in _sse_events:
         _sse_events[session_id] = []
-    _sse_events[session_id].append({"type": event_type, "data": data})
+    # Sanitize: round-trip through JSON to convert non-serializable types
+    # (numpy int64, float64, pandas Timestamp, etc.) to plain Python types.
+    try:
+        clean_data = json.loads(json.dumps(data, default=str))
+    except Exception:
+        clean_data = {}
+    _sse_events[session_id].append({"type": event_type, "data": clean_data})
 
 
 async def run_agent_pipeline(
@@ -327,8 +494,10 @@ async def run_agent_pipeline(
         for img_path in image_paths:
             if os.path.exists(img_path):
                 try:
-                    with open(img_path, "rb") as f:
-                        img_bytes = f.read()
+                    def _read_img(p=img_path):
+                        with open(p, "rb") as f:
+                            return f.read()
+                    img_bytes = await asyncio.to_thread(_read_img)
                     
                     mime_type = "image/png"
                     if img_path.lower().endswith(".html"):
@@ -400,6 +569,8 @@ async def run_agent_pipeline(
                 "429" in error_str or "rate" in error_str
                 or "exhausted" in error_str or "quota" in error_str
                 or "resource_exhausted" in error_str
+                or "503" in error_str or "unavailable" in error_str
+                or "high demand" in error_str or "overloaded" in error_str
             )
             if is_rate_limit:
                 if attempt < max_retries - 1:
@@ -412,8 +583,7 @@ async def run_agent_pipeline(
                     continue
                 else:
                     print(f"Rate limit exhausted after {max_retries} attempts")
-                    import json as _json_fallback
-                    return _json_fallback.dumps({"status": "error", "error": f"API rate limit exceeded after {max_retries} retries."})
+                    return json.dumps({"status": "error", "error": f"API rate limit exceeded after {max_retries} retries."})
             raise
 
     return final_response
@@ -471,7 +641,7 @@ async def upload_csv(file: UploadFile = File(...)):
     session_id = str(uuid.uuid4())
     
     file_basename = file.filename.rsplit(".", 1)[0]
-    safe_folder = file_basename.replace(" ", "_").replace("-", "_").strip()[:80]
+    safe_folder = re.sub(r'[^\w]', '_', file_basename).strip('_')[:80]
     output_folder = safe_folder
     if (OUTPUT_DIR / output_folder).exists():
         output_folder = f"{safe_folder}_{session_id[:6]}"
@@ -480,8 +650,10 @@ async def upload_csv(file: UploadFile = File(...)):
     saved_file_path = UPLOAD_DIR / f"{output_folder}{ext}"
 
     content = await file.read()
-    with open(saved_file_path, "wb") as f:
-        f.write(content)
+    def _write_upload():
+        with open(saved_file_path, "wb") as f:
+            f.write(content)
+    await asyncio.to_thread(_write_upload)
 
     norm_result = normalize_file(str(saved_file_path.resolve()))
 
@@ -568,6 +740,7 @@ async def profile_dataset(session_id: str):
     state.semantic_map = profiler_data.get("classification", {})
     state.dataset_type = state.semantic_map.get("dataset_type", "")
     state.status = "profiled"
+    _persist_session(state)
 
     from a2a_messages import create_message, Intent
     msg = create_message(
@@ -716,6 +889,7 @@ async def discover_metrics(session_id: str):
     state.status = "discovered"
     state.discovery = discovery_data
     state.dag = discovery_data.get("dag", [])
+    _persist_session(state)
 
     return {
         "session_id": session_id,
@@ -747,8 +921,17 @@ async def validate_metric(session_id: str, request: Request):
         f"Available columns: {json.dumps([c['name'] + ' (' + c['type_category'] + ', ' + str(c['unique_count']) + ' unique)' for c in profile.get('columns', [])])}\n\n"
         f"The user wants to add a custom metric: \"{custom_metric}\"\n\n"
         f"Can this analysis be performed with the available data?\n"
-        f"Respond with ONLY a JSON object: "
-        f'{{\"valid\": true/false, \"reason\": \"...\", \"metric_name\": \"...\", \"description\": \"...\", \"analysis_type\": \"...\"}}'
+        f"Respond with ONLY a JSON object with these exact keys:\n"
+        f'- "valid": true or false\n'
+        f'- "reason": why it is or is not feasible\n'
+        f'- "metric_name": short display name for the analysis\n'
+        f'- "description": one sentence describing the insight\n'
+        f'- "analysis_type": snake_case identifier (e.g. "weekly_batch_patterns")\n'
+        f'- "column_roles": object mapping role keys to exact column names from the available columns list above '
+        f'(e.g. {{"time_col": "created_at", "value_col": "amount"}}). Use only column names that exist in the data. '
+        f'Use standard role keys: time_col, value_col, entity_col, event_col, category_col, group_col, col, col_a, col_b.\n\n'
+        f'Example: {{"valid": true, "reason": "...", "metric_name": "Weekly Batch Patterns", "description": "...", '
+        f'"analysis_type": "weekly_batch_patterns", "column_roles": {{"time_col": "created_at", "value_col": "amount"}}}}'
     )
 
     response = await run_agent_pipeline(
@@ -761,7 +944,8 @@ async def validate_metric(session_id: str, request: Request):
 
 class AnalyzeRequest(BaseModel):
     request: Optional[str] = "Analyze all metrics"
-    custom_metrics: Optional[List[str]] = []
+    custom_metrics: Optional[List[str]] = []      # legacy: kept for backwards compat
+    custom_nodes: Optional[List[dict]] = []        # structured node specs from UI
     approved_metrics: Optional[List[str]] = None
     user_instructions: Optional[str] = ""
 
@@ -785,20 +969,13 @@ async def run_pipeline_background(
             state=state,
         )
         print(f"INFO: Result: {result.get('status')}")
+        _persist_session(state)
     except Exception as e:
         print(f"ERROR: {str(e)}")
         traceback.print_exc()
         state.status = "error"
+        _persist_session(state)
 
-
-def run_pipeline_sync(
-    session_id, csv_path, output_folder,
-    approved, state
-):
-    asyncio.run(run_pipeline_background(
-        session_id, csv_path, output_folder,
-        approved, state
-    ))
 
 @app.post("/analyze/{session_id}")
 async def analyze(
@@ -821,11 +998,40 @@ async def analyze(
             detail=f"Analysis already in progress (status: {state.status}). Wait for it to complete."
         )
 
-    metrics = req_body.approved_metrics or req_body.custom_metrics
+    metrics = req_body.approved_metrics or req_body.custom_metrics or None
     output_folder_path = state.output_folder
 
     if req_body.user_instructions:
         state.user_instructions = req_body.user_instructions
+
+    # Append user-defined custom nodes to the DAG before the pipeline starts.
+    # The orchestrator sees them as regular DAG nodes and executes them normally.
+    if req_body.custom_nodes:
+        existing_ids = {n.get("id") for n in (state.dag or [])}
+        appended_ids = []
+        for cn in req_body.custom_nodes:
+            node_id = cn.get("id") or f"C{len(state.dag) + 1}"
+            if node_id not in existing_ids:          # guard against double-submit
+                state.dag.append({
+                    "id":            node_id,
+                    "analysis_type": cn.get("analysis_type", "custom"),
+                    "description":   cn.get("description", ""),
+                    "name":          cn.get("name") or cn.get("analysis_type", "Custom Analysis"),
+                    "column_roles":  cn.get("column_roles", {}),
+                    "depends_on":    [],
+                    "priority":      cn.get("priority", "medium"),
+                })
+                existing_ids.add(node_id)
+                appended_ids.append(node_id)
+        print(f"INFO: {len(appended_ids)} custom node(s) appended to DAG for {session_id}")
+
+        # Include custom node IDs in approved_metrics so the orchestrator's
+        # DAG filter (approved_metrics whitelist) does not discard them.
+        # BUT: if metrics is None, that means "run ALL" — don't restrict it.
+        # The custom nodes are already appended to state.dag, so they'll be
+        # included when the orchestrator runs the full DAG unfiltered.
+        if appended_ids and metrics is not None:
+            metrics = list(metrics) + appended_ids
 
     print(f"Starting pipeline for {session_id}")
     print(f"csv_path: {state.csv_path}")
@@ -834,7 +1040,7 @@ async def analyze(
         print(f"user_instructions: {state.user_instructions}")
 
     background_tasks.add_task(
-        run_pipeline_sync,
+        run_pipeline_background,
         session_id=session_id,
         csv_path=state.csv_path,
         output_folder=output_folder_path,
@@ -923,22 +1129,42 @@ async def get_status(session_id: str):
             status_code=404,
             detail="Session not found"
         )
+    # Layer 1: live pipeline state from the orchestrator store.
+    # get_pipeline_status reads _pipeline_store which tracks running/blocked in real-time.
+    live = get_pipeline_status(session_id)
+    live_statuses = live.get("node_statuses", {})   # includes "running" and "blocked"
+
+    # Layer 2: merge with SessionState for any node not yet in the pipeline store
+    # (e.g. between /discover and /analyze, or after a Redis restore).
     node_statuses = {}
     failed = getattr(state, "failed_nodes", set())
-    if hasattr(state, "dag") and state.dag:
+    if state.dag:
         for node in state.dag:
             nid = node.get("id", "")
-            if nid in failed:
+            if nid in live_statuses:
+                node_statuses[nid] = live_statuses[nid]  # running / blocked / complete / failed
+            elif nid in failed:
                 node_statuses[nid] = "failed"
             elif nid in state.results:
                 node_statuses[nid] = "complete"
             else:
                 node_statuses[nid] = "pending"
 
+    # Include gate results and monitor alerts so callers get the full picture in one request
+    from tools.monitor import get_session_events
+    raw_events = get_session_events(session_id, min_severity="warning")
+    alerts = [{"event": e.get("type", "unknown"), "data": e.get("payload", {})} for e in raw_events]
+
     return {
         "session_id":     session_id,
         "session_status": state.status,
-        "pipeline":       {"node_statuses": node_statuses},
+        "progress_pct":   live.get("progress_pct", 0),
+        "pipeline": {
+            "node_statuses": node_statuses,
+            "is_complete":   live.get("is_complete", False),
+        },
+        "gate_result":    getattr(state, "gate_result", {}),
+        "alerts":         alerts,
         "result_count":   len(state.results),
         "has_synthesis":  bool(state.synthesis),
         "has_report": any(
@@ -965,7 +1191,11 @@ async def sse_stream(session_id: str, request: Request):
             # Yield any new events since last check
             new_events = events[last_index:]
             for ev in new_events:
-                yield f"data: {json.dumps(ev)}\n\n".encode("utf-8")
+                try:
+                    yield f"data: {json.dumps(ev, default=str)}\n\n".encode("utf-8")
+                except Exception:
+                    # Skip malformed events — don't let one bad event kill the stream
+                    yield f"data: {json.dumps({'type': ev.get('type', 'unknown'), 'data': {}})}\n\n".encode("utf-8")
             last_index += len(new_events)
             # Check terminal condition: pipeline done AND all events sent
             state = sessions.get(session_id)
@@ -980,7 +1210,6 @@ async def sse_stream(session_id: str, request: Request):
                 yield b": keepalive\n\n"
             await asyncio.sleep(0.4)
 
-    from fastapi.responses import StreamingResponse
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -1086,10 +1315,7 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
             traceback.print_exc()
             state.status = "error"
 
-    def _sync_rerun():
-        asyncio.run(_do_rerun())
-
-    background_tasks.add_task(_sync_rerun)
+    background_tasks.add_task(_do_rerun)
     return {
         "status": "rerunning",
         "session_id": session_id,
@@ -1098,14 +1324,235 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
     }
 
 
+async def _classify_chat_intent(message: str) -> str:
+    """Lightweight LLM classification: is this a new analysis request or a question?
+
+    Returns 'analysis' or 'question'.
+    """
+    classification_prompt = (
+        "You are a message intent classifier for a data analytics platform.\n"
+        "The user has already run an analysis pipeline and is now chatting.\n\n"
+        "Classify this message as ONE of:\n"
+        "- 'analysis' — the user wants to run a NEW analysis, compute a new metric, "
+        "  create a new chart, or investigate something not already in the results. "
+        "  Examples: 'analyze retention by cohort', 'show me churn by region', "
+        "  'can you compute average revenue per user', 'break down sessions by device type'\n"
+        "- 'question' — the user is asking about EXISTING results, wants an explanation, "
+        "  summary, recommendation, or general conversation. "
+        "  Examples: 'what does the churn rate mean?', 'summarize the top findings', "
+        "  'what should we fix first?', 'explain the anomaly in A3'\n\n"
+        f"User message: \"{message}\"\n\n"
+        "Respond with ONLY the word 'analysis' or 'question'. Nothing else."
+    )
+    try:
+        resp = await run_agent_pipeline(
+            f"_intent_classify_{uuid.uuid4().hex[:8]}",
+            classification_prompt,
+            agent_getter="chat",
+            max_turns=1,
+        )
+        intent = (resp or "").strip().lower().rstrip(".")
+        if "analysis" in intent:
+            return "analysis"
+        return "question"
+    except Exception:
+        return "question"  # Default to safe Q&A mode on failure
+
+
+async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
+    """Execute a new analysis from a chat message. Returns response dict."""
+    profile      = getattr(state, "raw_profile", {}) or {}
+    dataset_type = getattr(state, "dataset_type", "unknown")
+
+    # ── Step 1: Validate the metric via discovery LLM ──────────────────
+    col_lines = []
+    for c in profile.get("columns", []):
+        line = f"  - {c['name']} ({c.get('type_category', 'unknown')}, {c.get('unique_count', '?')} unique"
+        samples = c.get("sample_values", [])
+        if samples:
+            line += f", e.g. {samples[:3]}"
+        line += ")"
+        col_lines.append(line)
+    col_block = "\n".join(col_lines) if col_lines else "  (no profile available)"
+
+    validation_prompt = (
+        f"Dataset type: {dataset_type}\n"
+        f"Available columns:\n{col_block}\n\n"
+        f"User's analysis request: \"{message}\"\n\n"
+        f"TASK:\n"
+        f"1. Determine if this analysis can be performed with the columns listed above.\n"
+        f"2. If feasible: map the required column roles from the ACTUAL column names above, "
+        f"pick the closest analysis_type from the known library types, "
+        f"and write a 2-sentence description of what will be computed and what insight it reveals.\n"
+        f"3. If not feasible: list exactly what data or column types are missing.\n\n"
+        f"Known analysis_type values (use the closest match, or 'custom' if none fit):\n"
+        f"session_detection, funnel_analysis, friction_detection, survival_analysis, "
+        f"user_segmentation, transition_analysis, dropout_analysis, sequential_pattern_mining, "
+        f"association_rules, distribution_analysis, categorical_analysis, correlation_matrix, "
+        f"anomaly_detection, missing_data_analysis, trend_analysis, cohort_analysis, "
+        f"rfm_analysis, pareto_analysis, event_taxonomy, user_journey_analysis, "
+        f"intervention_triggers, session_classification, contribution_analysis, cross_tab_analysis\n\n"
+        f"Respond with ONLY this JSON (no extra text, no markdown):\n"
+        f'{{"valid": true, "reason": "one sentence", '
+        f'"metric_name": "3-5 word clean name", '
+        f'"description": "2 sentences: what is computed and what insight it reveals", '
+        f'"analysis_type": "exact type or custom", '
+        f'"column_roles": {{"entity_col": "col_name or null", "time_col": "col_name or null", '
+        f'"event_col": "col_name or null", "outcome_col": "col_name or null"}}, '
+        f'"missing_requirements": []}}'
+    )
+
+    validation = {}
+    try:
+        val_response = await run_agent_pipeline(
+            f"{session_id}_chat_validate",
+            validation_prompt,
+            agent_getter="discovery",
+        )
+        validation = extract_json(val_response) or {}
+        print(f"INFO: Chat analysis validation for '{message[:40]}': "
+              f"valid={validation.get('valid')} type={validation.get('analysis_type')}")
+    except Exception as ve:
+        print(f"WARNING: Chat analysis validation failed: {ve}")
+
+    # ── Step 2: If invalid, return explanation ─────────────────────────
+    if validation.get("valid") is False:
+        missing = validation.get("missing_requirements", [])
+        reason  = validation.get("reason", "This analysis cannot be performed with the available data.")
+        missing_text = ""
+        if missing:
+            missing_text = "\n\nMissing data: " + ", ".join(missing)
+        return {
+            "session_id": session_id,
+            "response": f"I can't run that analysis — {reason}{missing_text}",
+            "analysis_status": "unsupported",
+        }
+
+    # ── Step 3: Execute the analysis ───────────────────────────────────
+    analysis_type = validation.get("analysis_type") or "custom"
+    description   = validation.get("description") or message
+    ai_roles      = validation.get("column_roles") or {}
+    metric_name   = validation.get("metric_name") or message[:40]
+
+    base_roles   = (state.semantic_map or {}).get("column_roles", {})
+    merged_roles = {**base_roles, **{k: v for k, v in ai_roles.items() if v}}
+
+    # Assign next C-number ID
+    existing_c_ids = [
+        aid for aid in (state.results or {}).keys()
+        if aid.startswith("C")
+    ]
+    next_c = len(existing_c_ids) + 1
+    analysis_id = f"C{next_c}"
+    output_folder = state.output_folder
+
+    # Push SSE node_started so frontend shows it in the terminal
+    push_sse_event(session_id, "node_started", {
+        "node_id": analysis_id,
+        "analysis_type": analysis_type,
+        "description": description,
+    })
+
+    try:
+        from agents.orchestrator import execute_single_analysis
+        result = await execute_single_analysis(
+            session_id=session_id,
+            analysis_type=analysis_type,
+            analysis_id=analysis_id,
+            csv_path=state.csv_path,
+            output_folder=output_folder,
+            description=description,
+            column_roles=merged_roles,
+            state=state,
+        )
+
+        if result.get("status") == "success":
+            # Add to state.dag
+            if not hasattr(state, "dag") or state.dag is None:
+                state.dag = []
+            existing_ids = {n.get("id") for n in state.dag}
+            if analysis_id not in existing_ids:
+                state.dag.append({
+                    "id":            analysis_id,
+                    "analysis_type": result.get("analysis_type", analysis_type),
+                    "description":   description,
+                    "name":          metric_name,
+                    "column_roles":  merged_roles,
+                    "depends_on":    [],
+                    "priority":      "high",
+                })
+
+            # Push SSE node_complete so chart renders in real-time (if SSE still active)
+            push_sse_event(session_id, "node_complete", {
+                "analysis_id": analysis_id,
+                "analysis_type": result.get("analysis_type", analysis_type),
+                "top_finding": result.get("top_finding", ""),
+                "severity": result.get("severity", "info"),
+                "chart_file_path": result.get("chart_file_path"),
+            })
+
+            finding = result.get("top_finding", "")
+            narrative = result.get("data", {}).get("narrative", {}) if isinstance(result.get("data"), dict) else {}
+            ins_sum   = result.get("insight_summary", {}) or {}
+
+            return {
+                "session_id":  session_id,
+                "response": (
+                    f"✓ **{metric_name}** analysis complete ({analysis_id}).\n\n"
+                    f"**Finding:** {finding}\n\n"
+                    f"The chart card should appear above. You can ask me about the results "
+                    f"or request another analysis."
+                ),
+                "analysis_status": "success",
+                "analysis_id": analysis_id,
+                # Include full chart payload so frontend can render even if SSE is disconnected
+                "chart": {
+                    "id":                     analysis_id,
+                    "analysisType":           result.get("analysis_type", analysis_type),
+                    "finding":                finding,
+                    "hasChart":               bool(result.get("chart_file_path")),
+                    "severity":               result.get("severity", "info"),
+                    "whatItMeans":             narrative.get("what_it_means"),
+                    "recommendation":         ins_sum.get("recommendation"),
+                    "proposedFix":            narrative.get("proposed_fix"),
+                    "decisionMakerTakeaway":  ins_sum.get("decision_maker_takeaway"),
+                    "keyFinding":             ins_sum.get("key_finding"),
+                    "topValues":              ins_sum.get("top_values"),
+                    "anomalies":              ins_sum.get("anomalies"),
+                },
+            }
+        else:
+            # Push failure event
+            push_sse_event(session_id, "node_failed", {
+                "node_id": analysis_id,
+                "error": result.get("error", "Analysis execution failed"),
+            })
+            return {
+                "session_id": session_id,
+                "response": f"The analysis could not be completed: {result.get('error', 'unknown error')}. Try rephrasing or request a different metric.",
+                "analysis_status": "error",
+            }
+    except Exception as e:
+        push_sse_event(session_id, "node_failed", {
+            "node_id": analysis_id,
+            "error": str(e),
+        })
+        return {
+            "session_id": session_id,
+            "response": f"Analysis execution failed: {str(e)}",
+            "analysis_status": "error",
+        }
+
+
 @app.post("/chat/{session_id}")
 async def chat(session_id: str, request: Request):
     """
-    Two-mode chat:
+    Three-mode chat:
     - Pre-pipeline: stores message as user_instructions for the next run.
-    - Post-pipeline: routes to the dedicated chat_agent with the full
-      context (synthesis, all findings, column profile). Never triggers
-      the analysis pipeline.
+    - Post-pipeline analysis request: validates, executes, and renders a new
+      analysis chart via SSE (reuses /add-metric logic).
+    - Post-pipeline question: routes to the dedicated chat_agent with the full
+      context (synthesis, all findings, column profile).
     """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
@@ -1131,7 +1578,16 @@ async def chat(session_id: str, request: Request):
             ),
         }
 
-    # ── Post-pipeline: answer from full context via chat_agent ───────────
+    # ── Post-pipeline: classify intent ───────────────────────────────────
+    # Only attempt analysis routing if the pipeline has completed
+    if state.status in ("complete", "synthesized", "analyzing", "error"):
+        intent = await _classify_chat_intent(message)
+        print(f"INFO: Chat intent for '{message[:50]}': {intent}")
+
+        if intent == "analysis":
+            return await _run_chat_analysis(session_id, state, message)
+
+    # ── Post-pipeline Q&A: answer from full context via chat_agent ───────
     context_parts = []
 
     # 1. Dataset basics
@@ -1371,6 +1827,20 @@ async def add_metric(session_id: str, request: Request):
         )
 
         if result.get("status") == "success":
+            # Add the custom node to state.dag so synthesis and report include it
+            if not hasattr(state, "dag") or state.dag is None:
+                state.dag = []
+            existing_ids = {n.get("id") for n in state.dag}
+            if analysis_id not in existing_ids:
+                state.dag.append({
+                    "id":            analysis_id,
+                    "analysis_type": result.get("analysis_type", analysis_type),
+                    "description":   description,
+                    "name":          validation.get("metric_name", metric_text[:40]),
+                    "column_roles":  merged_roles,
+                    "depends_on":    [],
+                    "priority":      "high",
+                })
             return {
                 "session_id":  session_id,
                 "status":      "success",
@@ -1544,10 +2014,13 @@ async def get_report(session_id: str):
 @app.get("/output/{folder_name}/{filename}")
 async def serve_artifact(folder_name: str, filename: str):
     """Serve a generated artifact file (HTML charts, PNGs, reports)."""
-    filepath = OUTPUT_DIR / folder_name / filename
+    filepath = (OUTPUT_DIR / folder_name / filename).resolve()
+    # Prevent path traversal — ensure the resolved path stays under OUTPUT_DIR
+    if not str(filepath).startswith(str(OUTPUT_DIR.resolve())):
+        raise HTTPException(403, "Access denied")
     if not filepath.exists():
         raise HTTPException(404, "File not found")
-    
+
     if filename.endswith(".html"):
         return FileResponse(filepath, media_type="text/html")
     return FileResponse(filepath)
@@ -1564,83 +2037,6 @@ async def list_sessions():
     }
 
 
-@app.get("/api/session/{session_id}/status")
-async def api_get_pipeline_status(session_id: str):
-    """
-    Returns real-time pipeline status for the frontend grid panel.
-    Includes node pass/fail states, gate results, and monitor alerts.
-    """
-    state = sessions.get(session_id)
-    if not state:
-        raise HTTPException(status_code=404, detail="Session not found")
-        
-    from tools.monitor import get_session_events
-    raw_events = get_session_events(session_id, min_severity="warning")
-    
-    events = []
-    for e in raw_events:
-        events.append({
-            "event": e.get("type", "unknown"),
-            "data": e.get("payload", {})
-        })
-    
-    node_status_list = []
-    if hasattr(state, "dag") and state.dag:
-        for node in state.dag:
-            nid = node["id"]
-            if nid in state.results:
-                res = state.results[nid]
-                if isinstance(res, dict) and res.get("status") == "error":
-                    status = "failed"
-                    error = res.get("error") or res.get("top_finding") or "Execution failed"
-                else:
-                    status = "complete"
-                    error = ""
-            elif hasattr(state, "failed_nodes") and nid in state.failed_nodes:
-                status = "failed"
-                error = "Execution failed"
-            else:
-                status = "pending"
-                error = ""
-
-            node_status_list.append({
-                "id": nid,
-                "type": node.get("analysis_type", "unknown"),
-                "status": status,
-                "error": error
-            })
-            
-    raw_response = {
-        "session_id": session_id,
-        "pipeline_status": state.status,
-        "gate_result": getattr(state, "gate_result", {}),
-        "alerts": events,
-        "nodes": node_status_list,
-    }
-
-    # Sanitize the entire response in one pass — catches numpy.float64, datetime,
-    # coroutine objects, or any other non-JSON-serializable type via default=str.
-    try:
-        return json.loads(json.dumps(raw_response, default=str))
-    except Exception as _e:
-        # Absolute fallback — return minimal safe response
-        return {
-            "session_id": session_id,
-            "pipeline_status": state.status,
-            "gate_result": {},
-            "alerts": [],
-            "nodes": [],
-        }
-
-
-
-def _get_file_type(filename: str) -> str:
-    ext = filename.rsplit(".", 1)[-1].lower()
-    type_map = {
-        "png": "chart", "jpg": "chart", "svg": "chart",
-        "html": "report", "json": "data", "py": "code"
-    }
-    return type_map.get(ext, "other")
 
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")

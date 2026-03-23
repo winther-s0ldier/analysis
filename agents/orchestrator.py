@@ -6,7 +6,6 @@ import math
 import copy
 import asyncio
 import logging
-import random
 import difflib
 import functools
 import traceback
@@ -425,6 +424,18 @@ async def run_full_pipeline(
             state.semantic_map = profiler_data.get("classification", {})
             state.dataset_type = profiler_data.get("classification", {}).get("dataset_type", "")
 
+        # Write dataset metadata to file so A2A dag_builder subprocess can access it
+        try:
+            import json as _json_meta
+            _meta_path = os.path.join(output_folder, "_dataset_meta.json")
+            with open(_meta_path, "w", encoding="utf-8") as _mf:
+                _json_meta.dump({
+                    "dataset_type": getattr(state, "dataset_type", ""),
+                    "csv_filename": getattr(state, "csv_filename", ""),
+                }, _mf, indent=2)
+        except Exception as _meta_err:
+            logging.warning(f"[{session_id}] Meta JSON write failed: {_meta_err}")
+
         _post_message(
             state, "profiler_agent", "discovery_agent",
             Intent.PROFILE_COMPLETE, session_id,
@@ -601,6 +612,24 @@ async def run_full_pipeline(
         from tools.monitor import check_failure_threshold
         check_failure_threshold(session_id, results["total"], len(results["failed"]))
 
+        # Early exit: if zero results succeeded, skip synthesis entirely
+        _successful_count = len([
+            r for r in state.results.values()
+            if isinstance(r, dict) and r.get("status") == "success"
+        ])
+        if _successful_count == 0:
+            print(f"ERROR: [{session_id}] All {results['total']} analyses failed. Skipping synthesis.")
+            _update_session_status(state, "error")
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("stream_end", {
+                    "session_id": session_id,
+                    "status": "error",
+                    "error": "All analyses failed — likely due to API rate limiting. Please retry when the API is available.",
+                })
+            _pipeline_event_hooks.pop(session_id, None)
+            return {"status": "error", "error": "All analyses failed", "session_id": session_id}
+
         # A2A mode: write node results to file so critic server can build fact_sheet
         if _USE_A2A_MULTISERVER:
             try:
@@ -624,12 +653,40 @@ async def run_full_pipeline(
         _mode = "A2A HTTP" if _USE_A2A_MULTISERVER else "SequentialAgent (ADK-native)"
         print(f"INFO: [{session_id}] Stages 4-6  - Synthesis -> Critic -> Report ({_mode})")
         _update_session_status(state, "synthesizing")
+
+        # Give the frontend 2s to receive and render the last node_complete
+        # chart cards before the synthesis message pushes them out of view.
+        await asyncio.sleep(2.0)
+
         try:
             _evt_hook = _pipeline_event_hooks.get(session_id)
             if _evt_hook:
-                _evt_hook("synthesis_started", {"session_id": session_id})
-        except Exception:
-            pass
+                # Include completed node data so the frontend can back-fill any
+                # chart cards whose node_complete SSE events were missed.
+                _synth_nodes_payload = []
+                if state and hasattr(state, "results"):
+                    for _aid, _r in state.results.items():
+                        if isinstance(_r, dict) and _r.get("status") == "success":
+                            _synth_nodes_payload.append({
+                                "analysis_id":             _aid,
+                                "analysis_type":            _r.get("analysis_type", ""),
+                                "top_finding":              _r.get("top_finding", ""),
+                                "chart_path":               bool(_r.get("chart_file_path")),
+                                "severity":                 _r.get("severity", "info"),
+                                "what_it_means":            _r.get("data", {}).get("narrative", {}).get("what_it_means", ""),
+                                "recommendation":           _r.get("insight_summary", {}).get("recommendation", ""),
+                                "proposed_fix":             _r.get("data", {}).get("narrative", {}).get("proposed_fix", ""),
+                                "key_finding":              _r.get("insight_summary", {}).get("key_finding", ""),
+                                "top_values":               _r.get("insight_summary", {}).get("top_values", ""),
+                                "anomalies":                _r.get("insight_summary", {}).get("anomalies", ""),
+                                "decision_maker_takeaway":  _r.get("insight_summary", {}).get("decision_maker_takeaway", ""),
+                            })
+                _evt_hook("synthesis_started", {
+                    "session_id": session_id,
+                    "completed_nodes": _synth_nodes_payload,
+                })
+        except Exception as _synth_start_err:
+            logging.warning(f"[{session_id}] synthesis_started SSE failed: {_synth_start_err}")
 
         try:
             if _USE_A2A_MULTISERVER:
@@ -671,13 +728,70 @@ async def run_full_pipeline(
             print(msg)
             logging.error(msg)
 
-        # Push synthesis SSE event
+        # Stream narrative as progressive chunks, then fire synthesis_complete
         try:
             _evt_hook = _pipeline_event_hooks.get(session_id)
             if _evt_hook:
-                _evt_hook("synthesis_complete", {"session_id": session_id})
-        except Exception:
-            pass
+                # Pull the freshly stored synthesis result
+                from agents.synthesis import get_synthesis_result as _get_syn
+                _syn = _get_syn(session_id) or (state.synthesis if hasattr(state, "synthesis") else {}) or {}
+                _narrative = (_syn.get("conversational_report") or "").strip()
+
+                if _narrative:
+                    import re as _re
+                    # Split on markdown h1/h2 headers ("# Foo") or HTML equivalents
+                    _sections = _re.split(r'(?=\n#{1,2} |<h[12][\s>])', _narrative)
+                    _sections = [s for s in _sections if s.strip()]
+                    if len(_sections) < 2:
+                        # Fallback: divide into 4 roughly equal chunks
+                        _sz = max(len(_narrative) // 4, 200)
+                        _sections = [_narrative[i:i + _sz] for i in range(0, len(_narrative), _sz)]
+
+                    for _ci, _section in enumerate(_sections):
+                        _evt_hook("synthesis_chunk", {
+                            "chunk":  _section,
+                            "index":  _ci,
+                            "first":  _ci == 0,
+                            "total":  len(_sections),
+                        })
+                        if _ci < len(_sections) - 1:
+                            # Space chunks across SSE poll windows (poll = 0.4 s)
+                            await asyncio.sleep(0.45)
+
+                # Include every completed node's chart info directly so the
+                # frontend can back-fill chart cards synchronously — no extra
+                # HTTP round-trip means cards appear before report_ready fires.
+                _completed_nodes_payload = []
+                if state and hasattr(state, "results"):
+                    for _aid, _r in state.results.items():
+                        if isinstance(_r, dict) and _r.get("status") == "success":
+                            _completed_nodes_payload.append({
+                                "analysis_id":             _aid,
+                                "analysis_type":            _r.get("analysis_type", ""),
+                                "top_finding":              _r.get("top_finding", ""),
+                                "chart_path":               bool(_r.get("chart_file_path")),
+                                "severity":                 _r.get("severity", "info"),
+                                "what_it_means":            _r.get("data", {}).get("narrative", {}).get("what_it_means", ""),
+                                "recommendation":           _r.get("insight_summary", {}).get("recommendation", ""),
+                                "proposed_fix":             _r.get("data", {}).get("narrative", {}).get("proposed_fix", ""),
+                                "key_finding":              _r.get("insight_summary", {}).get("key_finding", ""),
+                                "top_values":               _r.get("insight_summary", {}).get("top_values", ""),
+                                "anomalies":                _r.get("insight_summary", {}).get("anomalies", ""),
+                                "decision_maker_takeaway":  _r.get("insight_summary", {}).get("decision_maker_takeaway", ""),
+                            })
+                _evt_hook("synthesis_complete", {
+                    "session_id":      session_id,
+                    "completed_nodes": _completed_nodes_payload,
+                })
+        except Exception as _se:
+            print(f"WARNING: [{session_id}] synthesis streaming failed: {_se}")
+            # Fallback: bare synthesis_complete so frontend doesn't hang
+            try:
+                _fb = _pipeline_event_hooks.get(session_id)
+                if _fb:
+                    _fb("synthesis_complete", {"session_id": session_id})
+            except Exception as _fb_err:
+                logging.warning(f"[{session_id}] synthesis_complete fallback SSE failed: {_fb_err}")
 
         if _USE_A2A_MULTISERVER:
             import os as _os
@@ -685,7 +799,14 @@ async def run_full_pipeline(
             if _os.path.exists(_expected):
                 report = {"status": "success", "report_path": _expected}
             else:
-                report = {"status": "error", "error": f"A2A DAG Builder failed to synthesize report.html for {session_id}"}
+                # A2A dag_builder failed — fall back to local tool_build_report
+                print(f"WARNING: [{session_id}] A2A report missing — falling back to local tool_build_report")
+                try:
+                    from agents.dag_builder import tool_build_report
+                    report = tool_build_report(session_id, output_folder)
+                except Exception as _fb_err:
+                    print(f"ERROR: [{session_id}] Local tool_build_report fallback also failed: {_fb_err}")
+                    report = {"status": "error", "error": f"Report generation failed: {_fb_err}"}
         else:
             from agents.dag_builder import get_report_result
             report = get_report_result(session_id)
@@ -706,8 +827,8 @@ async def run_full_pipeline(
                         "session_id": session_id,
                         "error": _report_err,
                     })
-            except Exception:
-                pass
+            except Exception as _rpt_err:
+                logging.warning(f"[{session_id}] report_error SSE failed: {_rpt_err}")
 
         # Push report_ready BEFORE setting state to "complete" to avoid a race
         # where the SSE generator sends stream_end before report_ready reaches the frontend.
@@ -716,8 +837,8 @@ async def run_full_pipeline(
             if _evt_hook and report_path:
                 _evt_hook("report_ready", {"session_id": session_id, "report_path": str(report_path)})
             _pipeline_event_hooks.pop(session_id, None)
-        except Exception:
-            pass
+        except Exception as _rpt_sse_err:
+            logging.warning(f"[{session_id}] report_ready SSE failed: {_rpt_sse_err}")
 
         _update_session_status(state, "complete")
 
@@ -802,7 +923,17 @@ async def _execute_dag(
         
         from tools.monitor import emit
         emit(session_id, "node_started", {"node_id": node_id, "analysis_type": node.get("analysis_type")})
-        
+        # Also push via SSE so the terminal card shows "running…" in real time.
+        try:
+            _evt_hook_start = _pipeline_event_hooks.get(session_id)
+            if _evt_hook_start:
+                _evt_hook_start("node_started", {
+                    "node_id":       node_id,
+                    "analysis_type": node.get("analysis_type"),
+                })
+        except Exception as _start_err:
+            logging.warning(f"[{session_id}] node_started SSE for {node_id} failed: {_start_err}")
+
         result = await _execute_single_node(
             session_id=session_id,
             node=node,
@@ -828,7 +959,7 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id}: chart={result.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
-            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path'))})
+            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path')), "analysis_type": result.get("analysis_type") or node.get("analysis_type"), "top_finding": result.get("top_finding", ""), "severity": result.get("severity", "info")})
             return True
 
         last_error = result.get("error", "Unknown error")
@@ -878,7 +1009,7 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id} (retry): chart={retry.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
-            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path'))})
+            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path')), "analysis_type": retry.get("analysis_type") or node.get("analysis_type"), "top_finding": retry.get("top_finding", ""), "severity": retry.get("severity", "info")})
             return True
         else:
             msg = (f"ERROR NODE {node_id}: Retry also failed: "
@@ -887,6 +1018,12 @@ async def _execute_dag(
             print(msg)
             logging.error(msg)
             emit(session_id, "node_failed", {"node_id": node_id, "error": retry.get('error', 'no error field')}, severity="error")
+            try:
+                _evt_hook = _pipeline_event_hooks.get(session_id)
+                if _evt_hook:
+                    _evt_hook("node_failed", {"node_id": node_id, "error": retry.get("error", "no error field")})
+            except Exception as _fail_err:
+                logging.warning(f"[{session_id}] node_failed SSE for {node_id} failed: {_fail_err}")
             # A2A Phase 2: post failure message BEFORE marking state
             _post_message(
                 state, "coder_agent", "orchestrator",
@@ -894,9 +1031,8 @@ async def _execute_dag(
                 {"analysis_id": node_id, "error": retry.get("error", "")},
             )
             pipeline.mark_failed(node_id)
-            for other_node in dag:
-                if node_id in other_node.get("depends_on", []):
-                    pipeline.mark_blocked(other_node["id"])
+            # Do NOT cascade mark_blocked — dependent nodes will run on raw data.
+            # get_ready_to_run treats failed deps as resolved so they proceed.
             return False
 
     while not pipeline.is_complete() and \
@@ -945,6 +1081,17 @@ async def _execute_dag(
                     {"analysis_id": node_id, "error": str(result)},
                 )
                 pipeline.mark_failed(node_id)
+                # Send node_failed SSE so the frontend shows the node as failed
+                # rather than stuck on "waiting" forever.
+                try:
+                    _evt_hook = _pipeline_event_hooks.get(session_id)
+                    if _evt_hook:
+                        _evt_hook("node_failed", {
+                            "node_id": node_id,
+                            "error":   str(result),
+                        })
+                except Exception as _fail_err:
+                    logging.warning(f"[{session_id}] node_failed SSE for {node_id} failed: {_fail_err}")
 
     return {
         "completed": get_completed_analysis_ids(state.message_log),
@@ -1073,6 +1220,16 @@ async def _execute_single_node(
                 code = _build_library_call_code(lib_type, column_roles, _extra)
                 break
 
+    # Fallback: if no library_fn was set on the node dict (e.g. custom nodes
+    # appended by /analyze without a library_function field), try looking up by
+    # analysis_type directly.  This is how custom workflow.yaml analyses get
+    # their registered function called even when the node lacks library_function.
+    if not code and analysis_type in LIBRARY_REGISTRY:
+        _extra = {}
+        if node.get("cohort_window"):
+            _extra["cohort_window"] = node["cohort_window"]
+        code = _build_library_call_code(analysis_type, column_roles, _extra)
+
     if not code:
         prompt = (
             f"Session ID: {session_id}\n"
@@ -1121,7 +1278,7 @@ async def _execute_single_node(
         )
         try:
             result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, _exec_fn),
+                asyncio.get_running_loop().run_in_executor(None, _exec_fn),
                 timeout=120.0,
             )
         except asyncio.TimeoutError:
@@ -1133,6 +1290,13 @@ async def _execute_single_node(
 
         submit_result(session_id, analysis_id, analysis_type, result)
         state.store_result(analysis_id, result)
+
+        # Debug log for every completed node — helps diagnose missing chart cards (Issue 1)
+        print(
+            f"DEBUG NODE [{analysis_id}]: status={result.get('status')} "
+            f"chart={result.get('chart_file_path', 'NONE')} "
+            f"top_finding={str(result.get('top_finding', ''))[:80]}"
+        )
 
         # --- #10b: user_segmentation cluster naming ---
         # After segmentation results are stored, fire a small LLM call that reads
@@ -1232,8 +1396,8 @@ async def _execute_single_node(
             _dm_text_for_thread = (
                 state.results[analysis_id].get("insight_summary", {}) or {}
             ).get("decision_maker_takeaway", "")
-        except Exception:
-            pass
+        except Exception as _thr_err:
+            logging.warning(f"[{analysis_id}] Failed to read DM takeaway for thread: {_thr_err}")
         if session_id in _global_threads:
             _global_threads[session_id].append({
                 "id": analysis_id,
@@ -1247,12 +1411,19 @@ async def _execute_single_node(
             _evt_hook = _pipeline_event_hooks.get(session_id)
             if _evt_hook:
                 _evt_hook("node_complete", {
-                    "analysis_id": analysis_id,
-                    "analysis_type": analysis_type,
-                    "top_finding": result.get("top_finding", ""),
-                    "severity": result.get("severity", "info"),
-                    "chart_path": bool(result.get("chart_file_path")),
-                    "status": "success",
+                    "analysis_id":             analysis_id,
+                    "analysis_type":            analysis_type,
+                    "top_finding":              result.get("top_finding", ""),
+                    "severity":                 result.get("severity", "info"),
+                    "chart":                    bool(result.get("chart_file_path")),
+                    "status":                   "success",
+                    "what_it_means":            result.get("data", {}).get("narrative", {}).get("what_it_means", ""),
+                    "recommendation":           result.get("insight_summary", {}).get("recommendation", ""),
+                    "proposed_fix":             result.get("data", {}).get("narrative", {}).get("proposed_fix", ""),
+                    "key_finding":              result.get("insight_summary", {}).get("key_finding", ""),
+                    "top_values":               result.get("insight_summary", {}).get("top_values", ""),
+                    "anomalies":                result.get("insight_summary", {}).get("anomalies", ""),
+                    "decision_maker_takeaway":  result.get("insight_summary", {}).get("decision_maker_takeaway", ""),
                 })
         except Exception as _hook_err:
             print(f"WARNING: SSE event hook failed for {analysis_id}: {_hook_err}")
@@ -1335,6 +1506,24 @@ def _build_library_call_code(
             args.append(f"{k}='{v}'")
 
     arg_str = ", ".join(args)
+
+    # Custom analyses (registered via workflow_loader) live in user scripts,
+    # NOT in tools.analysis_library.  Generate an import from the correct module.
+    if entry.get("is_custom"):
+        script_dir  = entry.get("_script_dir", "")
+        module_name = entry.get("_module_name", fn)
+        code = (
+            "import pandas as pd\n"
+            "import numpy as np\n"
+            "import sys as _sys, os as _os\n"
+            f"_sd = {repr(script_dir)}\n"
+            "if _sd and _sd not in _sys.path:\n"
+            "    _sys.path.insert(0, _sd)\n"
+            f"from {module_name} import {fn}\n\n"
+            "def analyze(csv_path: str) -> dict:\n"
+            f"    return {fn}({arg_str})\n"
+        )
+        return code
 
     code = (
         "import pandas as pd\n"
@@ -1483,8 +1672,8 @@ def _update_session_status(state, status: str):
     """Update session state status."""
     try:
         state.status = status
-    except Exception:
-        pass
+    except Exception as _uss_err:
+        logging.warning(f"Failed to update session status to '{status}': {_uss_err}")
 
 
 def _post_message(
@@ -1501,8 +1690,8 @@ def _post_message(
             session_id=session_id,
         )
         state.post_message(msg)
-    except Exception:
-        pass
+    except Exception as _pm_err:
+        logging.warning(f"Failed to post A2A message ({sender}->{recipient}, intent={intent}): {_pm_err}")
 
 
 def _build_profile_summary(

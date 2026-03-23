@@ -1,8 +1,6 @@
 ﻿import os
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
-FLASH = os.getenv("GEMINI_FLASH_MODEL", "gemini-3.1-pro-preview")
-PRO   = os.getenv("GEMINI_PRO_MODEL",   "gemini-3.1-pro-preview")
 
 _AGENT_MODELS = {
     "orchestrator": MODEL,

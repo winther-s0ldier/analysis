@@ -10,6 +10,7 @@ DEFAULT_POLICY = {
     "required_analyses": [],
     "excluded_analyses": [],
     "outcome_col_override": None,
+    "custom_column_roles": {},
 }
 
 
@@ -172,6 +173,12 @@ def build_policy_context_for_discovery(policy: dict, column_roles: dict) -> str:
 
     max_nodes = policy.get("max_nodes", 10)
     lines.append(f"- MAX NODES: Limit DAG to {max_nodes} analysis nodes.")
+
+    custom_roles = policy.get("custom_column_roles", {})
+    if custom_roles:
+        lines.append(f"- COLUMN ROLE OVERRIDES (from policy.json — treat these as confirmed, do not re-infer):")
+        for col, role in custom_roles.items():
+            lines.append(f"  • '{col}' → {role}")
 
     warnings = validate_policy(policy, column_roles)
     if warnings:

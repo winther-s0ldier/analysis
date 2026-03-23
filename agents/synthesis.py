@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import threading
+from typing import Annotated
+from pydantic import Field
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..")
@@ -399,17 +401,20 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
     if not ex.get("top_priorities"):
         warnings_found.append("WEAK: executive_summary.top_priorities is empty.")
 
-    # Check for node citation pattern — matches [A1], [A1: type], [A2: funnel_analysis] etc.
+    # Check for node citation pattern — matches [A1], [C1], [A1: type], [C2: custom] etc.
     synthesis_str = json.dumps(synthesis)
-    citations = re.findall(r'\[A\d+[^\]]*\]', synthesis_str)
+    citations = re.findall(r'\[[AC]\d+[^\]]*\]', synthesis_str)
     citation_count = len(citations)
     if citation_count < 3:
         warnings_found.append(
             f"LOW CITATION: Only {citation_count} node ID citations found. "
-            "Synthesis should cite [AX] or [AX: type] for every quantitative claim."
+            "Synthesis should cite [AX]/[CX] or [AX: type] for every quantitative claim."
         )
-        from tools.monitor import emit
-        emit(session_id, "synthesis_low_citation", {"citation_count": citation_count}, severity="warning")
+        try:
+            from tools.monitor import emit
+            emit(session_id, "synthesis_low_citation", {"citation_count": citation_count}, severity="warning")
+        except Exception as _emit_err:
+            logging.warning(f"Failed to emit low citation warning: {_emit_err}")
 
     # Check insights have individual top_finding
     # detailed_insights can be {"insights": [...]} or a bare list — handle both
@@ -421,11 +426,11 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
         if not ins.get("how_to_fix"):
             warnings_found.append(f"INSIGHT[{i}]: how_to_fix steps are empty.")
 
-    # Check entity segments / personas if a segment section was included
-    _p = synthesis.get("personas", {})
-    personas = _p.get("personas", []) if isinstance(_p, dict) else _p
-    if synthesis.get("personas") is not None and not personas:
-        warnings_found.append("WEAK: personas section present but no archetypes defined.")
+    # Check entity segments / key_segments if a segment section was included
+    _p = synthesis.get("key_segments", synthesis.get("personas", {}))
+    personas = _p.get("segments", _p.get("personas", [])) if isinstance(_p, dict) else _p
+    if (synthesis.get("key_segments") is not None or synthesis.get("personas") is not None) and not personas:
+        warnings_found.append("WEAK: key_segments section present but no segments defined.")
 
     # Check conversational_report has content
     conv = synthesis.get("conversational_report", "")
@@ -442,7 +447,12 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
     }
 
 
-def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_notes: str = "", output_folder: str = "") -> str:
+def tool_submit_synthesis(
+    session_id: Annotated[str, Field(description="Active pipeline session ID")],
+    synthesis_json_str: Annotated[str, Field(description="Complete synthesis result as a JSON string matching the required output schema")],
+    reasoning_notes: Annotated[str, Field(description="2-3 sentence summary of key deductions made during synthesis. Stored and injected on retry.", default="")] = "",
+    output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.", default="")] = "",
+) -> str:
     """
     Submit the complete synthesis result.
     MUST be called as the last step.
@@ -584,7 +594,8 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
                 "'# Key Findings', '# Action Roadmap', '# Confidence Assessment'."
             )
 
-        # Fix 2: Enforce minimum 2 cross_metric_connections entries with distinct node citations
+        # Fix 2: Enforce cross_metric_connections — scaled by available results
+        # With 1 node: 0 connections needed; 2 nodes: 1; 3+: 2
         _cmc_raw = synthesis.get("cross_metric_connections", {})
         if isinstance(_cmc_raw, list):
             _connections = _cmc_raw
@@ -592,10 +603,12 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
             _connections = _cmc_raw.get("connections", [])
         else:
             _connections = []
-        if len(_connections) < 2:
+        _n_insights = len(_insights) if '_insights' in dir() else 2
+        _min_connections = max(0, min(2, _n_insights - 1))
+        if len(_connections) < _min_connections:
             _quality_failures.append(
                 f"cross_metric_connections.connections has {len(_connections)} entr"
-                f"{'y' if len(_connections) == 1 else 'ies'} (minimum 2 required). "
+                f"{'y' if len(_connections) == 1 else 'ies'} (minimum {_min_connections} required). "
                 "Each connection MUST cite two different [AX] node IDs and explain the causal mechanism."
             )
         else:
@@ -605,12 +618,12 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
                     continue
                 _fa = str(_conn.get("finding_a", ""))
                 _fb = str(_conn.get("finding_b", ""))
-                _cited = set(_re_cmc.findall(r'\[A\d+\]', _fa + _fb))
+                _cited = set(_re_cmc.findall(r'\[[AC]\d+\]', _fa + _fb))
                 if len(_cited) < 2:
                     _quality_failures.append(
                         f"cross_metric_connections.connections[{_ci}] cites fewer than 2 distinct node IDs "
                         f"(found: {sorted(_cited) if _cited else 'none'}). "
-                        "finding_a and finding_b must each reference a different [AX] node."
+                        "finding_a and finding_b must each reference a different [AX]/[CX] node."
                     )
 
         if _quality_failures:
@@ -714,8 +727,8 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
             print(f"WARNING: synthesis cache write failed: {_ce}")
             if state:
                 try:
-                    _int = synthesis.get("intervention_strategies", {})
-                    _per = synthesis.get("personas", {})
+                    _int = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
+                    _per = synthesis.get("key_segments", synthesis.get("personas", {}))
                     _cmc = synthesis.get("cross_metric_connections", {})
                     msg = create_message(
                         sender="synthesis_agent",
@@ -723,7 +736,7 @@ def tool_submit_synthesis(session_id: str, synthesis_json_str: str, reasoning_no
                         intent=Intent.SYNTHESIS_COMPLETE,
                         payload={
                             "critical_count": _int.get("critical_count", 0) if isinstance(_int, dict) else 0,
-                            "persona_count": _per.get("persona_count", 0) if isinstance(_per, dict) else len(synthesis.get("personas", [])),
+                            "segment_count": _per.get("segment_count", _per.get("persona_count", 0)) if isinstance(_per, dict) else len(synthesis.get("key_segments", synthesis.get("personas", []))),
                             "connection_count": _cmc.get("connection_count", 0) if isinstance(_cmc, dict) else len(synthesis.get("cross_metric_connections", [])),
                         },
                         session_id=session_id,
@@ -785,10 +798,12 @@ def get_synthesis_agent():
                 "This is stored and fed back to you if the submission is rejected, so you can build on it rather than starting over.\n\n"
 
                 "## EVIDENCE CITATION RULES (Non-Negotiable)\n"
-                "- EVERY quantitative claim (a percentage, a count, a ratio) MUST be followed by the analysis node it came from: `[A1: session_detection]`.\n"
-                "- EVERY root cause hypothesis MUST reference at least TWO data signals to support it (e.g., `[A2] + [A4]`).\n"
+                "- Node IDs use the format `[A1]`, `[A2]`, etc. for discovered analyses, and `[C1]`, `[C2]`, etc. for user-requested custom analyses. Cite both equally.\n"
+                "- EVERY quantitative claim (a percentage, a count, a ratio) MUST be followed by the analysis node it came from: `[A1: session_detection]` or `[C1: custom_type]`.\n"
+                "- EVERY root cause hypothesis MUST reference at least TWO data signals to support it (e.g., `[A2] + [C1]`).\n"
                 "- If an analysis node has `status: error` or `status: insufficient_data`, you MUST write 'Insufficient data from [NodeID]' for that insight — do NOT invent a finding.\n"
-                "- `top_priorities` in the executive summary MUST cite the specific node and metric that makes it a priority.\n\n"
+                "- `top_priorities` in the executive summary MUST cite the specific node and metric that makes it a priority.\n"
+                "- Custom analyses (CX nodes) are user-requested and high-priority — ALWAYS include their findings prominently.\n\n"
 
                 "## ANTI-HALLUCINATION RULES\n"
                 "These are the boundaries of what you are allowed to state:\n"
@@ -847,20 +862,20 @@ def get_synthesis_agent():
                 "Replace all values with findings from your actual data — never copy the example numbers.\n\n"
 
 
-                "### personas — infer 2-4 entity archetypes from segmentation / behavioral data\n"
+                "### key_segments — infer 2-4 entity archetypes from segmentation / behavioral data\n"
                 "ONLY include this section if the analysis results support it "
                 "(i.e., at least one of `session_classification`, `user_segmentation`, `funnel_analysis`, or `dropout_analysis` ran successfully).\n"
-                "If none of those analyses were run, OMIT the `personas` key entirely rather than fabricating archetypes.\n\n"
+                "If none of those analyses were run, OMIT the `key_segments` key entirely rather than fabricating archetypes.\n\n"
                 "NAMING: Name archetypes from what the DATA shows — derive the name from the entity's OBSERVED PATTERN, not from any assumed industry. "
                 "Examples of data-driven names: 'Deep Explorer' (many events, no outcome), 'Fast Converter' (few steps, high completion rate), "
                 "'Abandoner at Step 3' (consistent exit point). NEVER name archetypes after marketing demographics or industry personas "
                 "unless those exact labels appear verbatim in a tool result.\n\n"
                 "If `session_classification` ran [AX], use the EXACT segment labels it returned (they are data-derived from THIS dataset). "
                 "If `user_segmentation` ran instead, use its cluster descriptions. "
-                "Never import persona names from prior domain knowledge.\n"
+                "Never import segment names from prior domain knowledge.\n"
                 "{\n"
-                "  'persona_count': 3,\n"
-                "  'personas': [\n"
+                "  'segment_count': 3,\n"
+                "  'segments': [\n"
                 "    {\n"
                 "      'name': 'Derive from data patterns, e.g. High-Engagement Non-Converter or Early Dropout',\n"
                 "      'size': 'N entities (X%) [NodeID that provided this breakdown]',\n"
@@ -872,11 +887,11 @@ def get_synthesis_agent():
                 "  ]\n"
                 "}\n\n"
 
-                "### intervention_strategies — Concrete, evidence-backed actions\n"
+                "### recommendations — Concrete, evidence-backed actions\n"
                 "ONLY include this section if at least one analysis returned severity `critical` or `high`, "
                 "or if `intervention_triggers` was run. Omit the key entirely for descriptive/statistical datasets "
-                "where no actionable intervention signal was found.\n\n"
-                "Interventions MUST be domain-agnostic. Describe WHAT to do in terms of the data events/metrics found — "
+                "where no actionable recommendation signal was found.\n\n"
+                "Recommendations MUST be domain-agnostic. Describe WHAT to do in terms of the data events/metrics found — "
                 "do NOT assume a UI, an email system, or a SaaS product. Instead, describe the action in terms of "
                 "the triggering condition and the outcome variable from the data.\n"
                 "{\n"
@@ -930,7 +945,7 @@ def get_synthesis_agent():
                 "- DO call `tool_aggregate_results` first before writing anything.\n"
                 "- DO cite node IDs in EVERY quantitative claim.\n"
                 "- DO label estimates clearly with 'estimated' and show the formula.\n"
-                "- DO include an insight card for EVERY analysis node that returned `status: success`.\n"
+                "- DO include an insight card for EVERY analysis node that returned `status: success`, including custom (CX) nodes.\n"
                 "- DO use `tool_submit_synthesis(session_id, synthesis_json_str, reasoning_notes)` as your LAST action — pass your key reasoning as the third argument.\n\n"
 
                 "## DON'Ts\n"

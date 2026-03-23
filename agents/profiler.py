@@ -35,6 +35,25 @@ def tool_profile_and_classify(
     if "error" in raw_profile:
         return {"error": raw_profile["error"]}
 
+    # Apply custom_column_roles from policy.json — override programmatic inference.
+    # This is the user's explicit instruction: "treat this column as entity_col".
+    try:
+        from tools.data_policy import get_active_policy
+        _policy = get_active_policy()
+        _custom_roles = _policy.get("custom_column_roles", {})
+        if _custom_roles:
+            existing_roles = raw_profile.get("column_roles", {})
+            # Invert: existing_roles = {role: col_name}; _custom_roles = {col_name: role}
+            # Build reverse map and apply overrides
+            _reversed = {v: k for k, v in existing_roles.items() if v}
+            for col_name, role in _custom_roles.items():
+                # Remove any existing binding for this role
+                existing_roles[role] = col_name
+            raw_profile["column_roles"] = existing_roles
+            print(f"[PolicyEngine] Applied custom_column_roles overrides: {_custom_roles}")
+    except Exception as _pe:
+        print(f"[PolicyEngine] custom_column_roles apply failed: {_pe}")
+
     # Store immediately so get_profile_result() always returns valid data.
     # profile_csv already runs programmatic classification (infer_column_semantics +
     # classify_dataset), so we have row_count/column_count/dataset_type right now.
