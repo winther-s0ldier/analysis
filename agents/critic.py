@@ -31,7 +31,7 @@ def get_critic_store_result(session_id: str) -> dict:
 
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
-def tool_get_synthesis_for_critique(session_id: str) -> dict:
+def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
     """
     Retrieve the current synthesis + pre-extracted fact_sheet for this session.
     The synthesis contains all the insight cards, cross-metric connections,
@@ -40,10 +40,24 @@ def tool_get_synthesis_for_critique(session_id: str) -> dict:
     Use both to check: does every claim in synthesis trace back to a real number?
     """
     try:
-        from agents.synthesis import _synthesis_store
-        synthesis = _synthesis_store.get(session_id, {})
+        # Source 0: ToolContext.state — fastest path in SequentialAgent in-process mode.
+        # synthesis_agent writes tool_context.state["synthesis"] before this tool is called.
+        synthesis = {}
+        if tool_context is not None:
+            try:
+                _tc_synth = tool_context.state.get("synthesis")
+                if _tc_synth:
+                    synthesis = _tc_synth
+                    print(f"INFO: [ToolContext] critic got synthesis from state for {session_id}")
+            except Exception:
+                pass
 
-        # A2A server mode fallback: read _synthesis_cache.json when in-memory store is empty
+        # Source 1: in-memory store (single-server in-process mode)
+        if not synthesis:
+            from agents.synthesis import _synthesis_store
+            synthesis = _synthesis_store.get(session_id, {})
+
+        # Source 2 (A2A server mode fallback): read _synthesis_cache.json when in-memory store is empty
         if not synthesis:
             try:
                 from agent_servers.a2a_orchestrator import lookup_session as _lookup
@@ -256,12 +270,21 @@ def tool_submit_critique(
 
 # ── Agent factory ─────────────────────────────────────────────────────────────
 
+_PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
+
+
+def _load_prompt(name: str) -> str:
+    with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
+        return f.read()
+
+
 def get_critic_agent():
     global _critic_instance
     if _critic_instance is not None:
         return _critic_instance
 
     from google.adk.agents import Agent
+    from google.adk.tools import FunctionTool
     from tools.model_config import get_model
 
     _critic_instance = Agent(
@@ -269,40 +292,7 @@ def get_critic_agent():
         model=get_model("synthesis"),
         description="Adversarial critic that reviews synthesis for unsupported claims, "
                     "contradictions, overconfidence, and vague recommendations.",
-        instruction="""You are the Adversarial Critic — a rigorous scientific peer-reviewer for analytics pipelines.
-
-## YOUR MANDATE
-You receive a completed synthesis and the raw fact_sheet that powered it.
-Your job is to find any of these five problem types:
-
-1. **Unsupported claims** — A statement in synthesis that has NO [AX] citation (e.g., "users drop off due to poor onboarding" with zero citation).
-2. **Contradictions** — Two insight cards or a card vs. a connection that make mutually inconsistent claims about the same metric without explaining why.
-3. **Overconfidence** — "Users definitely do X" or "the primary cause is Y" stated without appropriate statistical caveats.
-4. **Missed critical findings** — A top_finding in fact_sheet that is clearly important (high severity or large magnitude) but completely absent from insights.
-5. **Vague actions** — A "how_to_fix" item that says things like "improve the experience" or "optimise the flow" without specifying WHAT to change.
-
-## WORKFLOW
-1. Call `tool_get_synthesis_for_critique(session_id)`.
-2. Read every insight card (ai_summary, root_cause_hypothesis, how_to_fix) and every cross-metric connection.
-3. For each problem found:
-   - Record the EXACT problematic text as "claim"
-   - Explain specifically WHY it is a problem as "issue"
-   - Rate severity: "high" = factual/logical error; "medium" = missing nuance; "low" = minor wording
-4. Count high-severity challenges:
-   - If 0–1 high-severity: set approved=True
-   - If 2+ high-severity: set approved=False
-5. Set confidence_adjustment: start at 1.0, subtract 0.1 per high challenge, 0.05 per medium.
-6. Write overall_verdict (2–4 sentences): what is the synthesis' overall reliability?
-7. Call `tool_submit_critique(session_id, approved, challenges, confidence_adjustment, overall_verdict)`.
-
-## STRICT RULES
-- Quote the EXACT text from synthesis in every "claim" — no paraphrasing.
-- Do NOT reject synthesis for stylistic issues, passive voice, or minor wording choices.
-- Do NOT flag missing analyses that the DAG simply didn't include — only evaluate what IS in synthesis.
-- Do NOT hallucinate issues that aren't there. If synthesis is well-grounded, say so.
-- approved=True means: "This synthesis is reliable enough for a business decision-maker to act on."
-- Be specific. Be honest. If the synthesis is good, approve it immediately.
-""",
-        tools=[tool_get_synthesis_for_critique, tool_submit_critique],
+        instruction=_load_prompt("critic.md"),
+        tools=[FunctionTool(tool_get_synthesis_for_critique), FunctionTool(tool_submit_critique)],
     )
     return _critic_instance

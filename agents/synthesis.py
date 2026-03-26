@@ -10,6 +10,15 @@ sys.path.insert(
 )
 
 from a2a_messages import create_message, Intent
+from tools.config_loader import get_config as _get_config
+
+_PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
+
+
+def _load_prompt(name: str) -> str:
+    with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
+        return f.read()
+
 
 
 _synthesis_store: dict = {}
@@ -433,9 +442,10 @@ def _validate_synthesis_grounding(synthesis: dict, fact_sheet: dict, session_id:
         warnings_found.append("WEAK: key_segments section present but no segments defined.")
 
     # Check conversational_report has content
+    _syn_cfg = _get_config()["synthesis"]
     conv = synthesis.get("conversational_report", "")
-    if len(str(conv)) < 800:
-        warnings_found.append("WEAK: conversational_report is too short (< 800 chars) — narrative lacks depth.")
+    if len(str(conv)) < _syn_cfg["min_report_chars_warn"]:
+        warnings_found.append(f"WEAK: conversational_report is too short (< {_syn_cfg['min_report_chars_warn']} chars) — narrative lacks depth.")
 
     is_valid = len([w for w in warnings_found if w.startswith("MISSING")]) == 0
 
@@ -452,6 +462,7 @@ def tool_submit_synthesis(
     synthesis_json_str: Annotated[str, Field(description="Complete synthesis result as a JSON string matching the required output schema")],
     reasoning_notes: Annotated[str, Field(description="2-3 sentence summary of key deductions made during synthesis. Stored and injected on retry.", default="")] = "",
     output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.", default="")] = "",
+    tool_context=None,  # ADK injects ToolContext automatically when declared
 ) -> str:
     """
     Submit the complete synthesis result.
@@ -549,11 +560,12 @@ def tool_submit_synthesis(
         # This prevents the pipeline accepting one-liner summaries as complete output.
         _quality_failures = []
 
+        _syn_cfg = _get_config()["synthesis"]
         _exec = synthesis.get("executive_summary", {})
         _overall_health = str(_exec.get("overall_health", ""))
-        if len(_overall_health) < 150:
+        if len(_overall_health) < _syn_cfg["min_exec_summary_chars"]:
             _quality_failures.append(
-                f"executive_summary.overall_health is too short ({len(_overall_health)} chars, minimum 150). "
+                f"executive_summary.overall_health is too short ({len(_overall_health)} chars, minimum {_syn_cfg['min_exec_summary_chars']}). "
                 "Re-write with 3+ specific stats citing node IDs."
             )
 
@@ -565,22 +577,22 @@ def tool_submit_synthesis(
         else:
             for _i, _ins in enumerate(_insights):
                 _summary = str(_ins.get("ai_summary", ""))
-                if len(_summary) < 80:
+                if len(_summary) < _syn_cfg["min_insight_summary_chars"]:
                     _quality_failures.append(
-                        f"detailed_insights.insights[{_i}].ai_summary is too short ({len(_summary)} chars, minimum 80). "
+                        f"detailed_insights.insights[{_i}].ai_summary is too short ({len(_summary)} chars, minimum {_syn_cfg['min_insight_summary_chars']}). "
                         "Must include: (a) the key metric with [NodeID], (b) what it means, (c) an internal comparison to another node finding. Do NOT invent benchmarks."
                     )
                 _rc = str(_ins.get("root_cause_hypothesis", ""))
-                if len(_rc) < 60:
+                if len(_rc) < _syn_cfg["min_insight_hypothesis_chars"]:
                     _quality_failures.append(
-                        f"detailed_insights.insights[{_i}].root_cause_hypothesis is too short ({len(_rc)} chars, minimum 60). "
+                        f"detailed_insights.insights[{_i}].root_cause_hypothesis is too short ({len(_rc)} chars, minimum {_syn_cfg['min_insight_hypothesis_chars']}). "
                         "Must cite at least two node IDs in a causal chain."
                     )
 
         _conv = str(synthesis.get("conversational_report", ""))
-        if len(_conv) < 1500:
+        if len(_conv) < _syn_cfg["min_report_chars"]:
             _quality_failures.append(
-                f"conversational_report is too short ({len(_conv)} chars, minimum 1500). "
+                f"conversational_report is too short ({len(_conv)} chars, minimum {_syn_cfg['min_report_chars']}). "
                 "Must be a full narrative section covering all major findings with cited metrics."
             )
 
@@ -685,6 +697,14 @@ def tool_submit_synthesis(
         with _synthesis_lock:
             _synthesis_store[session_id] = synthesis
 
+        # Write to ADK ToolContext.state — makes synthesis available to downstream agents
+        # (critic, dag_builder) in SequentialAgent in-process mode without file I/O.
+        if tool_context is not None:
+            try:
+                tool_context.state["synthesis"] = synthesis
+            except Exception:
+                pass
+
         try:
             from main import sessions
             state = sessions.get(session_id)
@@ -764,207 +784,66 @@ def tool_submit_synthesis(
 
 _synthesis_agent_instance = None
 
+
+def _synthesis_after_model_callback(callback_context, llm_response):
+    """Validate that the synthesis response contains the required JSON keys.
+
+    Returns a corrective LlmResponse if required keys are missing or the
+    response is not valid JSON. Returns None to keep the original response.
+    """
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    text = ""
+    if llm_response.content and llm_response.content.parts:
+        for part in llm_response.content.parts:
+            text += getattr(part, "text", "") or ""
+
+    if not text:
+        return None
+
+    # Extract JSON block if wrapped in ```json ... ```
+    import re
+    match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    json_text = match.group(1) if match else text
+    first = json_text.find("{")
+    last = json_text.rfind("}")
+    if first != -1 and last != -1:
+        json_text = json_text[first:last + 1]
+
+    try:
+        data = json.loads(json_text)
+        required = {"executive_summary", "detailed_insights", "conversational_report"}
+        missing = required - set(data.keys())
+        if missing:
+            return LlmResponse(content=types.Content(parts=[types.Part(text=(
+                f"Your response is missing required top-level keys: {sorted(missing)}. "
+                "Please rewrite your full synthesis JSON including all required fields: "
+                "executive_summary, detailed_insights, conversational_report, "
+                "cross_metric_connections, key_segments, and recommendations."
+            ))]))
+    except (json.JSONDecodeError, ValueError):
+        return LlmResponse(content=types.Content(parts=[types.Part(text=(
+            "Your response must be valid JSON wrapped in ```json ... ```. "
+            "The JSON must parse without errors via Python's json.loads(). "
+            "Please rewrite your complete synthesis as valid JSON."
+        ))]))
+
+    return None
+
+
 def get_synthesis_agent():
     global _synthesis_agent_instance
     if _synthesis_agent_instance is None:
         from google.adk.agents import Agent
+        from google.adk.tools import FunctionTool
         from tools.model_config import get_model
         _synthesis_agent_instance = Agent(
             name="synthesis_agent",
             model=get_model("synthesis"),
             description="Interpretation layer. Receives all analysis results and generates deep narrative, personas, strategies, and executive summary.",
-            instruction=(
-                "You are a Senior Data Intelligence Analyst operating as the final interpretation layer of a multi-agent analytics pipeline. "
-                "You receive structured, pre-computed analysis results from up to 20 analysis nodes and transform them into a single, definitive intelligence report. "
-                "Your output will be read by decision-makers and business stakeholders — it must be SPECIFIC, EVIDENCE-BACKED, and ACTIONABLE.\n\n"
-
-                "## CORE MANDATE: THE DATALOG STANDARD\n"
-                "Every claim you make MUST be traceable to data. You are NOT a language model generating generic business advice. "
-                "You are a data analyst whose ONLY source of truth is the tool results returned to you. "
-                "If a number does not appear in a tool result, you CANNOT state that number. If a trend is not in the data, you CANNOT claim it.\n\n"
-
-                "## WORKFLOW\n"
-                "1. Call `tool_aggregate_results(session_id)` to receive ALL completed analysis results, grouped by node ID and analysis type.\n"
-                "2. Study the results. For EACH node, check the `decision_maker_takeaway` field in the fact_sheet first — "
-                "this is a pre-generated insight summarising what matters most. Use it as your starting point, then deepen it with the raw numbers.\n"
-                "3. Identify cross-analysis patterns using the DAG DEPENDENCY GRAPH provided in the prompt:\n"
-                "   - DEPENDENT nodes (has depends_on): a child node result is caused or constrained by its parent — reason causally, not just correlationally.\n"
-                "   - AMPLIFYING pairs: two independent nodes that converge on the same entity stage — both findings reinforce the same conclusion.\n"
-                "   - CONTRADICTING signals: one node shows critical severity but a related node shows low impact — explain the discrepancy, do not ignore it.\n"
-                "4. Build your synthesis JSON and call `tool_submit_synthesis(session_id=<session_id>, synthesis_json_str=<json>, "
-                "output_folder=<output_folder from prompt>, reasoning_notes=<2-3 sentence summary>)`. "
-                "The output_folder and session_id are provided at the top of your prompt — copy them exactly. "
-                "reasoning_notes is a 2-3 sentence plain-English summary of your key deductions (e.g. 'Node A1 showed 70% bounce rate which I connected to A5 dropout peak...'). "
-                "This is stored and fed back to you if the submission is rejected, so you can build on it rather than starting over.\n\n"
-
-                "## EVIDENCE CITATION RULES (Non-Negotiable)\n"
-                "- Node IDs use the format `[A1]`, `[A2]`, etc. for discovered analyses, and `[C1]`, `[C2]`, etc. for user-requested custom analyses. Cite both equally.\n"
-                "- EVERY quantitative claim (a percentage, a count, a ratio) MUST be followed by the analysis node it came from: `[A1: session_detection]` or `[C1: custom_type]`.\n"
-                "- EVERY root cause hypothesis MUST reference at least TWO data signals to support it (e.g., `[A2] + [C1]`).\n"
-                "- If an analysis node has `status: error` or `status: insufficient_data`, you MUST write 'Insufficient data from [NodeID]' for that insight — do NOT invent a finding.\n"
-                "- `top_priorities` in the executive summary MUST cite the specific node and metric that makes it a priority.\n"
-                "- Custom analyses (CX nodes) are user-requested and high-priority — ALWAYS include their findings prominently.\n\n"
-
-                "## ANTI-HALLUCINATION RULES\n"
-                "These are the boundaries of what you are allowed to state:\n"
-                "- ALLOWED: Stating a number that appears verbatim in a tool result.\n"
-                "- ALLOWED: Inferring a trend direction (e.g., 'retention declines') if the tool result shows consecutive decreasing values.\n"
-                "- ALLOWED: Estimating business impact IF you show your calculation (e.g., 'Estimated impact = affected_entities × average_outcome_value').\n"
-                "- FORBIDDEN: Stating a specific percentage that is not in any tool result.\n"
-                "- FORBIDDEN: Claiming a correlation between two metrics unless the `correlation_matrix` analysis [AX] was run and shows r > 0.5.\n"
-                "- FORBIDDEN: Naming a specific entity as a persona archetype unless `user_segmentation` was run and returned cluster labels.\n\n"
-
-                "## DOMAIN-AGNOSTIC REASONING\n"
-                "You do NOT know the industry. You do NOT know what the product, service, or system is. You reason ONLY from DATA SHAPES:\n"
-                "- A high `avg_repetitions` in friction_detection means entities are looping — do NOT assume this is a 'payment gateway' issue unless the event values explicitly mention payment.\n"
-                "- Persona names MUST come from data patterns, not from industry archetypes. 'Struggling Explorer' is acceptable only if the data shows high event count + low outcome. 'Shopper' is NOT acceptable unless that exact label appears in a tool result.\n"
-                "- Interventions MUST be described in terms of data signals (events, thresholds, timeframes) — never assume a UI, CRM, or notification system exists.\n"
-                "- The word 'user' is fine if `entity_col` represents people. If the entities are products, transactions, samples, or records, use the appropriate term.\n"
-                "- Financial estimates are ALWAYS labeled as 'estimated' and show the formula used.\n"
-                "- If the dataset is clearly non-behavioral (e.g., sales records, sensor readings, survey responses), SKIP the `personas` and `intervention_strategies` sections and focus on `detailed_insights` + `conversational_report`.\n\n"
-
-                "## REQUIRED OUTPUT STRUCTURE (All keys mandatory)\n\n"
-
-                "### executive_summary\n"
-                "{\n"
-                "  'overall_health': 'One paragraph. Must cite 3+ specific stats with node IDs. Pattern: [AX] shows Y% of Z.',\n"
-                "  'top_priorities': ['Priority 1: __METRIC__ at __VALUE__ [NodeID]', 'Priority 2: ...'],\n"
-                "  'business_impact': 'Quantified consequence. Show formula if estimating. Label as estimated if not directly in data.',\n"
-                "  'resource_allocation': 'Specific recommendation on where to focus, referencing the highest-severity node.',\n"
-                "  'timeline': 'Quick Wins (1-2 weeks): [...]. Medium Fixes (1 month): [...]. Strategic (3 months): [...]'\n"
-                "}\n\n"
-
-                "### detailed_insights — ONE card per completed analysis node\n"
-                "⚠️  CRITICAL: Every text field below MUST contain real written content. "
-                "Empty strings (\"\") are NEVER allowed. Write the content inline — do not submit a skeleton.\n\n"
-                "EXAMPLE of a correctly filled card (copy this quality for every node):\n"
-                "{\n"
-                "  'insights': [\n"
-                "    {\n"
-                "      'title': '70.5% Bounce Rate — Majority of Sessions Are Single-Event',\n"
-                "      'ai_summary': '[A1] detected that 70.5% of all 39,066 sessions consist of exactly one event, meaning users abandon after a single interaction with no further engagement. This is the highest-severity finding in the dataset — it dwarfs the dropout rate from [A5] (42%) which only measures multi-step sessions, confirming the bounce problem is upstream of the funnel entirely.',\n"
-                "      'root_cause_hypothesis': '[A1] shows 70.5% single-event sessions → [A5] shows dropout spikes at Push_Failure event → users encountering Push_Failure on first interaction have no recovery path → this technical failure is the primary driver of the bounce rate, not user intent.',\n"
-                "      'possible_causes': [\n"
-                "        'Push_Failure event triggers on first load for 70%+ of users, per [A5] dropout data',\n"
-                "        'Session detection [A1] confirms no second event follows Push_Failure in 68% of affected sessions',\n"
-                "        'Event taxonomy [A2] classifies Push_Failure as a system event — not user-initiated — confirming it is a backend issue'\n"
-                "      ],\n"
-                "      'downstream_implications': 'Every downstream funnel metric is understated — conversion rates, journey lengths, and retention figures are computed only on the 29.5% of users who survive past the bounce. Fixing Push_Failure would roughly 3x the addressable funnel population.',\n"
-                "      'fix_priority': 'critical',\n"
-                "      'how_to_fix': [\n"
-                "        'Step 1: Instrument Push_Failure event from [A5] with device/OS breakdown to identify affected cohort',\n"
-                "        'Step 2: Deploy a silent retry on Push_Failure before surfacing error to user — [A1] data suggests most sessions would continue if the first event succeeded'\n"
-                "      ]\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
-                "Now write ONE card exactly like this for EACH analysis node in the fact_sheet. "
-                "Replace all values with findings from your actual data — never copy the example numbers.\n\n"
-
-
-                "### key_segments — infer 2-4 entity archetypes from segmentation / behavioral data\n"
-                "ONLY include this section if the analysis results support it "
-                "(i.e., at least one of `session_classification`, `user_segmentation`, `funnel_analysis`, or `dropout_analysis` ran successfully).\n"
-                "If none of those analyses were run, OMIT the `key_segments` key entirely rather than fabricating archetypes.\n\n"
-                "NAMING: Name archetypes from what the DATA shows — derive the name from the entity's OBSERVED PATTERN, not from any assumed industry. "
-                "Examples of data-driven names: 'Deep Explorer' (many events, no outcome), 'Fast Converter' (few steps, high completion rate), "
-                "'Abandoner at Step 3' (consistent exit point). NEVER name archetypes after marketing demographics or industry personas "
-                "unless those exact labels appear verbatim in a tool result.\n\n"
-                "If `session_classification` ran [AX], use the EXACT segment labels it returned (they are data-derived from THIS dataset). "
-                "If `user_segmentation` ran instead, use its cluster descriptions. "
-                "Never import segment names from prior domain knowledge.\n"
-                "{\n"
-                "  'segment_count': 3,\n"
-                "  'segments': [\n"
-                "    {\n"
-                "      'name': 'Derive from data patterns, e.g. High-Engagement Non-Converter or Early Dropout',\n"
-                "      'size': 'N entities (X%) [NodeID that provided this breakdown]',\n"
-                "      'profile': 'Data-derived description citing the specific events/metrics that define this group. [AX]',\n"
-                "      'pain_points': ['Pain point grounded in a specific event or metric from a tool result'],\n"
-                "      'opportunities': ['Concrete action tied to a specific finding from [AX]'],\n"
-                "      'priority_level': 'high|medium|low'\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
-
-                "### recommendations — Concrete, evidence-backed actions\n"
-                "ONLY include this section if at least one analysis returned severity `critical` or `high`, "
-                "or if `intervention_triggers` was run. Omit the key entirely for descriptive/statistical datasets "
-                "where no actionable recommendation signal was found.\n\n"
-                "Recommendations MUST be domain-agnostic. Describe WHAT to do in terms of the data events/metrics found — "
-                "do NOT assume a UI, an email system, or a SaaS product. Instead, describe the action in terms of "
-                "the triggering condition and the outcome variable from the data.\n"
-                "{\n"
-                "  'critical_count': 1,\n"
-                "  'strategies': [\n"
-                "    {\n"
-                "      'severity': 'critical|high|medium|low',\n"
-                "      'title': 'Title referencing the specific event, metric, or stage from [AX]',\n"
-                "      'realtime_interventions': [\n"
-                "        'Trigger an action WHEN [specific event from AX] occurs for the Nth time — cite the exact threshold from the data [AX]'\n"
-                "      ],\n"
-                "      'proactive_outreach': [\n"
-                "        'Target entities who completed [event X] but NOT [event Z] within [timeframe derived from data] [AX]'\n"
-                "      ]\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
-
-                "### cross_metric_connections — Cross-node synthesis\n"
-                "ONLY include connections where you can cite TWO different node IDs.\n"
-                "{\n"
-                "  'connection_count': 2,\n"
-                "  'connections': [\n"
-                "    {\n"
-                "      'finding_a': '[A1] 38% of sequences end after 1 step',\n"
-                "      'finding_b': '[A3] Highest friction at the first recorded event',\n"
-                "      'synthesized_meaning': 'Short sequences are correlated with high friction at the first recorded step.'\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
-
-                "### conversational_report — Long-form markdown narrative\n"
-                "Write a detailed markdown document formatted as a professional data intelligence report. "
-                "Adapt the section structure to the DATASET TYPE and analyses that were actually run — "
-                "do not force product/UX framing onto non-behavioral datasets.\n\n"
-                "REQUIRED structure (use these section titles exactly, adapt only sub-headings to the data):\n"
-                "# Key Findings\n"
-                "## What the Data Shows (2-3 paragraphs summarising the most important patterns, citing [NodeIDs])\n"
-                "## Finding Inventory (markdown table: Finding | Evidence [NodeID] | Severity | Estimated Impact)\n"
-                "# Entity Profiles  (ONLY if segmentation data is available — omit this section entirely otherwise)\n"
-                "## Archetype Profiles (one subsection per segment, named from data)\n"
-                "# Action Roadmap\n"
-                "## Immediate Actions (achievable quickly, citing the specific metric/event to target)\n"
-                "## Strategic Initiatives (longer-horizon, with data justification)\n"
-                "# Confidence Assessment\n"
-                "| Claim | Evidence [NodeID] | Confidence Level |\n"
-                "|---|---|---|\n"
-                "| Each major claim | Which node supports it | High/Medium/Low based on data completeness |\n\n"
-
-                "## DO's\n"
-                "- DO call `tool_aggregate_results` first before writing anything.\n"
-                "- DO cite node IDs in EVERY quantitative claim.\n"
-                "- DO label estimates clearly with 'estimated' and show the formula.\n"
-                "- DO include an insight card for EVERY analysis node that returned `status: success`, including custom (CX) nodes.\n"
-                "- DO use `tool_submit_synthesis(session_id, synthesis_json_str, reasoning_notes)` as your LAST action — pass your key reasoning as the third argument.\n\n"
-
-                "## DON'Ts\n"
-                "- DON'T fabricate numbers. If a metric isn't in the tool result, it doesn't exist.\n"
-                "- DON'T write generic recommendations like 'Improve UX' or 'Add A/B tests' without specific node evidence.\n"
-                "- DON'T name a correlation without the `correlation_matrix` result supporting it.\n"
-                "- DON'T write placeholder text like 'N/A', 'See data', or 'Data not available' — write instead what IS known.\n"
-                "- DON'T output raw JSON with unescaped newlines — the JSON must be parseable by Python's `json.loads()`.\n"
-                "- DON'T invent industry benchmarks. You have no external knowledge of what is 'normal' — only compare within the data.\n\n"
-
-                "## MANDATORY SELF-REVIEW BEFORE CALLING tool_submit_synthesis\n"
-                "Before submitting, verify each point — a rejected synthesis wastes a full LLM retry:\n"
-                "- [ ] Every quantitative claim in detailed_insights cites a [NodeID] with the exact number from the fact sheet.\n"
-                "- [ ] Every root_cause_hypothesis is a causal chain citing at least 2 different [NodeIDs].\n"
-                "- [ ] cross_metric_connections has at least 2 entries, each linking 2 DIFFERENT node IDs.\n"
-                "- [ ] conversational_report contains all required headers: '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
-                "- [ ] Every critical/high insight has at least 2 specific how_to_fix steps naming the exact event/metric from [NodeID].\n"
-                "- [ ] All estimated figures are labeled 'estimated' with the formula shown.\n"
-            ),
-            tools=[tool_aggregate_results, tool_submit_synthesis],
+            instruction=_load_prompt("synthesis.md"),
+            tools=[FunctionTool(tool_aggregate_results), FunctionTool(tool_submit_synthesis)],
+            after_model_callback=_synthesis_after_model_callback,
         )
     return _synthesis_agent_instance

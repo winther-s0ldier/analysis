@@ -5,6 +5,8 @@ from typing import Optional
 
 import pandas as pd
 
+from tools.config_loader import get_config
+
 
 # ── Registry path ─────────────────────────────────────────────────────────────
 def _registry_path() -> str:
@@ -102,9 +104,10 @@ def run_preflight_check(
         }
 
     # ── 3. Null density per column ────────────────────────────────────────────
+    _dq = get_config()["data_quality"]
     null_pcts = (df.isnull().sum() / n_rows * 100).round(1)
-    high_null = null_pcts[null_pcts > 30]
-    critical_null = null_pcts[null_pcts > 90]
+    high_null = null_pcts[null_pcts > _dq["null_warn_pct"]]
+    critical_null = null_pcts[null_pcts > _dq["null_critical_pct"]]
 
     for col in critical_null.index:
         errors.append(
@@ -128,7 +131,7 @@ def run_preflight_check(
     dup_count = int(df.duplicated().sum())
     dup_pct = round(dup_count / n_rows * 100, 1)
 
-    if dup_pct > 50:
+    if dup_pct > _dq["duplicate_warn_pct"]:
         warnings.append(
             f"{dup_pct}% of rows ({dup_count:,}) are exact duplicates. "
             "This may indicate a data export error."

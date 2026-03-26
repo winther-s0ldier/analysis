@@ -37,6 +37,7 @@ from a2a_messages import (
 )
 from tools.analysis_library import LIBRARY_REGISTRY
 from tools.model_config import get_model
+from tools.config_loader import get_config as _get_config
 
 try:
     from google.adk.agents.sequential_agent import SequentialAgent as _SequentialAgent
@@ -82,14 +83,19 @@ async def _llm_generate_with_retry(
     contents: str,
     model: str,
     label: str = "LLM",
-    max_attempts: int = 3,
-    backoff_base: float = 15.0,
+    max_attempts: int | None = None,
+    backoff_base: float | None = None,
 ):
     """Call Gemini generate_content with automatic retry on rate-limit errors.
 
     Replaces the three identical for-loop retry patterns scattered across this
     file. Raises on non-rate-limit errors and after exhausting all attempts.
     """
+    _retry_cfg = _get_config()["retry"]
+    if max_attempts is None:
+        max_attempts = _retry_cfg["max_attempts"]
+    if backoff_base is None:
+        backoff_base = _retry_cfg["backoff_base"]
     client = _get_llm_client()
     resp = None
     for _attempt in range(max_attempts):
@@ -484,7 +490,7 @@ async def run_full_pipeline(
 
         _profiler_confidence = classification.get("confidence", 1.0)
         _confidence_warning = ""
-        if _profiler_confidence < 0.7:
+        if _profiler_confidence < _get_config()["data_quality"]["profiler_confidence_threshold"]:
             _confidence_warning = (
                 f"\nâšWARNING: LOW PROFILER CONFIDENCE ({_profiler_confidence:.2f}): "
                 f"The dataset type classification is uncertain. "
@@ -654,9 +660,9 @@ async def run_full_pipeline(
         print(f"INFO: [{session_id}] Stages 4-6  - Synthesis -> Critic -> Report ({_mode})")
         _update_session_status(state, "synthesizing")
 
-        # Give the frontend 2s to receive and render the last node_complete
+        # Give the frontend time to receive and render the last node_complete
         # chart cards before the synthesis message pushes them out of view.
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(_get_config()["pipeline"]["synthesis_delay"])
 
         try:
             _evt_hook = _pipeline_event_hooks.get(session_id)
@@ -717,10 +723,11 @@ async def run_full_pipeline(
                         image_paths=image_paths,
                         max_turns=150,  # synthesis+critic+dag_builder need headroom
                     ),
-                    timeout=900.0,
+                    timeout=_get_config()["retry"]["llm_timeout"],
                 )
         except asyncio.TimeoutError:
-            msg = f"ERROR: Post-DAG pipeline timed out (>900s) for session {session_id}"
+            _timeout_val = _get_config()["retry"]["llm_timeout"]
+            msg = f"ERROR: Post-DAG pipeline timed out (>{_timeout_val:.0f}s) for session {session_id}"
             print(msg)
             logging.error(msg)
         except Exception as e:
@@ -755,8 +762,8 @@ async def run_full_pipeline(
                             "total":  len(_sections),
                         })
                         if _ci < len(_sections) - 1:
-                            # Space chunks across SSE poll windows (poll = 0.4 s)
-                            await asyncio.sleep(0.45)
+                            # Space chunks across SSE poll windows
+                            await asyncio.sleep(_get_config()["pipeline"]["sse_sleep_spacing"])
 
                 # Include every completed node's chart info directly so the
                 # frontend can back-fill chart cards synchronously — no extra
@@ -1054,7 +1061,7 @@ async def _execute_dag(
                     pipeline.mark_blocked(node["id"])
             break
 
-        _max_parallel = int(os.environ.get("MAX_PARALLEL_NODES", "3"))
+        _max_parallel = int(os.environ.get("MAX_PARALLEL_NODES", str(_get_config()["pipeline"]["max_parallel_nodes"])))
         semaphore = asyncio.Semaphore(_max_parallel)
 
         async def run_with_semaphore(nid):
@@ -1277,12 +1284,14 @@ async def _execute_single_node(
             output_folder=output_folder,
         )
         try:
+            _node_timeout = _get_config()["retry"]["node_timeout"]
             result = await asyncio.wait_for(
                 asyncio.get_running_loop().run_in_executor(None, _exec_fn),
-                timeout=120.0,
+                timeout=_node_timeout,
             )
         except asyncio.TimeoutError:
-            return {"status": "error", "error": "Execution timed out after 120s"}
+            _node_timeout = _get_config()["retry"]["node_timeout"]
+            return {"status": "error", "error": f"Execution timed out after {_node_timeout:.0f}s"}
 
         qual = validate_output_quality(result, analysis_type)
         if not qual["quality_pass"]:
@@ -1651,7 +1660,7 @@ def _validate_column_roles_against_csv(column_roles: dict, csv_path: str) -> dic
             logging.info(f"[ColGuard] case fix: '{col_name}' â†’ '{canonical}'")
             continue
         # Fuzzy match (Levenshtein-like via difflib)
-        matches = difflib.get_close_matches(col_name, actual_cols, n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(col_name, actual_cols, n=1, cutoff=_get_config()["data_quality"]["column_match_cutoff"])
         if matches:
             corrected[role_key] = matches[0]
             fixed = True

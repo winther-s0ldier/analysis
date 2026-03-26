@@ -34,6 +34,7 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from tools.redis_client import get_redis, redis_available
+from tools.config_loader import get_config
 
 sys.path.insert(0, os.path.dirname(__file__))
 from agents.orchestrator import (
@@ -83,7 +84,12 @@ async def lifespan(app: FastAPI):
         _server_script = str(Path(__file__).parent / "agent_servers" / "server_base.py")
         _log_dir = Path(__file__).parent / "logs"
         _log_dir.mkdir(exist_ok=True)
-        for _agent_name, _port in [("synthesis", 8004), ("critic", 8005), ("dag_builder", 8006)]:
+        _agent_ports = get_config()["agents"]["ports"]
+        for _agent_name, _port in [
+            ("synthesis", _agent_ports["synthesis"]),
+            ("critic", _agent_ports["critic"]),
+            ("dag_builder", _agent_ports["dag_builder"]),
+        ]:
             try:
                 _log_out = open(_log_dir / f"{_agent_name}.log", "a", encoding="utf-8")
                 proc = subprocess.Popen(
@@ -318,8 +324,8 @@ class SessionState:
 
 sessions: Dict[str, SessionState] = {}
 
-_SESSION_TTL = 86400      # 24 hours — Redis TTL
-_SESSION_MAX_AGE = 86400  # 24 hours — in-memory eviction threshold
+_SESSION_TTL = get_config()["pipeline"]["session_ttl"]      # Redis TTL
+_SESSION_MAX_AGE = get_config()["pipeline"]["session_ttl"]  # in-memory eviction threshold
 _SESSION_PREFIX = "adk:session:"
 
 

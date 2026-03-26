@@ -1,0 +1,32 @@
+pipeline:
+  max_parallel_nodes: 3        # orchestrator.py DAG semaphore
+  sse_poll_interval: 0.4       # main.py SSE generator sleep
+  synthesis_delay: 2.0         # orchestrator.py pre-synthesis pause
+  session_ttl: 86400           # main.py session TTL (seconds)
+  sse_sleep_spacing: 0.45      # orchestrator.py staggered SSE push sleep
+
+retry:
+  max_attempts: 3              # orchestrator.py LLM retry count
+  backoff_base: 15.0           # orchestrator.py backoff multiplier (seconds)
+  llm_timeout: 900.0           # orchestrator.py synthesis/pipeline timeout
+  node_timeout: 120.0          # orchestrator.py single-node execution timeout
+
+agents:
+  ports:
+    synthesis: 8004
+    critic: 8005
+    dag_builder: 8006
+
+data_quality:
+  null_warn_pct: 30            # tools/data_gate.py high null density threshold (%)
+  null_critical_pct: 90        # tools/data_gate.py critical null density threshold (%)
+  duplicate_warn_pct: 50       # tools/data_gate.py duplicate row threshold (%)
+  profiler_confidence_threshold: 0.7   # orchestrator.py triggers clarification below this
+  column_match_cutoff: 0.6     # orchestrator.py difflib fuzzy column matching cutoff
+
+synthesis:
+  min_report_chars: 1500       # agents/synthesis.py final check — conversational_report
+  min_report_chars_warn: 800   # agents/synthesis.py early warning — conversational_report
+  min_exec_summary_chars: 150  # agents/synthesis.py executive_summary.overall_health
+  min_insight_summary_chars: 80    # agents/synthesis.py per-insight ai_summary
+  min_insight_hypothesis_chars: 60  # agents/synthesis.py per-insight root_cause_hypothesis
