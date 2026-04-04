@@ -239,7 +239,7 @@ export function NarrativeCard({ htmlContent }) {
 
 function _mdToHtml(md) {
   try {
-    return marked.parse(md, { breaks: true, gfm: true });
+    return marked.parse(md, { breaks: true, gfm: true, async: false });
   } catch {
     return `<pre style="white-space:pre-wrap">${md}</pre>`;
   }

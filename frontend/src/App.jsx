@@ -15,7 +15,7 @@ import { useSSEStream } from './hooks/useSSEStream';
 import { Toaster } from 'sonner';
 import { useAutoAnimate } from '@formkit/auto-animate/react';
 import { motion } from 'framer-motion';
-import { Menu } from 'lucide-react';
+import { Menu, FileText, MessageSquare } from 'lucide-react';
 
 // ── Resizable Split Handle ─────────────────────────────────────────────────
 function ResizeHandle({ onDrag, onDragEnd }) {
@@ -81,6 +81,7 @@ function App() {
   const messagesEndRef = useRef(null);
   const [pipelineParent] = useAutoAnimate();
   const [conversationParent] = useAutoAnimate();
+  const [mobileView, setMobileView] = useState('chat'); // 'chat' or 'canvas'
 
   // Detect mobile viewport
   const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
@@ -91,6 +92,15 @@ function App() {
     if (window.innerWidth <= 768) setSidebarCollapsed(true);
     return () => window.removeEventListener('resize', handler);
   }, [setSidebarCollapsed]);
+
+  // Auto-switch mobile view to canvas when it opens
+  useEffect(() => {
+    if (isMobile && canvasOpen) {
+      setMobileView('canvas');
+    } else if (isMobile && !canvasOpen) {
+      setMobileView('chat');
+    }
+  }, [isMobile, canvasOpen]);
 
   // Ask AI handler — used by SelectionPopover in the chat column and by CanvasPanel
   const handleChatAsk = useCallback(async (selectedText, question) => {
@@ -199,10 +209,10 @@ function App() {
     <>
       <Toaster position="bottom-right" richColors theme="light" closeButton />
 
-      {/* Mobile hamburger — only visible on mobile, always accessible */}
-      {isMobile && (
+      {/* Mobile hamburger — only visible when sidebar is collapsed on mobile AND in chat view */}
+      {isMobile && sidebarCollapsed && mobileView === 'chat' && (
         <button
-          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          onClick={() => setSidebarCollapsed(false)}
           style={{
             position: 'fixed',
             top: 12,
@@ -220,9 +230,46 @@ function App() {
             boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
             cursor: 'pointer',
           }}
-          aria-label="Toggle sidebar"
+          aria-label="Open sidebar"
         >
           <Menu size={18} />
+        </button>
+      )}
+
+      {/* Mobile view toggle — only visible when canvas is open on mobile */}
+      {isMobile && canvasOpen && (
+        <button
+          onClick={() => setMobileView(mobileView === 'chat' ? 'canvas' : 'chat')}
+          style={{
+            position: 'fixed',
+            bottom: 84, // Above the User Activity button area
+            right: 16,
+            zIndex: 10000,
+            padding: '10px 16px',
+            background: '#111827',
+            color: '#F9FAFB',
+            border: 'none',
+            borderRadius: 24,
+            fontSize: 13,
+            fontWeight: 600,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            cursor: 'pointer',
+          }}
+        >
+          {mobileView === 'chat' ? (
+            <>
+              <FileText size={16} />
+              View Report
+            </>
+          ) : (
+            <>
+              <MessageSquare size={16} />
+              Back to Chat
+            </>
+          )}
         </button>
       )}
 
@@ -251,6 +298,7 @@ function App() {
           className="flex flex-col overflow-hidden"
           style={{
             width: isMobile ? '100%' : (canvasOpen ? `${chatPct}%` : '100%'),
+            display: isMobile && mobileView === 'canvas' ? 'none' : 'flex',
             minWidth: 0,
             flexShrink: 0,
             transition: isDragging ? 'none' : 'width 0.3s ease',
@@ -348,7 +396,15 @@ function App() {
         )}
 
         {/* Canvas panel — fills remaining space via flex:1 */}
-        <CanvasPanel onAsk={handleChatAsk} />
+        <div
+          className="flex-1 flex overflow-hidden"
+          style={{
+            display: isMobile && mobileView === 'chat' ? 'none' : 'flex',
+            minWidth: 0,
+          }}
+        >
+          <CanvasPanel onAsk={handleChatAsk} />
+        </div>
       </main>
     </>
   );

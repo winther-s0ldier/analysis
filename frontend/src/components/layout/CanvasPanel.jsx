@@ -418,10 +418,24 @@ export function CanvasPanel({ onAsk }) {
   const handleCopyLink = useCallback(() => {
     if (!sessionId) return;
     const url = `${window.location.origin}/report/${sessionId}`;
-    navigator.clipboard.writeText(url).then(() => {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {});
+    } else {
+      // Fallback for HTTP (no secure context)
+      const el = document.createElement('textarea');
+      el.value = url;
+      el.style.position = 'fixed';
+      el.style.opacity = '0';
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    }).catch(() => {});
+    }
   }, [sessionId]);
 
   // Table of contents extracted from report iframe headings

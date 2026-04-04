@@ -41,10 +41,11 @@ export function Sidebar() {
         {!collapsed && (
           <motion.aside
             key="sidebar"
-            className="flex flex-col shrink-0 z-10 overflow-hidden"
+            className="flex flex-col shrink-0 z-10"
             style={{
               backgroundColor: '#3D2B1A',
               borderRight: '1px solid rgba(255,255,255,0.07)',
+              overflow: isMobile ? 'auto' : 'hidden',
               // On mobile: fixed overlay drawer; on desktop: inline
               ...(isMobile ? {
                 position: 'fixed',
@@ -174,14 +175,24 @@ export function Sidebar() {
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '0 0 8px' }} />
 
             {/* User Activity button — bottom of expanded sidebar */}
-            <div className="px-2 pb-4 shrink-0">
+            <div
+              className="px-2 shrink-0"
+              style={{
+                paddingBottom: isMobile
+                  ? 'max(16px, env(safe-area-inset-bottom, 16px))'
+                  : '16px',
+              }}
+            >
               <button
                 onClick={() => window.location.href = '/user-activity/'}
-                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition-all duration-200"
+                className="w-full flex items-center gap-2.5 px-3 rounded-xl transition-all duration-200"
                 style={{
                   background: 'rgba(99,102,241,0.18)',
                   border: '1px solid rgba(99,102,241,0.35)',
                   cursor: 'pointer',
+                  paddingTop: isMobile ? 12 : 10,
+                  paddingBottom: isMobile ? 12 : 10,
+                  minHeight: isMobile ? 48 : 'auto',
                 }}
                 onMouseEnter={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.30)'; e.currentTarget.style.borderColor = 'rgba(99,102,241,0.6)'; }}
                 onMouseLeave={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.18)'; e.currentTarget.style.borderColor = 'rgba(99,102,241,0.35)'; }}

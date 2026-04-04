@@ -129,8 +129,13 @@ export function InputArea() {
 
   return (
     <div
-      className="shrink-0 px-4 py-3 bg-bg-page"
-      style={{ borderTop: '1px solid #F3F4F6' }}
+      className="shrink-0 px-4 py-3 bg-bg-page transition-all duration-300"
+      style={{
+        borderTop: '1px solid #F3F4F6',
+        paddingBottom: typeof window !== 'undefined' && window.innerWidth <= 768
+          ? 'max(12px, env(safe-area-inset-bottom, 12px))'
+          : 12
+      }}
       onDragOver={e => { e.preventDefault(); setIsHovering(true); }}
       onDragLeave={() => setIsHovering(false)}
       onDrop={handleDrop}
