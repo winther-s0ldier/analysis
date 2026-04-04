@@ -14,3 +14,5 @@ lifelines>=0.29.0
 networkx
 mlxtend>=0.23.0
 statsmodels>=0.14.0
+redis
+a2a-sdk

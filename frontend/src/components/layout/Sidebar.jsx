@@ -4,7 +4,6 @@ import { usePipelineStore } from '../../store/pipelineStore';
 import {
   PanelLeftClose, PanelLeft,
   Database, Search, Activity, Cpu, FileText, Upload,
-  LayoutGrid,
 } from 'lucide-react';
 import { cn } from '../ui/Badge';
 
@@ -51,20 +50,14 @@ export function Sidebar() {
             {/* Logo row */}
             <div className="px-4 pt-5 pb-4 flex items-center justify-between shrink-0">
               <div className="flex items-center gap-2.5">
-                <div
-                  className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0"
-                  style={{ background: 'linear-gradient(135deg,#6366F1,#4F46E5)' }}
-                >
-                  <LayoutGrid size={14} strokeWidth={2.5} color="#fff" />
-                </div>
-                <div className="flex flex-col leading-none">
-                  <span className="text-[13px] font-bold tracking-tight" style={{ color: '#F0EBE3' }}>
-                    ADHOPSUN
-                  </span>
-                  <span className="text-[10px] font-medium tracking-widest uppercase" style={{ color: '#A89070' }}>
-                    Analytics
-                  </span>
-                </div>
+                <img
+                  src="/adhopsun.jpeg"
+                  alt="ADHOPSUN"
+                  className="w-7 h-7 rounded-lg shrink-0 object-cover"
+                />
+                <span className="text-[13px] font-bold tracking-tight" style={{ color: '#F0EBE3' }}>
+                  ADHOPSUN
+                </span>
               </div>
 
               <button
