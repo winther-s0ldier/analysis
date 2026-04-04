@@ -1866,6 +1866,14 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")), name="dist_assets")
 app.mount("/user-activity", StaticFiles(directory=str(BASE_DIR / "frontend" / "public" / "user-activity"), html=True), name="user_activity")
 
+@app.get("/adhopsun.jpeg")
+async def serve_logo():
+    return FileResponse(str(BASE_DIR / "frontend" / "dist" / "adhopsun.jpeg"), media_type="image/jpeg")
+
+@app.get("/icons.svg")
+async def serve_icons():
+    return FileResponse(str(BASE_DIR / "frontend" / "dist" / "icons.svg"), media_type="image/svg+xml")
+
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def spa_fallback(full_path: str):
     html_path = BASE_DIR / "frontend" / "dist" / "index.html"
