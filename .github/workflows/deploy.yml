@@ -1,0 +1,27 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          timeout: 600s
+          script: |
+            cd /home/ubuntu/analysis
+            git pull origin main
+            source venv/bin/activate
+            pip install -r requirements.txt --quiet
+            cd frontend
+            npm install --quiet
+            npm run build
+            cd ..
+            sudo supervisorctl restart adk
