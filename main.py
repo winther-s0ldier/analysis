@@ -579,7 +579,7 @@ async def _validate_via_llm(prompt: str) -> dict:
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    html_path = BASE_DIR / "static" / "index.html"
+    html_path = BASE_DIR / "frontend" / "dist" / "index.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 @app.post("/upload")
@@ -1863,7 +1863,13 @@ async def list_sessions():
     }
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")), name="dist_assets")
 app.mount("/user-activity", StaticFiles(directory=str(BASE_DIR / "frontend" / "public" / "user-activity"), html=True), name="user_activity")
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa_fallback(full_path: str):
+    html_path = BASE_DIR / "frontend" / "dist" / "index.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
 if __name__ == "__main__":
     import uvicorn
