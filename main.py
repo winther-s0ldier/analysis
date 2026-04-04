@@ -1863,8 +1863,11 @@ async def list_sessions():
     }
 
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")), name="dist_assets")
 app.mount("/user-activity", StaticFiles(directory=str(BASE_DIR / "frontend" / "public" / "user-activity"), html=True), name="user_activity")
+
+_dist_assets = BASE_DIR / "frontend" / "dist" / "assets"
+if _dist_assets.exists():
+    app.mount("/assets", StaticFiles(directory=str(_dist_assets)), name="dist_assets")
 
 @app.get("/adhopsun.jpeg")
 async def serve_logo():
@@ -1876,8 +1879,10 @@ async def serve_icons():
 
 @app.get("/{full_path:path}", response_class=HTMLResponse)
 async def spa_fallback(full_path: str):
-    html_path = BASE_DIR / "frontend" / "dist" / "index.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    dist_index = BASE_DIR / "frontend" / "dist" / "index.html"
+    if dist_index.exists():
+        return HTMLResponse(content=dist_index.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<p>Run <code>npm run build</code> in the frontend folder.</p>", status_code=503)
 
 if __name__ == "__main__":
     import uvicorn

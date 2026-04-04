@@ -17,6 +17,7 @@ jobs:
           timeout: 600s
           script: |
             cd /home/ubuntu/analysis
+            git stash
             git pull origin main
             source venv/bin/activate
             pip install -r requirements.txt --quiet
