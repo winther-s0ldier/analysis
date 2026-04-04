@@ -6,7 +6,6 @@ export const usePipelineStore = create((set) => ({
   phase: 'idle', // 'idle' | 'uploading' | 'profiling' | 'discovering' | 'analyzing' | 'synthesizing' | 'building_report' | 'complete' | 'error'
   nodes: [],
   customMetricNodes: [], // user-validated custom analyses added before pipeline runs
-  renderedChartIds: new Set(),
   hasReport: false,
   sseConnected: false,
   canvasOpen: false,
@@ -17,7 +16,6 @@ export const usePipelineStore = create((set) => ({
     sessionId, outputFolder,
     phase: 'idle', nodes: [], customMetricNodes: [], hasReport: false,
     canvasOpen: false, canvasNarrative: null,
-    renderedChartIds: new Set(),
   }),
   setPhase: (phase) => set({ phase }),
 
@@ -50,12 +48,6 @@ export const usePipelineStore = create((set) => ({
     nodes: state.nodes.filter(n => n.id !== id),
   })),
 
-  markChartRendered: (id) => set((state) => {
-    const newSet = new Set(state.renderedChartIds);
-    newSet.add(id);
-    return { renderedChartIds: newSet };
-  }),
-
   setHasReport: (hasReport) => set({ hasReport }),
   setSseConnected: (sseConnected) => set({ sseConnected }),
   setCanvasOpen: (canvasOpen) => set({ canvasOpen }),
@@ -73,7 +65,6 @@ export const usePipelineStore = create((set) => ({
     phase: 'idle',
     nodes: [],
     customMetricNodes: [],
-    renderedChartIds: new Set(),
     hasReport: false,
     sseConnected: false,
     canvasOpen: false,

@@ -1,37 +1,33 @@
-"""
-agent_servers/server_base.py
-============================
-Wraps any ADK agent into a standalone A2A HTTP server.
-
-Usage:
-    python agent_servers/server_base.py --agent profiler --port 8001
-    python agent_servers/server_base.py --agent coder    --port 8003
-
-Each server exposes:
-    GET  /.well-known/agent-card.json   <- auto-generated Agent Card
-    POST /                              <- JSON-RPC 2.0 A2A task endpoint
-
-Environment:
-    GOOGLE_API_KEY  must be set (same as main.py)
-    GEMINI_MODEL    optional model override
-"""
 import os
 import sys
 import argparse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Load .env from project root (same as main.py)
 try:
     from dotenv import load_dotenv as _load_dotenv
     _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
 except ImportError:
     pass
-# Ensure GOOGLE_API_KEY mirrors GEMINI_API_KEY
+
 _raw = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if _raw:
     os.environ.setdefault("GOOGLE_API_KEY", _raw)
     os.environ.setdefault("GEMINI_API_KEY", _raw)
+
+_AGENT_AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN", "")
+
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        if request.url.path == "/.well-known/agent-card.json":
+            return await call_next(request)
+        if _AGENT_AUTH_TOKEN:
+            auth = request.headers.get("Authorization", "")
+            if auth != f"Bearer {_AGENT_AUTH_TOKEN}":
+                return Response("Unauthorized", status_code=401)
+        return await call_next(request)
 
 AGENT_MAP = {
     "profiler":    ("agents.profiler",    "get_profiler_agent"),
@@ -50,7 +46,6 @@ DEFAULT_PORTS = {
     "critic":      8005,
     "dag_builder": 8006,
 }
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -86,13 +81,13 @@ def main():
         sys.exit(1)
 
     app = _to_a2a(agent)
+    app.add_middleware(_BearerAuthMiddleware)
 
     import uvicorn
     print(f"INFO: Starting {args.agent} A2A server on {args.host}:{port}")
     print(f"INFO: Agent Card -> http://{args.host}:{port}/.well-known/agent-card.json")
     print(f"INFO: A2A endpoint -> http://{args.host}:{port}/")
     uvicorn.run(app, host=args.host, port=port)
-
 
 if __name__ == "__main__":
     main()

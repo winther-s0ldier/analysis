@@ -10,18 +10,22 @@ env/
 dist/
 build/
 
-# Virtual environments (any name)
 **/venv/
 **/.venv/
 **/env/
 **/ENV/
 
-# Data & Reports
 output/
 outputs/
 uploads/
 *.log
 data/log/
+
+_a2a_sessions.json
+data/schema_registry.json
+pipeline.log
+
+frontend/dist/
 
 # Test data files
 test_data*.csv

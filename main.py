@@ -56,12 +56,8 @@ from tools.ingestion_normalizer import (
     get_supported_extensions,
 )
 
-
-# ── Kaleido startup check ─────────────────────────────────────────────────
-# kaleido is required for Plotly to export static PNG charts. If it is missing
-# charts will silently fail to render in the report. Warn loudly at startup.
 try:
-    import kaleido as _kaleido  # noqa: F401
+    import kaleido as _kaleido
     print("INFO: kaleido OK — static chart export available.")
 except ImportError:
     print(
@@ -71,14 +67,11 @@ except ImportError:
 
 _agent_server_procs: list = []
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ────────────────────────────────────────────────────────────────
-    # Restore sessions persisted in Redis from a previous run
+
     _restore_sessions_from_redis()
 
-    # Start A2A agent sub-servers when USE_A2A_MULTISERVER is enabled
     if os.getenv("USE_A2A_MULTISERVER", "true").lower() != "false":
         import subprocess
         _server_script = str(Path(__file__).parent / "agent_servers" / "server_base.py")
@@ -102,12 +95,10 @@ async def lifespan(app: FastAPI):
             except Exception as _e:
                 print(f"WARNING: Could not start {_agent_name} A2A server: {_e}")
 
-    # Start hourly session eviction loop
     _eviction_task = asyncio.create_task(_cleanup_stale_sessions())
 
-    yield  # ← server is running
+    yield
 
-    # ── Shutdown ───────────────────────────────────────────────────────────────
     _eviction_task.cancel()
 
     for proc in _agent_server_procs:
@@ -116,15 +107,12 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-    # Multi-worker guard: sessions{} is in-process memory — unsafe across workers
-    # unless Redis is available (Redis becomes the shared source of truth).
     worker_count = int(os.environ.get("WEB_CONCURRENCY", "1"))
     if worker_count > 1 and not redis_available():
         print(
             f"ERROR: Multiple workers (WEB_CONCURRENCY={worker_count}) require Redis. "
             f"Either start Redis or set WEB_CONCURRENCY=1."
         )
-
 
 app = FastAPI(
     title="Agentic Analytics",
@@ -133,14 +121,10 @@ app = FastAPI(
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- A2A endpoints: root pipeline + each individual agent ---
-# Host/port read from env so Agent Card URLs are correct in production.
-# On AWS set A2A_HOST=your-domain.com A2A_PORT=443 A2A_PROTOCOL=https
 _A2A_HOST     = os.getenv("A2A_HOST",     "localhost")
 _A2A_PORT     = int(os.getenv("A2A_PORT", "8000"))
 _A2A_PROTOCOL = os.getenv("A2A_PROTOCOL", "http")
 
-# Agents to expose individually via A2A
 _A2A_AGENTS = [
     ("profiler",    "agents.profiler",    "get_profiler_agent"),
     ("discovery",   "agents.discovery",   "get_discovery_agent"),
@@ -150,13 +134,12 @@ _A2A_AGENTS = [
     ("dag_builder", "agents.dag_builder", "get_dag_builder_agent"),
 ]
 
-_mounted_a2a_agents: dict = {}   # name -> mount path, for the /agents registry
+_mounted_a2a_agents: dict = {}
 
 try:
     import importlib
     from google.adk.a2a.utils.agent_to_a2a import to_a2a as _to_a2a
 
-    # Root pipeline agent
     _root_a2a = _to_a2a(
         get_root_agent(),
         host=_A2A_HOST, port=_A2A_PORT, protocol=_A2A_PROTOCOL,
@@ -165,7 +148,6 @@ try:
     _mounted_a2a_agents["pipeline"] = "/a2a"
     print("INFO: A2A root   -> /a2a  |  Card -> /a2a/.well-known/agent-card.json")
 
-    # Individual agents
     for _a2a_name, _a2a_module, _a2a_getter in _A2A_AGENTS:
         try:
             _mod    = importlib.import_module(_a2a_module)
@@ -184,15 +166,8 @@ try:
 except Exception as _a2a_err:
     print(f"WARNING: A2A endpoints unavailable: {_a2a_err}")
 
-
 @app.get("/agents", tags=["A2A"])
 async def list_a2a_agents():
-    """
-    A2A service registry — lists every agent exposed via Google A2A protocol.
-    Each entry includes the agent name, mount path, and Agent Card URL.
-    External A2A-compliant systems can use these cards to discover and call
-    individual agents without going through the full pipeline.
-    """
     base = f"{_A2A_PROTOCOL}://{_A2A_HOST}:{_A2A_PORT}"
     return {
         "protocol": "Google A2A",
@@ -207,74 +182,86 @@ async def list_a2a_agents():
         ],
     }
 
-
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-session_service = InMemorySessionService()
+def _build_session_service():
+    _redis_url = os.getenv("REDIS_URL")
+    _a2a_active = os.getenv("USE_A2A_MULTISERVER", "true").lower() != "false"
+    if _redis_url and _a2a_active:
+        try:
+            from google.adk.sessions import RedisSessionService
+            svc = RedisSessionService(_redis_url)
+            print(f"INFO: ADK session service → Redis ({_redis_url})")
+            return svc
+        except Exception as _e:
+            print(f"WARNING: Redis ADK session init failed ({_e}), falling back to InMemory")
+    return InMemorySessionService()
+
+session_service = _build_session_service()
 
 class SessionState:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.created_at: float = time.time()   # unix timestamp — used for TTL eviction
+        self.created_at: float = time.time()
         self.csv_path: str = ""
         self.csv_filename: str = ""
         self.output_folder: str = ""
         self.status: str = "uploaded"
-        
+
         self.raw_profile: dict = {}
         self.semantic_map: dict = {}
         self.dataset_type: str = ""
         self.dag: list = []
         self.approved_metrics: list = []
         self.discovery: dict = {}
-        
+
         self.results: dict = {}
-        self.failed_nodes: set = set()   # node IDs where status=error
+        self.failed_nodes: set = set()
         self.precomputed: dict = {}
         self.synthesis: dict = {}
         self.artifacts: list = []
 
         self.message_log: list = []
-        # A2A Phase 2: per-recipient indexed mailbox — O(1) lookup instead of O(n) scan
+
         self._mailbox: dict = {}
         self.normalization: dict = {}
         self.gate_result: dict = {}
 
         self.user_instructions: str = ""
-        self.conversation_history: list = []  # [(user_msg, agent_reply), ...]
-        self.clarification_request: dict = {}  # set by discovery when CLARIFICATION_NEEDED
+        self.conversation_history: list = []
+        self.clarification_request: dict = {}
 
     def post_message(self, message) -> None:
         d = message.to_dict()
         self.message_log.append(d)
-        # A2A Phase 2: index by recipient for O(1) mailbox lookup
+
         recipient = d.get("recipient", "")
         if recipient:
             self._mailbox.setdefault(recipient, []).append(d)
 
     def get_messages_for(self, recipient: str) -> list:
-        # A2A Phase 2: use indexed mailbox instead of full scan
+
         return list(self._mailbox.get(recipient, []))
-    
+
     def store_result(self, analysis_id: str, result: dict) -> None:
         self.results[analysis_id] = result
         if isinstance(result, dict) and result.get("status") == "error":
             self.failed_nodes.add(analysis_id)
-    
+
     def get_result(self, analysis_id: str) -> dict | None:
         return self.results.get(analysis_id)
-    
-    def store_precomputed(self, analysis_type: str, 
+
+    def store_precomputed(self, analysis_type: str,
                            result: dict) -> None:
         self.precomputed[analysis_type] = result
-    
+
     def get_precomputed(self, analysis_type: str) -> dict | None:
         return self.precomputed.get(analysis_type)
-    
+
     def to_dict(self) -> dict:
         return {
             "session_id":           self.session_id,
@@ -324,20 +311,13 @@ class SessionState:
 
 sessions: Dict[str, SessionState] = {}
 
-_SESSION_TTL = get_config()["pipeline"]["session_ttl"]      # Redis TTL
-_SESSION_MAX_AGE = get_config()["pipeline"]["session_ttl"]  # in-memory eviction threshold
+_SESSION_TTL = get_config()["pipeline"]["session_ttl"]
+_SESSION_MAX_AGE = get_config()["pipeline"]["session_ttl"]
 _SESSION_PREFIX = "adk:session:"
 
-
 async def _cleanup_stale_sessions() -> None:
-    """Hourly background task: evict sessions older than _SESSION_MAX_AGE from memory.
-
-    Without this the sessions{} dict grows unboundedly — each entry can hold
-    MBs of raw_profile, results, and synthesis data across many sessions.
-    Redis handles its own TTL; this mirrors that behaviour for in-process memory.
-    """
     while True:
-        await asyncio.sleep(3600)  # run every hour
+        await asyncio.sleep(get_config()["pipeline"]["session_restore_interval"])
         now = time.time()
         stale = [
             sid for sid, state in list(sessions.items())
@@ -346,10 +326,7 @@ async def _cleanup_stale_sessions() -> None:
         for sid in stale:
             sessions.pop(sid, None)
             _sse_events.pop(sid, None)
-            # Evict per-session agent stores that are not self-evicting.
-            # _plan_store and _profile_store use .pop() on read, so they clean
-            # themselves up.  _synthesis_store, _reasoning_store, and _critic_store
-            # use .get() / direct assignment and accumulate indefinitely otherwise.
+
             try:
                 from agents.synthesis import _synthesis_store, _reasoning_store
                 _synthesis_store.pop(sid, None)
@@ -364,13 +341,10 @@ async def _cleanup_stale_sessions() -> None:
         if stale:
             print(f"INFO: [Eviction] Removed {len(stale)} stale session(s) from memory")
 
-
 def _redis_key(session_id: str) -> str:
     return f"{_SESSION_PREFIX}{session_id}"
 
-
 def _persist_session(state: SessionState) -> None:
-    """Write session state to Redis. No-op if Redis is unavailable."""
     r = get_redis()
     if not r:
         return
@@ -379,9 +353,7 @@ def _persist_session(state: SessionState) -> None:
     except Exception as e:
         print(f"WARNING: Redis persist failed for {state.session_id}: {e}")
 
-
 def _restore_sessions_from_redis() -> None:
-    """On startup, reload any sessions persisted in Redis into the in-memory dict."""
     r = get_redis()
     if not r:
         return
@@ -404,17 +376,11 @@ def _restore_sessions_from_redis() -> None:
     except Exception as e:
         print(f"WARNING: Redis session restore failed: {e}")
 
-
-# --- #12: SSE event store — thread-safe list per session ---
-# Background pipeline thread appends events; SSE endpoint reads them.
 _sse_events: Dict[str, list] = {}
 
-# Maximum pipeline wall-clock time before watchdog force-completes the session as error.
-PIPELINE_TIMEOUT_SECONDS = 900  # 15 minutes
-
+PIPELINE_TIMEOUT_SECONDS = 900
 
 async def _pipeline_watchdog(session_id: str) -> None:
-    """Force-fail a session that stays 'analyzing' beyond PIPELINE_TIMEOUT_SECONDS."""
     await asyncio.sleep(PIPELINE_TIMEOUT_SECONDS)
     state = sessions.get(session_id)
     if state and state.status == "analyzing":
@@ -425,43 +391,27 @@ async def _pipeline_watchdog(session_id: str) -> None:
         })
         print(f"WARNING: [Watchdog] Session {session_id} timed out after {PIPELINE_TIMEOUT_SECONDS}s")
 
-
 def push_sse_event(session_id: str, event_type: str, data: dict) -> None:
-    """Push a real-time event to the SSE stream for a session.
-
-    Sanitizes data through JSON round-trip with default=str to convert
-    numpy/pandas types that would crash the SSE generator's json.dumps.
-    """
     if session_id not in _sse_events:
         _sse_events[session_id] = []
-    # Sanitize: round-trip through JSON to convert non-serializable types
-    # (numpy int64, float64, pandas Timestamp, etc.) to plain Python types.
+
     try:
         clean_data = json.loads(json.dumps(data, default=str))
     except Exception:
         clean_data = {}
     _sse_events[session_id].append({"type": event_type, "data": clean_data})
 
-
 async def run_agent_pipeline(
     pipeline_id: str,
     prompt: str,
     agent_getter: str = "root",
-    max_turns: int = 15,
+    max_turns: int = None,
     image_paths: List[str] = None,
-    agent=None,  # #7: pass a pre-built agent directly (e.g. LoopAgent) instead of agent_getter
+    agent=None,
 ) -> str:
-    """Run an agent with a user message and return the response.
+    if max_turns is None:
+        max_turns = get_config()["agents"]["max_turns"]["default"]
 
-    Args:
-        pipeline_id: Session/pipeline identifier.
-        prompt: User message to send to the agent.
-        agent_getter: Which agent to use (looked up from agent_map).
-        max_turns: Maximum number of LLM round-trips before
-            giving up. Prevents small models from looping forever.
-        image_paths: Optional list of local file paths to images.
-        agent: Pre-built agent instance. If provided, agent_getter is ignored.
-    """
     APP_NAME = "Analytics_analytics"
     USER_ID = "user_1"
 
@@ -473,10 +423,10 @@ async def run_agent_pipeline(
         "synthesis":   get_synthesis_agent,
         "dag_builder": get_dag_builder_agent,
         "chat":        get_chat_agent,
-        "critic":      get_critic_agent,   # #8: adversarial critic
+        "critic":      get_critic_agent,
     }
     if agent is not None:
-        target_agent = agent  # #7: LoopAgent or any pre-built agent passed directly
+        target_agent = agent
     else:
         getter = agent_map.get(agent_getter, get_root_agent)
         target_agent = getter()
@@ -504,13 +454,13 @@ async def run_agent_pipeline(
                         with open(p, "rb") as f:
                             return f.read()
                     img_bytes = await asyncio.to_thread(_read_img)
-                    
+
                     mime_type = "image/png"
                     if img_path.lower().endswith(".html"):
                         continue
                     elif img_path.lower().endswith(".jpg") or img_path.lower().endswith(".jpeg"):
                         mime_type = "image/jpeg"
-                        
+
                     parts.append(
                         types.Part.from_bytes(data=img_bytes, mime_type=mime_type)
                     )
@@ -541,7 +491,6 @@ async def run_agent_pipeline(
             ):
                 turn_count += 1
 
-                # ADK tracing: forward tool calls to SSE for real-time observability
                 if _adk_trace and event.content and event.content.parts:
                     for _part in event.content.parts:
                         _fc = getattr(_part, "function_call", None)
@@ -580,10 +529,10 @@ async def run_agent_pipeline(
             )
             if is_rate_limit:
                 if attempt < max_retries - 1:
-                    # Respect API-suggested delay if present, else exponential backoff
+
                     match = re.search(r"'retryDelay': '(\d+)s'", str(e))
-                    base_delay = int(match.group(1)) + 1 if match else 20
-                    delay = min(base_delay * (attempt + 1), 120)  # cap at 2 min
+                    base_delay = int(match.group(1)) + 1 if match else get_config()["pipeline"]["rate_limit_default_delay"]
+                    delay = min(base_delay * (attempt + 1), 120)
                     print(f"Rate limit hit. Waiting {delay}s... (Attempt {attempt+1}/{max_retries})")
                     await asyncio.sleep(delay)
                     continue
@@ -594,46 +543,47 @@ async def run_agent_pipeline(
 
     return final_response
 
-
 def extract_json(response: str) -> dict:
-    """Robustly extract JSON from LLM text that may contain markdown wrappers."""
     try:
         match = re.search(r'```(?:json)?\s*(.*?)\s*```', response, re.DOTALL)
         if match:
             return json.loads(match.group(1))
-        
+
         first_brace = response.find('{')
         first_bracket = response.find('[')
-        
+
         start_idx = -1
         if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
             start_idx = first_brace
         elif first_bracket != -1:
             start_idx = first_bracket
-        
+
         if start_idx != -1:
             last_brace = response.rfind('}')
             last_bracket = response.rfind(']')
             end_idx = max(last_brace, last_bracket)
-            
+
             if end_idx != -1:
                 return json.loads(response[start_idx:end_idx + 1])
-        
+
         return json.loads(response.strip())
     except Exception as e:
         return {"error": str(e), "raw": response[:500]}
 
+async def _validate_via_llm(prompt: str) -> dict:
+    import google.generativeai as genai
+    from tools.model_config import get_model
+    model = genai.GenerativeModel(get_model("discovery"))
+    response = model.generate_content(prompt)
+    return extract_json(response.text) or {}
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """Serve the main UI."""
     html_path = BASE_DIR / "static" / "index.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
-
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
-    """Upload a file and start the analysis pipeline."""
     if not is_supported(file.filename):
         raise HTTPException(
             status_code=415,
@@ -645,13 +595,13 @@ async def upload_csv(file: UploadFile = File(...)):
         )
 
     session_id = str(uuid.uuid4())
-    
+
     file_basename = file.filename.rsplit(".", 1)[0]
     safe_folder = re.sub(r'[^\w]', '_', file_basename).strip('_')[:80]
     output_folder = safe_folder
     if (OUTPUT_DIR / output_folder).exists():
         output_folder = f"{safe_folder}_{session_id[:6]}"
-    
+
     ext = Path(file.filename).suffix.lower()
     saved_file_path = UPLOAD_DIR / f"{output_folder}{ext}"
 
@@ -681,7 +631,6 @@ async def upload_csv(file: UploadFile = File(...)):
 
     csv_path = norm_result["csv_path"]
 
-    # --- Pre-Flight Data Quality Gate ---
     from tools.data_gate import run_preflight_check
     dataset_type = norm_result["original_filename"].split(".")[0]
     gate_result = run_preflight_check(csv_path, dataset_type)
@@ -719,10 +668,8 @@ async def upload_csv(file: UploadFile = File(...)):
         "status":       "uploaded",
     }
 
-
 @app.post("/profile/{session_id}")
 async def profile_dataset(session_id: str):
-    """Run the profiler agent to analyze CSV structure. Returns profile + classification."""
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
@@ -748,7 +695,7 @@ async def profile_dataset(session_id: str):
     state.status = "profiled"
     _persist_session(state)
 
-    from a2a_messages import create_message, Intent
+    from pipeline_types import create_message, Intent
     msg = create_message(
         sender="profiler_agent",
         recipient="discovery_agent",
@@ -779,13 +726,7 @@ async def profile_dataset(session_id: str):
         "classification": profiler_data.get("classification"),
     }
 
-
 def build_fallback_discovery(state: SessionState, session_id: str) -> dict:
-    """
-    Deterministic fallback: build the analysis DAG directly from
-    the profiler's recommended_analyses, bypassing the LLM entirely.
-    Works with ANY model (or no model at all).
-    """
     from agents.discovery import (
         build_dag_deterministic,
         tool_submit_analysis_plan,
@@ -830,10 +771,8 @@ def build_fallback_discovery(state: SessionState, session_id: str) -> dict:
         "node_count": dag_result.get("node_count", 0),
     }
 
-
 @app.post("/discover/{session_id}")
 async def discover_metrics(session_id: str):
-    """Run the discovery agent to build an analysis DAG from the existing profile."""
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
@@ -876,7 +815,7 @@ async def discover_metrics(session_id: str):
         response = await run_agent_pipeline(
             session_id, prompt,
             agent_getter="discovery",
-            max_turns=12,
+            max_turns=get_config()["agents"]["max_turns"]["discovery"],
         )
     except Exception as e:
         print(f"Discovery agent error: {e}")
@@ -903,13 +842,8 @@ async def discover_metrics(session_id: str):
         "discovery": discovery_data,
     }
 
-
 @app.post("/validate-metric/{session_id}")
 async def validate_metric(session_id: str, request: Request):
-    """
-    Validate a custom metric request against the data.
-    The Discovery Agent reasons about whether the data supports this analysis.
-    """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
@@ -940,32 +874,24 @@ async def validate_metric(session_id: str, request: Request):
         f'"analysis_type": "weekly_batch_patterns", "column_roles": {{"time_col": "created_at", "value_col": "amount"}}}}'
     )
 
-    response = await run_agent_pipeline(
-        f"{session_id}_validate", prompt, agent_getter="discovery"
-    )
-
-    result = extract_json(response)
+    result = await _validate_via_llm(prompt)
     return {"session_id": session_id, "validation": result}
-
 
 class AnalyzeRequest(BaseModel):
     request: Optional[str] = "Analyze all metrics"
-    custom_metrics: Optional[List[str]] = []      # legacy: kept for backwards compat
-    custom_nodes: Optional[List[dict]] = []        # structured node specs from UI
+    custom_metrics: Optional[List[str]] = []
+    custom_nodes: Optional[List[dict]] = []
     approved_metrics: Optional[List[str]] = None
     user_instructions: Optional[str] = ""
-
 
 async def run_pipeline_background(
     session_id, csv_path, output_folder,
     approved, state
 ):
+    from agents.orchestrator import _pipeline_event_hooks
+    _pipeline_event_hooks[session_id] = lambda evt, data: push_sse_event(session_id, evt, data)
+    _sse_events[session_id] = []
     try:
-        # --- #12: Register SSE event hook so orchestrator can push real-time events ---
-        from agents.orchestrator import _pipeline_event_hooks
-        _pipeline_event_hooks[session_id] = lambda evt, data: push_sse_event(session_id, evt, data)
-        _sse_events[session_id] = []  # Reset event list for this run
-
         print(f"INFO: Pipeline starting for {session_id}")
         result = await run_full_pipeline(
             session_id=session_id,
@@ -981,7 +907,12 @@ async def run_pipeline_background(
         traceback.print_exc()
         state.status = "error"
         _persist_session(state)
-
+        try:
+            push_sse_event(session_id, "stream_end", {"status": "error", "error": str(e)})
+        except Exception:
+            pass
+    finally:
+        _pipeline_event_hooks.pop(session_id, None)
 
 @app.post("/analyze/{session_id}")
 async def analyze(
@@ -997,7 +928,6 @@ async def analyze(
             detail="Session not found"
         )
 
-    # Guard against double-submit (e.g. user clicks Analyze twice rapidly)
     if state.status in ("analyzing", "synthesizing", "building_report"):
         raise HTTPException(
             status_code=409,
@@ -1010,14 +940,12 @@ async def analyze(
     if req_body.user_instructions:
         state.user_instructions = req_body.user_instructions
 
-    # Append user-defined custom nodes to the DAG before the pipeline starts.
-    # The orchestrator sees them as regular DAG nodes and executes them normally.
     if req_body.custom_nodes:
         existing_ids = {n.get("id") for n in (state.dag or [])}
         appended_ids = []
         for cn in req_body.custom_nodes:
             node_id = cn.get("id") or f"C{len(state.dag) + 1}"
-            if node_id not in existing_ids:          # guard against double-submit
+            if node_id not in existing_ids:
                 state.dag.append({
                     "id":            node_id,
                     "analysis_type": cn.get("analysis_type", "custom"),
@@ -1031,11 +959,6 @@ async def analyze(
                 appended_ids.append(node_id)
         print(f"INFO: {len(appended_ids)} custom node(s) appended to DAG for {session_id}")
 
-        # Include custom node IDs in approved_metrics so the orchestrator's
-        # DAG filter (approved_metrics whitelist) does not discard them.
-        # BUT: if metrics is None, that means "run ALL" — don't restrict it.
-        # The custom nodes are already appended to state.dag, so they'll be
-        # included when the orchestrator runs the full DAG unfiltered.
         if appended_ids and metrics is not None:
             metrics = list(metrics) + appended_ids
 
@@ -1057,14 +980,8 @@ async def analyze(
 
     return {"status": "started", "session_id": session_id}
 
-
 @app.post("/clarify/{session_id}")
 async def submit_clarification(session_id: str, request: Request):
-    """
-    Receive user-confirmed column roles after a CLARIFICATION_NEEDED pause.
-    Updates state.semantic_map with the confirmed roles, posts CLARIFICATION_PROVIDED,
-    and re-triggers the /discover stage so the pipeline can proceed.
-    """
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1076,15 +993,13 @@ async def submit_clarification(session_id: str, request: Request):
     if not confirmed_roles:
         raise HTTPException(status_code=400, detail="column_roles required in request body")
 
-    # Merge confirmed roles into the existing semantic map
     if not isinstance(state.semantic_map, dict):
         state.semantic_map = {}
     if "column_roles" not in state.semantic_map:
         state.semantic_map["column_roles"] = {}
     state.semantic_map["column_roles"].update(confirmed_roles)
 
-    # Post CLARIFICATION_PROVIDED so orchestrator / discovery can resume
-    from a2a_messages import create_message, Intent
+    from pipeline_types import create_message, Intent
     state.post_message(create_message(
         intent=Intent.CLARIFICATION_PROVIDED,
         sender="frontend",
@@ -1092,16 +1007,13 @@ async def submit_clarification(session_id: str, request: Request):
         payload={"confirmed_column_roles": confirmed_roles},
     ))
 
-    state.status = "uploaded"  # reset so /discover can run again
+    state.status = "uploaded"
     push_sse_event(session_id, "status_update", {"status": "clarification_provided", "message": "Column roles confirmed — re-running discovery."})
 
-    # Re-trigger discovery with the updated column roles
     asyncio.create_task(_re_discover(session_id))
     return {"status": "clarification_provided", "session_id": session_id}
 
-
 async def _re_discover(session_id: str) -> None:
-    """Re-run discovery after a clarification response."""
     state = sessions.get(session_id)
     if not state:
         return
@@ -1126,7 +1038,6 @@ async def _re_discover(session_id: str) -> None:
         print(f"ERROR: _re_discover failed for {session_id}: {_e}")
         state.status = "error"
 
-
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
     state = sessions.get(session_id)
@@ -1135,20 +1046,17 @@ async def get_status(session_id: str):
             status_code=404,
             detail="Session not found"
         )
-    # Layer 1: live pipeline state from the orchestrator store.
-    # get_pipeline_status reads _pipeline_store which tracks running/blocked in real-time.
-    live = get_pipeline_status(session_id)
-    live_statuses = live.get("node_statuses", {})   # includes "running" and "blocked"
 
-    # Layer 2: merge with SessionState for any node not yet in the pipeline store
-    # (e.g. between /discover and /analyze, or after a Redis restore).
+    live = get_pipeline_status(session_id)
+    live_statuses = live.get("node_statuses", {})
+
     node_statuses = {}
     failed = getattr(state, "failed_nodes", set())
     if state.dag:
         for node in state.dag:
             nid = node.get("id", "")
             if nid in live_statuses:
-                node_statuses[nid] = live_statuses[nid]  # running / blocked / complete / failed
+                node_statuses[nid] = live_statuses[nid]
             elif nid in failed:
                 node_statuses[nid] = "failed"
             elif nid in state.results:
@@ -1156,7 +1064,6 @@ async def get_status(session_id: str):
             else:
                 node_statuses[nid] = "pending"
 
-    # Include gate results and monitor alerts so callers get the full picture in one request
     from tools.monitor import get_session_events
     raw_events = get_session_events(session_id, min_severity="warning")
     alerts = [{"event": e.get("type", "unknown"), "data": e.get("payload", {})} for e in raw_events]
@@ -1181,40 +1088,39 @@ async def get_status(session_id: str):
 
 @app.get("/stream/{session_id}")
 async def sse_stream(session_id: str, request: Request):
-    """
-    #12: Server-Sent Events endpoint for real-time pipeline progress.
-    Replaces polling — frontend subscribes once and receives events as they happen.
-    Events: node_complete, synthesis_complete, report_ready, stream_end.
-    Falls back gracefully: if client disconnects, generator exits cleanly.
-    """
     async def event_generator():
         last_index = 0
         _keepalive_counter = 0
-        while True:
+        _max_sse_seconds = 1800
+        _elapsed = 0.0
+        _poll_interval = 0.4
+        while _elapsed < _max_sse_seconds:
             if await request.is_disconnected():
                 break
             events = _sse_events.get(session_id, [])
-            # Yield any new events since last check
+
             new_events = events[last_index:]
             for ev in new_events:
                 try:
                     yield f"data: {json.dumps(ev, default=str)}\n\n".encode("utf-8")
                 except Exception:
-                    # Skip malformed events — don't let one bad event kill the stream
                     yield f"data: {json.dumps({'type': ev.get('type', 'unknown'), 'data': {}})}\n\n".encode("utf-8")
             last_index += len(new_events)
-            # Check terminal condition: pipeline done AND all events sent
+
             state = sessions.get(session_id)
             if state and state.status in ("complete", "error") and last_index >= len(events):
                 yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': state.status}})}\n\n".encode("utf-8")
-                _sse_events.pop(session_id, None)  # free memory once stream closes
+                _sse_events.pop(session_id, None)
                 break
-            # Bug-11: reduced poll interval for faster event delivery;
-            # keepalive comment every ~5s prevents proxy/browser timeouts
+
             _keepalive_counter += 1
             if _keepalive_counter % 12 == 0:
                 yield b": keepalive\n\n"
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(_poll_interval)
+            _elapsed += _poll_interval
+        else:
+            yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': 'error', 'error': 'SSE stream timed out after 30 minutes'}})}\n\n".encode("utf-8")
+            _sse_events.pop(session_id, None)
 
     return StreamingResponse(
         event_generator(),
@@ -1226,19 +1132,12 @@ async def sse_stream(session_id: str, request: Request):
         },
     )
 
-
 @app.post("/rerun-synthesis/{session_id}")
 async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, body: dict = None):
-    """
-    #5: Re-run synthesis (and critic + report) without re-running all analysis nodes.
-    Useful when synthesis quality was poor or the user wants a fresh interpretation.
-    Returns immediately; results stream via SSE or appear on next /synthesis poll.
-    """
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(404, "Session not found")
 
-    # Block if pipeline is still running
     if state.status not in ("complete", "error", "rerunning_synthesis"):
         raise HTTPException(
             409,
@@ -1253,7 +1152,6 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
     if not completed:
         raise HTTPException(400, "No completed analyses available to synthesize.")
 
-    # Clear old synthesis so agents start fresh
     try:
         from agents.synthesis import _synthesis_store, _reasoning_store
         _synthesis_store.pop(session_id, None)
@@ -1262,10 +1160,7 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
         pass
     state.synthesis = {}
     state.status = "rerunning_synthesis"
-    _sse_events[session_id] = []  # Fresh event stream
-
-    # Reuse the existing event hook — already registered by run_pipeline_background.
-    # Do NOT overwrite it here: overwriting mid-stream would lose pending events.
+    _sse_events[session_id] = []
 
     user_instructions = (body or {}).get("instructions", "").strip()
 
@@ -1287,14 +1182,13 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
             )
             push_sse_event(session_id, "synthesis_complete", {"session_id": session_id})
 
-            # Re-run critic
             try:
                 from agents.critic import get_critic_store_result
                 await run_agent_pipeline(
                     f"{session_id}_critic_rerun",
                     f"session_id: {session_id}\nReview the regenerated synthesis.",
                     agent_getter="critic",
-                    max_turns=8,
+                    max_turns=get_config()["agents"]["max_turns"]["critic"],
                 )
                 _crit = get_critic_store_result(session_id)
                 if _crit:
@@ -1306,7 +1200,6 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
             except Exception as _ce:
                 print(f"WARNING: Critic rerun failed (non-fatal): {_ce}")
 
-            # Re-run dag_builder
             await run_agent_pipeline(
                 f"{session_id}_report_rerun",
                 f"Session ID: {session_id}\nOutput folder: {state.output_folder}\n"
@@ -1329,12 +1222,7 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
                    "Results will appear shortly.",
     }
 
-
 async def _classify_chat_intent(message: str) -> str:
-    """Lightweight LLM classification: is this a new analysis request or a question?
-
-    Returns 'analysis' or 'question'.
-    """
     classification_prompt = (
         "You are a message intent classifier for a data analytics platform.\n"
         "The user has already run an analysis pipeline and is now chatting.\n\n"
@@ -1355,22 +1243,19 @@ async def _classify_chat_intent(message: str) -> str:
             f"_intent_classify_{uuid.uuid4().hex[:8]}",
             classification_prompt,
             agent_getter="chat",
-            max_turns=1,
+            max_turns=get_config()["agents"]["max_turns"]["intent_classify"],
         )
         intent = (resp or "").strip().lower().rstrip(".")
         if "analysis" in intent:
             return "analysis"
         return "question"
     except Exception:
-        return "question"  # Default to safe Q&A mode on failure
-
+        return "question"
 
 async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
-    """Execute a new analysis from a chat message. Returns response dict."""
     profile      = getattr(state, "raw_profile", {}) or {}
     dataset_type = getattr(state, "dataset_type", "unknown")
 
-    # ── Step 1: Validate the metric via discovery LLM ──────────────────
     col_lines = []
     for c in profile.get("columns", []):
         line = f"  - {c['name']} ({c.get('type_category', 'unknown')}, {c.get('unique_count', '?')} unique"
@@ -1410,18 +1295,12 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
 
     validation = {}
     try:
-        val_response = await run_agent_pipeline(
-            f"{session_id}_chat_validate",
-            validation_prompt,
-            agent_getter="discovery",
-        )
-        validation = extract_json(val_response) or {}
+        validation = await _validate_via_llm(validation_prompt)
         print(f"INFO: Chat analysis validation for '{message[:40]}': "
               f"valid={validation.get('valid')} type={validation.get('analysis_type')}")
     except Exception as ve:
         print(f"WARNING: Chat analysis validation failed: {ve}")
 
-    # ── Step 2: If invalid, return explanation ─────────────────────────
     if validation.get("valid") is False:
         missing = validation.get("missing_requirements", [])
         reason  = validation.get("reason", "This analysis cannot be performed with the available data.")
@@ -1434,7 +1313,6 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
             "analysis_status": "unsupported",
         }
 
-    # ── Step 3: Execute the analysis ───────────────────────────────────
     analysis_type = validation.get("analysis_type") or "custom"
     description   = validation.get("description") or message
     ai_roles      = validation.get("column_roles") or {}
@@ -1443,7 +1321,6 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
     base_roles   = (state.semantic_map or {}).get("column_roles", {})
     merged_roles = {**base_roles, **{k: v for k, v in ai_roles.items() if v}}
 
-    # Assign next C-number ID
     existing_c_ids = [
         aid for aid in (state.results or {}).keys()
         if aid.startswith("C")
@@ -1452,7 +1329,6 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
     analysis_id = f"C{next_c}"
     output_folder = state.output_folder
 
-    # Push SSE node_started so frontend shows it in the terminal
     push_sse_event(session_id, "node_started", {
         "node_id": analysis_id,
         "analysis_type": analysis_type,
@@ -1473,7 +1349,7 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
         )
 
         if result.get("status") == "success":
-            # Add to state.dag
+
             if not hasattr(state, "dag") or state.dag is None:
                 state.dag = []
             existing_ids = {n.get("id") for n in state.dag}
@@ -1488,7 +1364,6 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
                     "priority":      "high",
                 })
 
-            # Push SSE node_complete so chart renders in real-time (if SSE still active)
             push_sse_event(session_id, "node_complete", {
                 "analysis_id": analysis_id,
                 "analysis_type": result.get("analysis_type", analysis_type),
@@ -1511,7 +1386,7 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
                 ),
                 "analysis_status": "success",
                 "analysis_id": analysis_id,
-                # Include full chart payload so frontend can render even if SSE is disconnected
+
                 "chart": {
                     "id":                     analysis_id,
                     "analysisType":           result.get("analysis_type", analysis_type),
@@ -1528,7 +1403,7 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
                 },
             }
         else:
-            # Push failure event
+
             push_sse_event(session_id, "node_failed", {
                 "node_id": analysis_id,
                 "error": result.get("error", "Analysis execution failed"),
@@ -1549,17 +1424,8 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
             "analysis_status": "error",
         }
 
-
 @app.post("/chat/{session_id}")
 async def chat(session_id: str, request: Request):
-    """
-    Three-mode chat:
-    - Pre-pipeline: stores message as user_instructions for the next run.
-    - Post-pipeline analysis request: validates, executes, and renders a new
-      analysis chart via SSE (reuses /add-metric logic).
-    - Post-pipeline question: routes to the dedicated chat_agent with the full
-      context (synthesis, all findings, column profile).
-    """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
@@ -1570,7 +1436,6 @@ async def chat(session_id: str, request: Request):
 
     state = sessions[session_id]
 
-    # ── Pre-pipeline: queue as instructions ──────────────────────────────
     if state.status in ("uploaded", "profiled", "discovered", "profiling", "discovering"):
         if state.user_instructions:
             state.user_instructions += f"\n{message}"
@@ -1584,8 +1449,6 @@ async def chat(session_id: str, request: Request):
             ),
         }
 
-    # ── Post-pipeline: classify intent ───────────────────────────────────
-    # Only attempt analysis routing if the pipeline has completed
     if state.status in ("complete", "synthesized", "analyzing", "error"):
         intent = await _classify_chat_intent(message)
         print(f"INFO: Chat intent for '{message[:50]}': {intent}")
@@ -1593,10 +1456,8 @@ async def chat(session_id: str, request: Request):
         if intent == "analysis":
             return await _run_chat_analysis(session_id, state, message)
 
-    # ── Post-pipeline Q&A: answer from full context via chat_agent ───────
     context_parts = []
 
-    # 1. Dataset basics
     col_roles = (state.semantic_map or {}).get("column_roles", {}) if hasattr(state, "semantic_map") else {}
     profile   = getattr(state, "raw_profile", {}) or {}
     columns   = profile.get("columns", [])
@@ -1613,7 +1474,6 @@ async def chat(session_id: str, request: Request):
         f"  Column roles: {json.dumps(col_roles)}"
     )
 
-    # 2. Full analysis findings — no truncation
     if state.results:
         lines = []
         for aid, result in state.results.items():
@@ -1633,7 +1493,6 @@ async def chat(session_id: str, request: Request):
             lines.append(block)
         context_parts.append("ANALYSIS RESULTS\n" + "\n\n".join(lines))
 
-    # 3. Full synthesis — all sections
     synth = getattr(state, "synthesis", {}) or {}
     if synth:
         synth_parts = []
@@ -1695,7 +1554,6 @@ async def chat(session_id: str, request: Request):
 
         context_parts.append("SYNTHESIS\n" + "\n\n".join(synth_parts))
 
-    # 4. Inject prior conversation turns (last 5 exchanges)
     if state.conversation_history:
         history_lines = []
         for _q, _a in state.conversation_history[-5:]:
@@ -1704,7 +1562,6 @@ async def chat(session_id: str, request: Request):
             "PRIOR CONVERSATION (most recent first)\n" + "\n\n".join(history_lines)
         )
 
-    # 5. Assemble prompt and call dedicated chat agent
     separator = "\n" + "=" * 60 + "\n"
     full_context = separator.join(context_parts)
     prompt = f"{full_context}\n\n{'=' * 60}\nUSER QUESTION: {message}"
@@ -1713,24 +1570,16 @@ async def chat(session_id: str, request: Request):
         f"{session_id}_chat",
         prompt,
         agent_getter="chat",
-        max_turns=4,
+        max_turns=get_config()["agents"]["max_turns"]["chat"],
     )
 
-    # Persist this exchange so future turns can reference it
     if response:
         state.conversation_history.append((message, response))
 
     return {"session_id": session_id, "response": response}
 
-
 @app.post("/add-metric/{session_id}")
 async def add_metric(session_id: str, request: Request):
-    """
-    Add and execute a single custom metric after discovery.
-    1. AI validates whether the data supports the requested metric
-    2. If unsupported, returns missing requirements without running
-    3. If supported, uses AI-generated description + column mapping then executes
-    """
     if session_id not in sessions:
         raise HTTPException(404, "Session not found")
 
@@ -1743,7 +1592,6 @@ async def add_metric(session_id: str, request: Request):
     profile      = state.raw_profile or {}
     dataset_type = state.dataset_type or "unknown"
 
-    # ── Step 1: Build a rich column context for the LLM ──────────────────
     col_lines = []
     for c in profile.get("columns", []):
         line = f"  - {c['name']} ({c.get('type_category', 'unknown')}, {c.get('unique_count', '?')} unique"
@@ -1781,22 +1629,14 @@ async def add_metric(session_id: str, request: Request):
         f'"missing_requirements": []}}'
     )
 
-    # ── Step 2: Ask the discovery LLM to validate ────────────────────────
     validation = {}
     try:
-        val_response = await run_agent_pipeline(
-            f"{session_id}_validate_custom",
-            validation_prompt,
-            agent_getter="discovery",
-        )
-        validation = extract_json(val_response) or {}
+        validation = await _validate_via_llm(validation_prompt)
         print(f"INFO: Custom metric validation for '{metric_text[:40]}': "
               f"valid={validation.get('valid')} type={validation.get('analysis_type')}")
     except Exception as ve:
         print(f"WARNING: Custom metric validation LLM call failed: {ve}. Proceeding with defaults.")
-        # On LLM failure, fall through to default behaviour (treat as valid custom)
 
-    # ── Step 3: If invalid, return unsupported early ─────────────────────
     if validation.get("valid") is False:
         missing = validation.get("missing_requirements", [])
         reason  = validation.get("reason", "This analysis cannot be performed with the available data.")
@@ -1807,12 +1647,10 @@ async def add_metric(session_id: str, request: Request):
             "missing_requirements": missing,
         }
 
-    # ── Step 4: Use AI-generated fields where available ──────────────────
     analysis_type  = validation.get("analysis_type") or "custom"
     description    = validation.get("description") or metric_text
     ai_roles       = validation.get("column_roles") or {}
 
-    # Merge: AI-derived roles override the session semantic map
     base_roles   = state.semantic_map.get("column_roles", {})
     merged_roles = {**base_roles, **{k: v for k, v in ai_roles.items() if v}}
 
@@ -1833,7 +1671,7 @@ async def add_metric(session_id: str, request: Request):
         )
 
         if result.get("status") == "success":
-            # Add the custom node to state.dag so synthesis and report include it
+
             if not hasattr(state, "dag") or state.dag is None:
                 state.dag = []
             existing_ids = {n.get("id") for n in state.dag}
@@ -1871,10 +1709,8 @@ async def add_metric(session_id: str, request: Request):
             "error":      str(e),
         }
 
-
 @app.get("/results/{session_id}")
 async def get_results(session_id: str):
-    """Return all completed analysis results."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1892,15 +1728,12 @@ async def get_results(session_id: str):
         })
     return results
 
-
 @app.post("/retry/{session_id}/{node_id}")
 async def retry_node(session_id: str, node_id: str):
-    """Re-execute a failed or pending DAG node."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(404, "Session not found")
 
-    # Find the node spec in the stored DAG
     node = next((n for n in (state.dag or []) if n.get("id") == node_id), None)
     if not node:
         raise HTTPException(404, f"Node {node_id} not found in pipeline plan")
@@ -1910,7 +1743,6 @@ async def retry_node(session_id: str, node_id: str):
     column_roles  = state.semantic_map.get("column_roles", {})
     output_folder = state.output_folder
 
-    # Remove from failed_nodes so it's treated as fresh
     state.failed_nodes.discard(node_id)
     state.results.pop(node_id, None)
 
@@ -1942,10 +1774,8 @@ async def retry_node(session_id: str, node_id: str):
         state.failed_nodes.add(node_id)
         return {"status": "error", "analysis_id": node_id, "error": str(e)}
 
-
 @app.post("/report/refresh/{session_id}")
 async def refresh_report(session_id: str):
-    """Regenerate the HTML report to include any custom analyses added after initial pipeline."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(404, "Session not found")
@@ -1962,48 +1792,42 @@ async def refresh_report(session_id: str):
     except Exception as e:
         raise HTTPException(500, f"Report refresh failed: {e}")
 
-
 @app.get("/chart/{session_id}/{analysis_id}")
 async def get_chart(
     session_id: str,
     analysis_id: str
 ):
-    """Serve a chart HTML file."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     result = state.get_result(analysis_id)
     if not result or not result.get("chart_file_path"):
         raise HTTPException(status_code=404, detail="Chart not found")
-    
+
     chart_path = Path(result["chart_file_path"])
     if not chart_path.exists():
         raise HTTPException(status_code=404, detail="Chart file deleted")
-        
-    return FileResponse(chart_path, media_type="text/html")
 
+    return FileResponse(chart_path, media_type="text/html")
 
 @app.get("/synthesis/{session_id}")
 async def get_synthesis(session_id: str):
-    """Return synthesis results."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     return state.synthesis or {}
 
-
 @app.get("/report/{session_id}")
 async def get_report(session_id: str):
-    """Serve the final HTML report."""
     state = sessions.get(session_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     report_artifact = next(
         (a for a in state.artifacts if a.get("type") == "report" or a.get("filename") == "report.html"),
         None
     )
-    
+
     if not report_artifact:
         report_path = Path(state.output_folder) / "report.html"
         if not report_path.exists():
@@ -2016,12 +1840,10 @@ async def get_report(session_id: str):
 
     return FileResponse(report_path, media_type="text/html")
 
-
 @app.get("/output/{folder_name}/{filename}")
 async def serve_artifact(folder_name: str, filename: str):
-    """Serve a generated artifact file (HTML charts, PNGs, reports)."""
     filepath = (OUTPUT_DIR / folder_name / filename).resolve()
-    # Prevent path traversal — ensure the resolved path stays under OUTPUT_DIR
+
     if not str(filepath).startswith(str(OUTPUT_DIR.resolve())):
         raise HTTPException(403, "Access denied")
     if not filepath.exists():
@@ -2031,10 +1853,8 @@ async def serve_artifact(folder_name: str, filename: str):
         return FileResponse(filepath, media_type="text/html")
     return FileResponse(filepath)
 
-
 @app.get("/sessions")
 async def list_sessions():
-    """List all active sessions."""
     return {
         "sessions": [
             {"id": sid, "filename": info.csv_filename, "status": info.status}
@@ -2042,11 +1862,8 @@ async def list_sessions():
         ]
     }
 
-
-
-
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
-
+app.mount("/user-activity", StaticFiles(directory=str(BASE_DIR / "frontend" / "public" / "user-activity"), html=True), name="user_activity")
 
 if __name__ == "__main__":
     import uvicorn

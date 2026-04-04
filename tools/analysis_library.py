@@ -5,21 +5,16 @@ import os
 from collections import Counter, defaultdict
 from typing import Optional, List
 from datetime import datetime
-from a2a_messages import AnalysisResult
+from pipeline_types import AnalysisResult
 import warnings
 warnings.filterwarnings('ignore')
 
-
 def _json_safe(obj):
-    """Recursively sanitize a result dict so it is always JSON-serialisable.
-    Handles numpy scalars, NaN/Inf floats, pandas NA, and other non-JSON types.
-    Called automatically by _make_result and _make_error_result.
-    """
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_json_safe(x) for x in obj]
-    # Unwrap numpy / pandas scalar types (numpy.int64, numpy.float32, etc.)
+
     if hasattr(obj, 'item'):
         try:
             obj = obj.item()
@@ -33,23 +28,21 @@ def _json_safe(obj):
         return obj
     if isinstance(obj, (bool, int, str)):
         return obj
-    # Catch pandas NA, numpy arrays, Timestamps, etc.
+
     s = str(obj)
     if s in ("<NA>", "nan", "NaN", "inf", "-inf", "Inf"):
         return None
-    # If it looks like a plain number string, return as-is; otherwise stringify
+
     return s
 
 DEFAULT_SESSION_MARKERS = {
-    # Generic process / sequence starters (domain-agnostic)
+
     "started", "start", "begin", "initiated", "opened",
     "created", "initialized", "launched", "connected", "activated",
-    # Digital product / web app (kept as fallback for app event logs)
+
     "Session Started", "Journey Started", "App Installed",
     "User Login", "app_start", "login", "landing_page_view",
 }
-
-
 
 LIBRARY_REGISTRY = {
     "distribution_analysis": {
@@ -223,19 +216,11 @@ LIBRARY_REGISTRY = {
     },
 }
 
-
 def _make_result(analysis_type: str, data: dict,
                   top_finding: str, severity: str,
                   confidence: float,
                   chart_ready_data: dict,
                   enables: list = None) -> dict:
-    """
-    Standard result envelope. Every library function
-    returns this exact structure.
-    Severity: critical | high | medium | low | info
-    Confidence: 0.0 to 1.0
-    Always passes through _json_safe so results are guaranteed JSON-serialisable.
-    """
     return _json_safe({
         "analysis_type": analysis_type,
         "status": "success",
@@ -253,9 +238,49 @@ def _make_result(analysis_type: str, data: dict,
         }
     })
 
+def compute_confidence(n: int, null_rate: float = 0.0,
+                       p_value: float = None, effect_size: float = None,
+                       base: float = 0.85) -> float:
+
+    size_c = 0.55 + 0.43 * (1.0 - math.exp(-n / 1500))
+
+    null_c = max(0.30, 1.0 - float(null_rate) * 0.70)
+
+    if p_value is None:
+        p_c = base
+    elif p_value < 0.01:
+        p_c = 1.00
+    elif p_value < 0.05:
+        p_c = 0.88
+    elif p_value < 0.10:
+        p_c = 0.72
+    else:
+        p_c = 0.48
+
+    if effect_size is None:
+        e_c = base
+    else:
+        abs_e = abs(float(effect_size))
+        if abs_e >= 0.8:
+            e_c = 1.00
+        elif abs_e >= 0.5:
+            e_c = 0.88
+        elif abs_e >= 0.2:
+            e_c = 0.74
+        else:
+            e_c = 0.55
+
+    score = (
+        base   * 1.0 +
+        size_c * 1.8 +
+        null_c * 0.8 +
+        p_c    * 1.0 +
+        e_c    * 0.6
+    ) / (1.0 + 1.8 + 0.8 + 1.0 + 0.6)
+
+    return round(max(0.10, min(0.99, score)), 3)
 
 def _make_error_result(analysis_type: str, error: str, status: str = "error") -> dict:
-    """Return a properly-shaped envelope for error / insufficient-data cases."""
     return _json_safe({
         "analysis_type": analysis_type,
         "status": status,
@@ -274,22 +299,16 @@ def _make_error_result(analysis_type: str, error: str, status: str = "error") ->
         "error": error,
     })
 
-
 def run_distribution_analysis(csv_path: str, col: str) -> dict:
-    """
-    Full distribution analysis on any numeric column.
-    Histogram data, box plot stats, normality test,
-    outlier detection (IQR + Z-score).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     if col not in df.columns:
         return _make_error_result("distribution_analysis", f"Column '{col}' not found")
 
     data = df[col].dropna()
     if len(data) == 0:
         return _make_error_result("distribution_analysis", f"Column '{col}' has no non-null values", "insufficient_data")
-    
+
     stats = {
         "count": len(data),
         "mean": round(float(data.mean()), 4),
@@ -302,22 +321,22 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
         "skewness": round(float(data.skew()), 4),
         "kurtosis": round(float(data.kurtosis()), 4),
     }
-    
+
     iqr = stats["q75"] - stats["q25"]
     lower = stats["q25"] - 1.5 * iqr
     upper = stats["q75"] + 1.5 * iqr
     outliers = data[(data < lower) | (data > upper)]
     outlier_pct = round(len(outliers) / len(data) * 100, 2)
-    
+
     stats["outlier_count"] = len(outliers)
     stats["outlier_pct"] = outlier_pct
     stats["outlier_lower_bound"] = round(lower, 4)
     stats["outlier_upper_bound"] = round(upper, 4)
-    
+
     z_scores = np.abs((data - data.mean()) / data.std())
     z_outliers = data[z_scores > 3]
     stats["z_outlier_count"] = len(z_outliers)
-    
+
     try:
         from scipy import stats as scipy_stats
         sample = data.sample(min(500, len(data)),
@@ -326,7 +345,6 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
         stats["normality_p_value"] = round(float(p_value), 6)
         stats["is_normal"] = p_value > 0.05
 
-        # 95% confidence interval for the mean
         ci = scipy_stats.t.interval(
             confidence=0.95,
             df=len(data) - 1,
@@ -338,12 +356,12 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
         stats["normality_p_value"] = None
         stats["is_normal"] = None
         stats["mean_ci_95"] = None
-    
+
     hist, bin_edges = np.histogram(data, bins=30)
-    
+
     severity = "high" if outlier_pct > 10 else \
                "medium" if outlier_pct > 5 else "low"
-    
+
     _ci = stats.get("mean_ci_95")
     _ci_str = f" (95% CI [{_ci[0]}, {_ci[1]}])" if _ci else ""
     _norm = stats.get("is_normal")
@@ -360,13 +378,15 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
         f"{outlier_pct}% outliers detected "
         f"({_normal_str})."
     )
-    
+
+    _null_rate = (len(df[col]) - len(data)) / max(len(df[col]), 1)
+    _p_val = stats.get("normality_p_value")
     return _make_result(
         analysis_type="distribution",
         data=stats,
         top_finding=top_finding,
         severity=severity,
-        confidence=0.95,
+        confidence=compute_confidence(n=len(data), null_rate=_null_rate, p_value=_p_val, base=0.90),
         chart_ready_data={
             "type": "histogram_box",
             "col": col,
@@ -383,14 +403,9 @@ def run_distribution_analysis(csv_path: str, col: str) -> dict:
         }
     )
 
-
 def run_categorical_analysis(csv_path: str, col: str) -> dict:
-    """
-    Frequency table, Pareto analysis, entropy score.
-    Works on any categorical column.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     if col not in df.columns:
         return _make_error_result("categorical_analysis", f"Column '{col}' not found")
 
@@ -399,26 +414,26 @@ def run_categorical_analysis(csv_path: str, col: str) -> dict:
 
     if total == 0:
         return _make_error_result("categorical_analysis", "No non-null values", "insufficient_data")
-    
+
     top_20_pct_count = max(1, int(len(counts) * 0.20))
     top_20_volume = counts.head(top_20_pct_count).sum()
     pareto_ratio = round(top_20_volume / total * 100, 1)
-    
+
     probs = counts / total
     entropy = round(float(-np.sum(probs * np.log2(probs + 1e-10))), 4)
     max_entropy = round(np.log2(len(counts)), 4)
     entropy_ratio = round(entropy / max_entropy, 4) \
                     if max_entropy > 0 else 0
-    
+
     top_10 = {str(k): int(v) for k, v in counts.head(10).items()}
-    
+
     top_finding = (
         f"{col}: {len(counts)} unique values. "
         f"Top 20% of categories account for {pareto_ratio}% of records. "
         f"Distribution entropy: {entropy_ratio:.0%} "
         f"({'evenly spread' if entropy_ratio > 0.8 else 'highly concentrated'})."
     )
-    
+
     return _make_result(
         analysis_type="categorical",
         data={
@@ -431,7 +446,11 @@ def run_categorical_analysis(csv_path: str, col: str) -> dict:
         },
         top_finding=top_finding,
         severity="info",
-        confidence=0.99,
+        confidence=compute_confidence(
+            n=total,
+            null_rate=df[col].isna().sum() / max(len(df[col]), 1),
+            base=0.92,
+        ),
         chart_ready_data={
             "type": "frequency_bar",
             "col": col,
@@ -440,27 +459,20 @@ def run_categorical_analysis(csv_path: str, col: str) -> dict:
         }
     )
 
-
-def run_correlation_matrix(csv_path: str, 
+def run_correlation_matrix(csv_path: str,
                              cols: list = None) -> dict:
-    """
-    Pearson + Spearman correlation matrix.
-    Auto-selects columns if none specified.
-    Flags high correlations (>0.7) and negative correlations (<-0.5).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     if cols:
         numeric_df = df[cols].select_dtypes(include=[np.number])
     else:
         numeric_df = df.select_dtypes(include=[np.number])
-    
+
     if numeric_df.shape[1] < 2:
         return _make_error_result("correlation_matrix", "Need at least 2 numeric columns", "insufficient_data")
-    
+
     pearson = numeric_df.corr(method='pearson')
 
-    # Compute p-values for each correlation pair
     _n = len(numeric_df.dropna())
     def _corr_pvalue(r, n):
         import math
@@ -484,7 +496,6 @@ def run_correlation_matrix(csv_path: str,
             raw_pvals.append(pv)
             raw_pairs.append((i, j, float(val)))
 
-    # Bonferroni correction
     m = len(raw_pvals)
     bonf_pvals = [min(p * m, 1.0) for p in raw_pvals]
 
@@ -503,7 +514,6 @@ def run_correlation_matrix(csv_path: str,
 
     notable.sort(key=lambda x: abs(x["pearson"]), reverse=True)
 
-    # VIF — multicollinearity check (only when ≥ 3 numeric cols and enough rows)
     vif_data = []
     try:
         if numeric_df.shape[1] >= 3 and len(numeric_df.dropna()) > numeric_df.shape[1]:
@@ -517,7 +527,7 @@ def run_correlation_matrix(csv_path: str,
                 })
     except Exception:
         vif_data = []
-    
+
     sig_notable = [x for x in notable if x.get("significant", True)]
     top_finding = (
         f"Correlation analysis on {len(cols_list)} numeric columns. "
@@ -544,7 +554,13 @@ def run_correlation_matrix(csv_path: str,
         },
         top_finding=top_finding,
         severity="medium" if notable else "low",
-        confidence=0.95,
+        confidence=compute_confidence(
+            n=_n,
+            null_rate=numeric_df.isnull().mean().mean(),
+            p_value=notable[0]["p_value"] if notable else None,
+            effect_size=notable[0]["pearson"] if notable else None,
+            base=0.90,
+        ),
         chart_ready_data={
             "type": "correlation_heatmap",
             "columns": cols_list,
@@ -554,54 +570,49 @@ def run_correlation_matrix(csv_path: str,
         }
     )
 
-
 def run_anomaly_detection(csv_path: str, col: str) -> dict:
-    """
-    IQR + Z-score + Isolation Forest anomaly detection.
-    Returns anomaly indices, severity scores, and boundaries.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     if col not in df.columns:
         return _make_error_result("anomaly_detection", f"Column '{col}' not found")
 
     data = df[col].dropna()
     if len(data) == 0:
         return _make_error_result("anomaly_detection", "Insufficient data", "insufficient_data")
-    
+
     q1 = float(data.quantile(0.25))
     q3 = float(data.quantile(0.75))
     iqr = q3 - q1
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
     iqr_outliers = data[(data < lower) | (data > upper)]
-    
+
     z_scores = np.abs((data - data.mean()) / (data.std() + 1e-10))
     z_outliers = data[z_scores > 3]
-    
+
     iso_outlier_indices = []
     try:
         from sklearn.ensemble import IsolationForest
-        iso = IsolationForest(contamination=0.05, 
+        iso = IsolationForest(contamination=0.05,
                                random_state=42)
         preds = iso.fit_predict(data.values.reshape(-1, 1))
         iso_outlier_indices = data.index[preds == -1].tolist()
     except Exception:
         pass
-    
+
     iqr_set = set(iqr_outliers.index.tolist())
     z_set = set(z_outliers.index.tolist())
     iso_set = set(iso_outlier_indices)
-    
+
     consensus = list(iqr_set & (z_set | iso_set))
-    
+
     outlier_pct = round(len(consensus) / len(data) * 100, 2) \
                   if len(data) > 0 else 0
-    
+
     severity = "critical" if outlier_pct > 15 else \
                "high" if outlier_pct > 8 else \
                "medium" if outlier_pct > 3 else "low"
-    
+
     top_finding = (
         f"Anomaly detection on '{col}': "
         f"{len(consensus)} consensus outliers "
@@ -611,7 +622,7 @@ def run_anomaly_detection(csv_path: str, col: str) -> dict:
         f"Z-score={len(z_set)}, "
         f"IsoForest={len(iso_set)}."
     )
-    
+
     return _make_result(
         analysis_type="anomaly_detection",
         data={
@@ -642,14 +653,9 @@ def run_anomaly_detection(csv_path: str, col: str) -> dict:
         }
     )
 
-
 def run_missing_data_analysis(csv_path: str) -> dict:
-    """
-    Analyzes patterns of missingness across all columns.
-    Detects systematic vs random missing data.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     missing_stats = []
     for col in df.columns:
         null_count = int(df[col].isna().sum())
@@ -662,12 +668,12 @@ def run_missing_data_analysis(csv_path: str) -> dict:
                             else "high" if null_count/len(df) > 0.1
                             else "medium"
             })
-    
+
     missing_stats.sort(key=lambda x: x["null_pct"], reverse=True)
     total_cells = df.shape[0] * df.shape[1]
     total_missing = int(df.isna().sum().sum())
     overall_pct = round(total_missing / total_cells * 100, 2)
-    
+
     top_finding = (
         f"Missing data: {overall_pct}% of all cells are null "
         f"({total_missing:,} cells). "
@@ -676,11 +682,11 @@ def run_missing_data_analysis(csv_path: str) -> dict:
            f"({missing_stats[0]['null_pct']}% missing)"
            if missing_stats else "No missing data detected.")
     )
-    
+
     severity = "critical" if overall_pct > 20 else \
                "high" if overall_pct > 10 else \
                "medium" if overall_pct > 2 else "low"
-    
+
     return _make_result(
         analysis_type="missing_data",
         data={
@@ -703,18 +709,11 @@ def run_missing_data_analysis(csv_path: str) -> dict:
         }
     )
 
-
 def run_trend_analysis(
     csv_path: str,
     time_col: str,
     value_col: str,
 ) -> dict:
-    """
-    Time series trend analysis.
-    Rolling averages (7/30 period), trend direction,
-    Mann-Kendall trend test, changepoint detection.
-    Works on any datetime + numeric column pair.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if time_col not in df.columns:
@@ -778,7 +777,6 @@ def run_trend_analysis(
                     ),
                 })
 
-    # Mann-Whitney U test on largest changepoint: is the before/after shift significant?
     changepoint_p = None
     if changepoints:
         try:
@@ -859,18 +857,11 @@ def run_trend_analysis(
         enables=["anomaly_detection"],
     )
 
-
 def run_time_series_decomposition(
     csv_path: str,
     time_col: str,
     value_col: str,
 ) -> dict:
-    """
-    STL decomposition: trend + seasonality + residual.
-    Auto-detects period (daily=7, monthly=12).
-    Flags: trend direction, seasonality strength,
-    anomalous residuals.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if time_col not in df.columns:
@@ -979,7 +970,6 @@ def run_time_series_decomposition(
         },
     )
 
-
 def run_cohort_analysis(
     csv_path: str,
     entity_col: str,
@@ -987,12 +977,6 @@ def run_cohort_analysis(
     value_col: str,
     cohort_window: str = "M",
 ) -> dict:
-    """
-    Cohort analysis: groups entities by first appearance
-    period and tracks retention/value over time.
-    Works for any entity + datetime + value structure.
-    cohort_window: "D" (daily), "W" (weekly), "M" (monthly, default), "Q" (quarterly)
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     for col in [entity_col, time_col, value_col]:
@@ -1087,7 +1071,6 @@ def run_cohort_analysis(
         },
     )
 
-
 def run_session_detection(
     csv_path: str,
     entity_col: str,
@@ -1096,18 +1079,6 @@ def run_session_detection(
     marker_events: list = None,
     gap_minutes: int = 30,
 ) -> dict:
-    """
-    Detect session boundaries per entity.
-    Mode 1: marker_events provided → event-based detection.
-    Mode 2: no markers → 30-minute time-gap detection.
-
-    Returns enriched CSV path with session_id column added,
-    plus session statistics.
-
-    IMPORTANT: This must be called first (A1) for all
-    behavioral analyses. Its output (session_id column)
-    is required by funnel, friction, survival, segments.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     for col in [entity_col, time_col]:
@@ -1205,7 +1176,6 @@ def run_session_detection(
         "low"
     )
 
-    # Hybrid narrative
     narrative = {
         "what_it_means": (
             f"{total_sessions:,} sessions detected across {bounce_rate}% bounce rate. "
@@ -1285,7 +1255,6 @@ def run_session_detection(
         ],
     )
 
-
 def run_funnel_analysis(
     csv_path: str,
     entity_col: str,
@@ -1294,12 +1263,6 @@ def run_funnel_analysis(
     session_col: str = "session_id",
     funnel_steps: list = None,
 ) -> dict:
-    """
-    Funnel analysis with conversion rates at each step.
-    If funnel_steps not provided, auto-detects stages
-    from event frequency + ordering patterns.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -1403,7 +1366,6 @@ def run_funnel_analysis(
         "low"
     )
 
-    # Hybrid narrative
     if biggest_drop and biggest_drop_pct > 20:
         narrative = {
             "what_it_means": (
@@ -1454,20 +1416,12 @@ def run_funnel_analysis(
         },
     )
 
-
 def run_friction_detection(
     csv_path: str,
     entity_col: str,
     event_col: str,
     session_col: str = "session_id",
 ) -> dict:
-    """
-    Identify events with high repetition rates indicating
-    users are stuck.
-    Friction score = repetitions / total occurrences.
-    CRITICAL > 10%, HIGH > 5%, MEDIUM > 2%.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -1558,7 +1512,6 @@ def run_friction_detection(
             if hasattr(v, 'item'):
                 r[k] = v.item()
 
-    # Hybrid narrative — deterministic from computed values
     if top_event is not None and float(top_event["repetition_rate"]) > 0.02:
         top_name = str(top_event[event_col])
         top_rate = float(top_event["repetition_rate"])
@@ -1612,20 +1565,12 @@ def run_friction_detection(
         },
     )
 
-
 def run_survival_analysis(
     csv_path: str,
     entity_col: str,
     event_col: str,
     session_col: str = "session_id",
 ) -> dict:
-    """
-    Kaplan-Meier style session survival analysis.
-    Computes what % of sessions survive to each step.
-    Identifies safe (>80%), warning (50-80%),
-    and danger (<50%) zones.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -1693,9 +1638,6 @@ def run_survival_analysis(
     pct_10   = round(reach_10 / total_sessions * 100, 1)
     pct_20   = round(reach_20 / total_sessions * 100, 1)
 
-    # Log-rank test: compare survival of short vs long sessions
-    # Split at median — test whether the two halves have significantly different
-    # survival distributions (a simple but informative significance check).
     logrank_p = None
     try:
         from scipy import stats as _sc
@@ -1731,7 +1673,6 @@ def run_survival_analysis(
         "low"
     )
 
-    # Hybrid narrative
     if critical and critical["dropout_rate"] > 10:
         narrative = {
             "what_it_means": (
@@ -1787,7 +1728,6 @@ def run_survival_analysis(
         },
     )
 
-
 def run_user_segmentation(
     csv_path: str,
     entity_col: str,
@@ -1795,14 +1735,6 @@ def run_user_segmentation(
     time_col: str = None,
     session_col: str = "session_id",
 ) -> dict:
-    """
-    DBSCAN clustering on behavioral features.
-    Features: total_events, event_diversity,
-    repetition_ratio, session_count, avg_session_length.
-    Produces segments with characteristics.
-    No hardcoded labels — inferred from cluster data.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -1832,7 +1764,7 @@ def run_user_segmentation(
     if time_col and time_col in df.columns:
         agg_dict["time_min"] = (time_col, "min")
         agg_dict["time_max"] = (time_col, "max")
-        
+
     agg_df = df.groupby(entity_col).agg(**agg_dict).reset_index()
 
     agg_df["avg_sess_len"] = (
@@ -1969,7 +1901,6 @@ def run_user_segmentation(
         f"{', '.join(segments[0]['characteristics']) or 'mixed behavior'}."
     )
 
-    # Hybrid narrative
     dominant = segments[0] if segments else None
     noise_seg = next((s for s in segments if s["is_noise"]), None)
     narrative = {
@@ -2007,7 +1938,6 @@ def run_user_segmentation(
         },
     )
 
-
 def run_sequential_pattern_mining(
     csv_path: str,
     entity_col: str,
@@ -2015,11 +1945,6 @@ def run_sequential_pattern_mining(
     session_col: str = "session_id",
     min_support: float = 0.03,
 ) -> dict:
-    """
-    PrefixSpan-style frequent sequence mining.
-    Finds top behavioral pathways and repetition loops.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -2088,8 +2013,6 @@ def run_sequential_pattern_mining(
         if p["sequence"][0] == p["sequence"][1]
     ]
 
-    # Outcome correlation: correlate pattern occurrence with session depth
-    # (longer sessions as a proxy for successful/engaged sessions)
     outcome_correlations = []
     try:
         from scipy import stats as _sc
@@ -2098,7 +2021,7 @@ def run_sequential_pattern_mining(
             seq = pat["sequence"]
             if len(seq) < 2:
                 continue
-            # Binary: does this session contain the bigram/trigram?
+
             def _has_pattern(grp):
                 events = grp[event_col].tolist()
                 for _i in range(len(events) - len(seq) + 1):
@@ -2144,7 +2067,6 @@ def run_sequential_pattern_mining(
         )
     )
 
-    # Hybrid narrative
     if all_patterns:
         top_seq = " → ".join(all_patterns[0]["sequence"])
         top_support = all_patterns[0]["support"]
@@ -2202,7 +2124,6 @@ def run_sequential_pattern_mining(
         },
     )
 
-
 def run_association_rules(
     csv_path: str,
     entity_col: str,
@@ -2211,13 +2132,6 @@ def run_association_rules(
     outcome_events: list = None,
     min_confidence: float = 0.70,
 ) -> dict:
-    """
-    Association rule mining for intervention triggers.
-    IF [event pattern] THEN [outcome] rules.
-    If outcome_events not provided, auto-detects
-    success events from data (low-frequency, late-session).
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -2320,7 +2234,6 @@ def run_association_rules(
         )
     )
 
-    # Hybrid narrative
     if rules:
         top_rule = rules[0]
         narrative = {
@@ -2365,19 +2278,12 @@ def run_association_rules(
         },
     )
 
-
 def run_rfm_analysis(
     csv_path: str,
     entity_col: str,
     time_col: str,
     value_col: str,
 ) -> dict:
-    """
-    Recency, Frequency, Monetary (RFM) segmentation.
-    Rides on entity_col (e.g., user_uuid).
-    Scores 1-5 for each dimension, then defines segments
-    (Champions, At Risk, Hibernating, etc.).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     for col in [entity_col, time_col, value_col]:
@@ -2508,16 +2414,11 @@ def run_rfm_analysis(
         },
     )
 
-
 def run_pareto_analysis(
     csv_path: str,
     entity_col: str,
     value_col: str,
 ) -> dict:
-    """
-    80/20 Rule Analysis: identifies the minority of entities
-    driving the majority of value (revenue/monetary).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     for col in [entity_col, value_col]:
@@ -2571,29 +2472,12 @@ def run_pareto_analysis(
         }
     )
 
-
-
-
 def run_transition_analysis(
     csv_path: str,
     entity_col: str,
     event_col: str,
     time_col: str = None,
 ) -> dict:
-    """
-    Markov Transition Matrix — domain-agnostic.
-
-    For each entity's time-sorted event sequence, computes
-    P(next_event | current_event) across the entire dataset.
-    Also computes exit probabilities (session-end after event).
-
-    Produces:
-    - Full NxN transition probability matrix (top 30 events)
-    - Top transitions by volume and probability
-    - Dead-end events (high exit probability)
-    - Loop detection (self-transitions)
-    - Absorbing states (events rarely followed by others)
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     required_cols = [entity_col, event_col]
@@ -2735,7 +2619,6 @@ def run_transition_analysis(
         )
     )
 
-    # Hybrid narrative
     if dead_ends:
         worst_dead_end = dead_ends[0]["event"]
         worst_exit_prob = dead_ends[0]["exit_prob"]
@@ -2785,23 +2668,12 @@ def run_transition_analysis(
         },
     )
 
-
 def run_dropout_analysis(
     csv_path: str,
     entity_col: str,
     event_col: str,
     time_col: str = None,
 ) -> dict:
-    """
-    Dropout Sequence Analysis — domain-agnostic.
-
-    Identifies what events commonly occur right before
-    a session ends (user drops off). Analyzes:
-    - Last 1, 2, and 3 events before session end
-    - Common dropout sequences (bigrams/trigrams)
-    - Dropout rate per event (% of time an event is the last)
-    - Early vs late session dropouts
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     required_cols = [entity_col, event_col]
@@ -2902,7 +2774,6 @@ def run_dropout_analysis(
         f"{early_pct}% of sessions are early dropouts."
     )
 
-    # Hybrid narrative
     if top_last:
         top_exit_event = top_last[0][0]
         top_exit_pct = round(top_last[0][1] / total_sessions * 100, 1)
@@ -2960,31 +2831,10 @@ def run_dropout_analysis(
         },
     )
 
-
 def run_event_taxonomy(
     csv_path: str,
     event_col: str,
 ) -> dict:
-    """
-    Event Taxonomy Classifier — domain-agnostic.
-
-    Auto-classifies events into functional categories using
-    keyword pattern matching. NOT hardcoded to any domain.
-    Uses common software/UX patterns to infer:
-    - authentication (login, register, verify, otp, password)
-    - search (search, query, filter, find, browse, discover)
-    - selection (select, view, click, tap, open, detail, item)
-    - transaction (pay, purchase, buy, checkout, cart, order, book, reserve)
-    - navigation (back, home, menu, settings, navigate, page, tab)
-    - error (error, fail, crash, retry, timeout, exception)
-    - notification (push, notification, alert, remind, message)
-    - onboarding (welcome, tutorial, intro, setup, first, install)
-    - social (share, like, comment, follow, invite, refer)
-    - other (everything else)
-
-    Returns category distribution, event-to-category mapping,
-    and the taxonomy itself for downstream synthesis.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if event_col not in df.columns:
@@ -3045,7 +2895,6 @@ def run_event_taxonomy(
     ]
 
     def classify_event(event_name: str) -> str:
-        """Classify a single event by keyword matching."""
         lower = event_name.lower().replace("-", "_").replace(" ", "_")
         for category, keywords in TAXONOMY:
             for kw in keywords:
@@ -3070,8 +2919,6 @@ def run_event_taxonomy(
         mapping[evt] = cat
         category_counts[cat] += count
 
-    # LLM reclassification: re-classify events that landed in "other" category.
-    # Only triggers when >5 ambiguous events exist. Falls back to keyword result on any error.
     _ambiguous = [evt for evt, cat in mapping.items() if cat == "other"]
     if len(_ambiguous) > 5:
         try:
@@ -3100,12 +2947,12 @@ def run_event_taxonomy(
                 for _evt, _new_cat in _remapped.items():
                     if _evt in mapping and _new_cat in _valid_cats and _new_cat != "other":
                         mapping[_evt] = _new_cat
-                # Recompute category_counts from updated mapping
+
                 category_counts = defaultdict(int)
                 for _evt2, _count2 in event_counts.items():
                     category_counts[mapping.get(_evt2, "other")] += _count2
         except Exception:
-            pass  # keep keyword classification as-is
+            pass
 
     total_events = sum(category_counts.values())
     cat_distribution = {
@@ -3126,7 +2973,6 @@ def run_event_taxonomy(
         f"{cat_distribution.get('other', {}).get('pct', 0)}% of events remained unclassified ('other')."
     )
 
-    # Hybrid narrative
     top_cat = max(category_counts, key=category_counts.get) if category_counts else "unknown"
     top_cat_pct = round(category_counts.get(top_cat, 0) / max(total_events, 1) * 100, 1)
     other_pct = cat_distribution.get("other", {}).get("pct", 0)
@@ -3172,13 +3018,8 @@ def run_user_journey_analysis(
     event_col: str,
     time_col: str = None,
 ) -> dict:
-    """
-    Per-User Journey Tracking.
-    Analyzes specific sequential journeys taken by individual users.
-    Identifies common entry/exit points and average session sizes per user.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
-    
+
     if entity_col not in df.columns or event_col not in df.columns:
         return _make_error_result("user_journey_analysis", "Missing required columns")
 
@@ -3187,13 +3028,13 @@ def run_user_journey_analysis(
         df = df.sort_values([entity_col, time_col])
     else:
         df = df.sort_values([entity_col])
-        
+
     journey_stats = []
-    
+
     for entity, group in df.groupby(entity_col):
         events = group[event_col].tolist()
         if not events: continue
-        
+
         journey_stats.append({
             "entity_id": str(entity),
             "step_count": len(events),
@@ -3201,17 +3042,17 @@ def run_user_journey_analysis(
             "exit_event": str(events[-1]),
             "unique_events": len(set(events))
         })
-        
+
     if not journey_stats:
         return _make_error_result("user_journey_analysis", "No valid journeys found")
-        
+
     journey_df = pd.DataFrame(journey_stats)
-    
+
     common_entries = journey_df["entry_event"].value_counts().head(5).to_dict()
     common_exits = journey_df["exit_event"].value_counts().head(5).to_dict()
     avg_steps = round(journey_df["step_count"].mean(), 2)
     max_steps = int(journey_df["step_count"].max())
-    
+
     top_finding = f"Analyzed journeys for {len(journey_df):,} entities. Average steps per journey: {avg_steps}. Most common entry: {list(common_entries.keys())[0] if common_entries else 'N/A'}."
 
     return _make_result(
@@ -3235,12 +3076,7 @@ def run_user_journey_analysis(
         }
     )
 
-
 def run_contribution_analysis(csv_path: str, group_col: str, value_col: str) -> dict:
-    """
-    Analyzes how much each category in group_col contributes to the total of value_col.
-    Helps identify revenue drivers, volume drivers, etc. in non-behavioral data.
-    """
     df = pd.read_csv(csv_path, low_memory=False)
     if group_col not in df.columns or value_col not in df.columns:
         return _make_error_result("contribution_analysis", f"Missing columns: {group_col} or {value_col}")
@@ -3254,35 +3090,34 @@ def run_contribution_analysis(csv_path: str, group_col: str, value_col: str) -> 
     total_val = df[value_col].sum()
     if total_val == 0:
         return _make_error_result("contribution_analysis", "Total sum of value_col is zero")
-        
+
     grouped = df.groupby(group_col)[value_col].agg(["sum", "count", "mean"]).reset_index()
     grouped["contribution_pct"] = (grouped["sum"] / total_val * 100).round(2)
     grouped = grouped.sort_values(by="contribution_pct", ascending=False)
-    
+
     top_group = grouped.iloc[0]
     top_finding = (
         f"The top group '{top_group[group_col]}' accounts for "
         f"{top_group['contribution_pct']}% of the total '{value_col}' "
         f"({top_group['sum']:,.2f} out of {total_val:,.2f} total)."
     )
-    
-    # Check for heavy concentration (Pareto principle)
+
     top_20_pct_count = max(1, int(len(grouped) * 0.2))
     top_20_pct_contrib = grouped.head(top_20_pct_count)["contribution_pct"].sum()
-    
+
     if top_20_pct_contrib > 80:
         top_finding += f" High concentration: top 20% of groups drive {top_20_pct_contrib:.1f}% of total value."
         severity = "high"
     else:
         severity = "info"
-        
+
     return _make_result(
         analysis_type="contribution_analysis",
         data={
             "total_value": float(total_val),
             "group_count": len(grouped),
             "top_20_pct_concentration": float(top_20_pct_contrib),
-            "contributions": grouped.to_dict(orient="records")[:20]  # Cap at 20
+            "contributions": grouped.to_dict(orient="records")[:20]
         },
         top_finding=top_finding,
         severity=severity,
@@ -3295,12 +3130,7 @@ def run_contribution_analysis(csv_path: str, group_col: str, value_col: str) -> 
         }
     )
 
-
 def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
-    """
-    Tests relationship between two categorical variables.
-    Computes Chi-squared test and Cramér's V (effect size).
-    """
     try:
         from scipy.stats import chi2_contingency
     except ImportError:
@@ -3315,37 +3145,31 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
     if len(df) == 0:
         return _make_error_result("cross_tab_analysis", "No valid rows", "insufficient_data")
 
-    # Adaptive binning: keep every category that represents ≥1% of rows.
-    # This is data-driven — a dataset with 30 meaningful event types keeps all 30,
-    # while a column with 10,000 user IDs collapses to just the significant ones.
-    # Floor at 5 categories so there's always something meaningful to cross-tabulate.
     for _col in [col_a, col_b]:
         _freq = df[_col].value_counts(normalize=True)
-        _keep = _freq[_freq >= 0.01].index  # categories with ≥1% share
-        if len(_keep) < 5:                  # ensure minimum meaningful groupings
+        _keep = _freq[_freq >= 0.01].index
+        if len(_keep) < 5:
             _keep = _freq.nlargest(5).index
         if len(_keep) < df[_col].nunique():
             df[_col] = df[_col].where(df[_col].isin(_keep), other="Other")
 
     contingency = pd.crosstab(df[col_a], df[col_b])
 
-    # Check if table is valid for chi2 (needs sum > 0)
     if contingency.sum().sum() == 0 or contingency.shape[0] < 2 or contingency.shape[1] < 2:
         return _make_error_result("cross_tab_analysis", "Contingency table invalid (too few groups or counts)")
-        
+
     chi2_stat, p_val, dof, ex = chi2_contingency(contingency)
-    
-    # Cramér's V
+
     n = contingency.sum().sum()
     min_dim = min(contingency.shape) - 1
     if min_dim > 0 and n > 0:
         cramer_v = np.sqrt(chi2_stat / (n * min_dim))
     else:
         cramer_v = 0.0
-        
+
     is_significant = p_val < 0.05
     strength = "Strong" if cramer_v > 0.5 else "Moderate" if cramer_v > 0.25 else "Weak"
-    
+
     if is_significant:
         top_finding = (
             f"Statistically significant relationship found between '{col_a}' and '{col_b}' "
@@ -3357,20 +3181,19 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
     else:
         top_finding = f"No significant relationship between '{col_a}' and '{col_b}' (p={p_val:.4f})."
         severity = "info"
-        
-    # Get highest positive deviation from expected (what drives the relationship)
+
     observed = contingency.values
     expected = ex
     diff = observed - expected
     max_idx = np.unravel_index(np.argmax(diff, axis=None), diff.shape)
-    
+
     driver = ""
     if is_significant:
         row_label = contingency.index[max_idx[0]]
         col_label = contingency.columns[max_idx[1]]
         driver = f"Biggest driver: '{row_label}' co-occurs with '{col_label}' much more than expected."
         top_finding += " " + driver
-        
+
     return _make_result(
         analysis_type="cross_tab_analysis",
         data={
@@ -3379,7 +3202,7 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
             "cramer_v": float(cramer_v),
             "is_significant": bool(is_significant),
             "strongest_driver": driver,
-            "contingency_table": contingency.head(10).to_dict()  # Sample
+            "contingency_table": contingency.head(10).to_dict()
         },
         top_finding=top_finding,
         severity=severity,
@@ -3392,11 +3215,6 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
         }
     )
 
-
-# ======================================================================
-# NEW ANALYSES (Datalog-Parity)
-# ======================================================================
-
 def run_intervention_triggers(
     csv_path: str,
     entity_col: str,
@@ -3405,12 +3223,6 @@ def run_intervention_triggers(
     session_col: str = "session_id",
     min_dropout_rate: float = 0.80,
 ) -> dict:
-    """
-    Discovers high-confidence dropout trigger rules.
-    Identifies which events reliably precede session abandonment.
-    Domain-agnostic — uses session-end detection, not domain knowledge.
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -3438,7 +3250,6 @@ def run_intervention_triggers(
     if total_sessions == 0:
         return _make_error_result("intervention_triggers", "No sessions found", "insufficient_data")
 
-    # Last event per session = the event at which users dropped off
     session_last = (
         df.groupby(session_col)[event_col]
         .apply(lambda x: x.iloc[-1])
@@ -3536,7 +3347,6 @@ def run_intervention_triggers(
         },
     )
 
-
 def run_session_classification(
     csv_path: str,
     entity_col: str,
@@ -3544,14 +3354,6 @@ def run_session_classification(
     time_col: str,
     session_col: str = "session_id",
 ) -> dict:
-    """
-    Classifies each user into a behavioural persona (domain-agnostic):
-      - Converter:  Reached a rare/low-freq event with sufficient depth
-      - Attempter:  High depth + diversity, no conversion signal
-      - Shopper:    High repetition, moderate depth
-      - Browser:    Low depth, low diversity
-    Requires session_id column (from run_session_detection).
-    """
     df = pd.read_csv(csv_path, low_memory=False)
 
     if session_col not in df.columns:
@@ -3587,7 +3389,6 @@ def run_session_classification(
         user_stats["total_events"].clip(lower=1)
     ).round(4)
 
-    # Low-freq events = conversion signals (rare events = meaningful actions)
     event_freq = df[event_col].value_counts(normalize=True)
     conversion_signal_events = set(event_freq[event_freq < 0.05].index.tolist())
 

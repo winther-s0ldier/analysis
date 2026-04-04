@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Download, MessageSquare, Loader2, FileText, ArrowUp } from 'lucide-react';
+import { X, Download, MessageSquare, Loader2, FileText, ArrowUp, List, ExternalLink, Link, Check } from 'lucide-react';
+import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { usePipelineStore } from '../../store/pipelineStore';
 import { useChatStore } from '../../store/chatStore';
 import { sendChatMessage } from '../../api';
@@ -333,6 +335,18 @@ function BuildingSkeleton() {
   );
 }
 
+// ── Narrative renderer ────────────────────────────────────────────────────────
+// The streaming narrative is markdown. Convert to HTML then sanitize with DOMPurify.
+function _renderNarrative(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  try {
+    const html = marked.parse(raw, { breaks: true, gfm: true });
+    return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  } catch {
+    return `<pre style="white-space:pre-wrap">${String(raw).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}</pre>`;
+  }
+}
+
 // ── CanvasPanel ───────────────────────────────────────────────────────────────
 // onAsk: (selectedText, question) => void  — provided by App.jsx so answers
 // always appear in the left chat column regardless of which panel triggered them.
@@ -394,6 +408,26 @@ export function CanvasPanel({ onAsk }) {
     }
   }, [sessionId]);
 
+  const [copied, setCopied] = useState(false);
+
+  const handleOpenInTab = useCallback(() => {
+    if (!sessionId) return;
+    window.open(`/report/${sessionId}`, '_blank', 'noopener,noreferrer');
+  }, [sessionId]);
+
+  const handleCopyLink = useCallback(() => {
+    if (!sessionId) return;
+    const url = `${window.location.origin}/report/${sessionId}`;
+    navigator.clipboard.writeText(url).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }).catch(() => {});
+  }, [sessionId]);
+
+  // Table of contents extracted from report iframe headings
+  const [tocItems, setTocItems] = useState([]);
+  const [tocOpen, setTocOpen] = useState(false);
+
   // iframe load: auto-fit height + attach iframe selection bridge
   const [iframeLoaded, setIframeLoaded] = useState(false);
   const [iframeHeight, setIframeHeight] = useState(500);
@@ -405,6 +439,17 @@ export function CanvasPanel({ onAsk }) {
       if (doc) {
         const h = doc.body?.scrollHeight || doc.documentElement?.scrollHeight || 500;
         setIframeHeight(h + 8);
+
+        // Extract headings for TOC
+        const headings = Array.from(doc.querySelectorAll('h1, h2, h3'));
+        const items = headings
+          .filter(el => el.textContent?.trim())
+          .map((el, i) => {
+            // Assign an id if missing so we can scroll to it
+            if (!el.id) el.id = `_toc_${i}`;
+            return { id: el.id, text: el.textContent.trim().slice(0, 60), tag: el.tagName.toLowerCase() };
+          });
+        setTocItems(items);
 
         // Bridge text selection events from the iframe document to this panel
         const iframeEl = iframeRef.current;
@@ -519,6 +564,57 @@ export function CanvasPanel({ onAsk }) {
               {showReport ? 'Analysis Report' : 'Narrative Summary'}
             </span>
 
+            {/* TOC toggle — only when report has headings */}
+            {showReport && tocItems.length > 0 && (
+              <button
+                onClick={() => setTocOpen(o => !o)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium border transition-all"
+                style={{
+                  background: tocOpen ? '#EEF2FF' : '#F9FAFB',
+                  borderColor: tocOpen ? '#6366F1' : '#E5E7EB',
+                  color: tocOpen ? '#4F46E5' : '#374151',
+                }}
+                title="Table of contents"
+              >
+                <List size={13} strokeWidth={2} />
+                Contents
+              </button>
+            )}
+
+            {/* Open in tab */}
+            {showReport && (
+              <button
+                onClick={handleOpenInTab}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium border transition-all"
+                style={{ background: '#F9FAFB', borderColor: '#E5E7EB', color: '#374151' }}
+                onMouseEnter={e => { e.currentTarget.style.background = '#F3F4F6'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = '#F9FAFB'; }}
+                title="Open report in new tab"
+              >
+                <ExternalLink size={13} strokeWidth={2} />
+                Open
+              </button>
+            )}
+
+            {/* Copy link */}
+            {showReport && (
+              <button
+                onClick={handleCopyLink}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium border transition-all"
+                style={{
+                  background: copied ? '#F0FDF4' : '#F9FAFB',
+                  borderColor: copied ? '#86EFAC' : '#E5E7EB',
+                  color: copied ? '#16A34A' : '#374151',
+                }}
+                onMouseEnter={e => { if (!copied) { e.currentTarget.style.background = '#F3F4F6'; } }}
+                onMouseLeave={e => { if (!copied) { e.currentTarget.style.background = '#F9FAFB'; } }}
+                title="Copy report link"
+              >
+                {copied ? <Check size={13} strokeWidth={2.5} /> : <Link size={13} strokeWidth={2} />}
+                {copied ? 'Copied!' : 'Copy link'}
+              </button>
+            )}
+
             {/* Download */}
             {(showReport || showNarrative) && (
               <button
@@ -549,6 +645,49 @@ export function CanvasPanel({ onAsk }) {
           {/* ── Content ── */}
           {/* position: relative so iframe Ask AI popover can be absolute-positioned */}
           <div ref={contentRef} className="flex-1 overflow-y-auto relative" style={{ overscrollBehavior: 'contain' }}>
+
+            {/* TOC panel — floats at top above iframe when open */}
+            <AnimatePresence initial={false}>
+              {showReport && tocOpen && tocItems.length > 0 && (
+                <motion.div
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                  style={{ background: '#FAFAFA', borderBottom: '1px solid #E5E7EB', overflow: 'hidden' }}
+                >
+                  <nav style={{ padding: '12px 20px', display: 'flex', flexWrap: 'wrap', gap: '4px 12px' }}>
+                    {tocItems.map((item, i) => (
+                      <button
+                        key={i}
+                        onClick={() => {
+                          try {
+                            const el = iframeRef.current?.contentDocument?.getElementById(item.id);
+                            if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                          } catch {}
+                        }}
+                        style={{
+                          fontSize: item.tag === 'h1' ? 12 : 11,
+                          fontWeight: item.tag === 'h1' ? 700 : item.tag === 'h2' ? 600 : 500,
+                          color: '#374151',
+                          paddingLeft: item.tag === 'h2' ? 8 : item.tag === 'h3' ? 16 : 0,
+                          background: 'none', border: 'none', cursor: 'pointer',
+                          borderRadius: 4, padding: '3px 6px',
+                          whiteSpace: 'nowrap', overflow: 'hidden', maxWidth: 200,
+                          textOverflow: 'ellipsis',
+                          textAlign: 'left',
+                        }}
+                        title={item.text}
+                        onMouseEnter={e => { e.currentTarget.style.background = '#EEF2FF'; e.currentTarget.style.color = '#4F46E5'; }}
+                        onMouseLeave={e => { e.currentTarget.style.background = 'none'; e.currentTarget.style.color = '#374151'; }}
+                      >
+                        {item.text}
+                      </button>
+                    ))}
+                  </nav>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
             {/* Report: iframe that fills content area */}
             {showReport && (
@@ -671,9 +810,9 @@ export function CanvasPanel({ onAsk }) {
                 <SelectionPopover containerRef={contentRef} onSubmit={handleSubmitQuestion} />
                 <div
                   ref={narrativeRef}
-                  className="prose prose-sm max-w-none narrative-stream"
+                  className="prose prose-sm max-w-none narrative-stream narrative-md"
                   style={{ fontSize: 14, lineHeight: 1.75, color: '#374151' }}
-                  dangerouslySetInnerHTML={{ __html: typeof canvasNarrative === 'string' ? canvasNarrative.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/on\w+\s*=\s*["'][^"']*["']/gi, '').replace(/on\w+\s*=\s*[^\s>]+/gi, '').replace(/javascript\s*:/gi, '') : '' }}
+                  dangerouslySetInnerHTML={{ __html: _renderNarrative(canvasNarrative) }}
                 />
               </div>
             )}

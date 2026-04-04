@@ -56,7 +56,13 @@ function formatDate(dateStr) {
 }
 
 export function ProfileCard({ data }) {
-  if (!data || !data.profile) return null;
+  if (!data || !data.profile) return (
+    <div className="w-full flex items-center gap-2.5 px-4 py-3 rounded-xl border text-[13px]"
+      style={{ background: '#FFF7ED', borderColor: '#FED7AA', color: '#92400E' }}>
+      <span>⚠</span>
+      <span>Dataset profile unavailable — the profiling step may have failed.</span>
+    </div>
+  );
   const { profile, classification } = data;
 
   const ct = profile.column_types || {};

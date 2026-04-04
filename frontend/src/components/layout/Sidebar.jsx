@@ -42,7 +42,7 @@ export function Sidebar() {
           <motion.aside
             key="sidebar"
             className="flex flex-col shrink-0 z-10 overflow-hidden"
-            style={{ backgroundColor: '#0C0E14', borderRight: '1px solid rgba(255,255,255,0.06)' }}
+            style={{ backgroundColor: '#3D2B1A', borderRight: '1px solid rgba(255,255,255,0.07)' }}
             initial={{ width: 0, opacity: 0 }}
             animate={{ width: 220, opacity: 1 }}
             exit={{ width: 0, opacity: 0 }}
@@ -58,10 +58,10 @@ export function Sidebar() {
                   <LayoutGrid size={14} strokeWidth={2.5} color="#fff" />
                 </div>
                 <div className="flex flex-col leading-none">
-                  <span className="text-[13px] font-bold tracking-tight" style={{ color: '#F9FAFB' }}>
-                    R*
+                  <span className="text-[13px] font-bold tracking-tight" style={{ color: '#F0EBE3' }}>
+                    ADHOPSUN
                   </span>
-                  <span className="text-[10px] font-medium tracking-widest uppercase" style={{ color: '#4B5563' }}>
+                  <span className="text-[10px] font-medium tracking-widest uppercase" style={{ color: '#A89070' }}>
                     Analytics
                   </span>
                 </div>
@@ -70,9 +70,9 @@ export function Sidebar() {
               <button
                 onClick={() => setCollapsed(true)}
                 className="w-7 h-7 flex items-center justify-center rounded-md transition-colors duration-200"
-                style={{ color: '#4B5563' }}
-                onMouseEnter={e => e.currentTarget.style.color = '#9CA3AF'}
-                onMouseLeave={e => e.currentTarget.style.color = '#4B5563'}
+                style={{ color: '#6B5F58' }}
+                onMouseEnter={e => e.currentTarget.style.color = '#A89890'}
+                onMouseLeave={e => e.currentTarget.style.color = '#6B5F58'}
                 title="Collapse sidebar"
               >
                 <PanelLeftClose size={15} />
@@ -98,10 +98,10 @@ export function Sidebar() {
                       'relative flex items-center gap-2.5 px-3 py-2 rounded-lg cursor-default transition-all duration-300',
                     )}
                     style={{
-                      backgroundColor: isActive ? '#161922' : 'transparent',
+                      backgroundColor: isActive ? '#4E3522' : 'transparent',
                     }}
                     onMouseEnter={e => {
-                      if (!isActive) e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.04)';
+                      if (!isActive) e.currentTarget.style.backgroundColor = 'rgba(255,255,255,0.05)';
                     }}
                     onMouseLeave={e => {
                       if (!isActive) e.currentTarget.style.backgroundColor = 'transparent';
@@ -176,8 +176,8 @@ export function Sidebar() {
             className="flex flex-col items-center pt-5 shrink-0 z-10"
             style={{
               width: 52,
-              backgroundColor: '#0C0E14',
-              borderRight: '1px solid rgba(255,255,255,0.06)',
+              backgroundColor: '#3D2B1A',
+              borderRight: '1px solid rgba(255,255,255,0.07)',
             }}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -187,9 +187,9 @@ export function Sidebar() {
             <button
               onClick={() => setCollapsed(false)}
               className="w-8 h-8 flex items-center justify-center rounded-lg transition-colors duration-200"
-              style={{ color: '#4B5563' }}
-              onMouseEnter={e => e.currentTarget.style.color = '#9CA3AF'}
-              onMouseLeave={e => e.currentTarget.style.color = '#4B5563'}
+              style={{ color: '#6B5F58' }}
+              onMouseEnter={e => e.currentTarget.style.color = '#A89890'}
+              onMouseLeave={e => e.currentTarget.style.color = '#6B5F58'}
               title="Expand sidebar"
             >
               <PanelLeft size={16} />

@@ -1,7 +1,8 @@
 import React, { useRef, useState } from 'react';
 import { usePipelineStore } from '../../store/pipelineStore';
+import { useChatStore } from '../../store/chatStore';
 import { motion } from 'framer-motion';
-import { AlertTriangle, Info, AlertCircle, TrendingUp, Lightbulb, Wrench } from 'lucide-react';
+import { AlertTriangle, Info, AlertCircle, TrendingUp, Lightbulb, Wrench, BarChart2, Activity, MessageCircle } from 'lucide-react';
 
 const MIN_HEIGHT = 360;
 const MAX_HEIGHT = 680;
@@ -61,9 +62,28 @@ function MetaChip({ icon: Icon, label, value, accent }) {
   );
 }
 
+// ── ConfidenceBar ─────────────────────────────────────────────────────────────
+function ConfidenceBar({ confidence }) {
+  if (confidence == null) return null;
+  const pct = Math.round(confidence * 100);
+  const color = pct >= 90 ? '#10B981' : pct >= 75 ? '#F59E0B' : '#EF4444';
+  const label = pct < 75 ? 'Directional — treat as indicative' : null;
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+      <span style={{ fontSize: 10, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em', width: 70, flexShrink: 0 }}>Confidence</span>
+      <div style={{ flex: 1, height: 4, borderRadius: 2, background: '#F3F4F6', overflow: 'hidden' }}>
+        <div style={{ height: '100%', width: `${pct}%`, background: color, borderRadius: 2, transition: 'width 0.5s' }} />
+      </div>
+      <span style={{ fontSize: 11, fontWeight: 600, fontFamily: 'monospace', color, width: 34, textAlign: 'right' }}>{pct}%</span>
+      {label && <span style={{ fontSize: 10, color: '#9CA3AF', fontStyle: 'italic' }}>{label}</span>}
+    </div>
+  );
+}
+
 // ── ChartCard ─────────────────────────────────────────────────────────────────
-export function ChartCard({ id, analysisType, finding, hasChart = true, severity, decisionMakerTakeaway, keyFinding, topValues, anomalies, whatItMeans, recommendation, proposedFix }) {
+export function ChartCard({ id, analysisType, finding, hasChart = true, severity, confidence, decisionMakerTakeaway, keyFinding, topValues, anomalies, whatItMeans, recommendation, proposedFix }) {
   const { sessionId } = usePipelineStore();
+  const { setPendingMessage } = useChatStore();
   const [loaded, setLoaded] = useState(false);
   const [iframeError, setIframeError] = useState(false);
   const [iframeHeight, setIframeHeight] = useState(MIN_HEIGHT);
@@ -144,6 +164,9 @@ export function ChartCard({ id, analysisType, finding, hasChart = true, severity
           </div>
         )}
 
+        {/* Confidence bar */}
+        <ConfidenceBar confidence={confidence} />
+
         {/* Contextual meta chips */}
         {hasMeta && (
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -160,7 +183,7 @@ export function ChartCard({ id, analysisType, finding, hasChart = true, severity
               accent={false}
             />
             <MetaChip
-              icon={TrendingUp}
+              icon={BarChart2}
               label="Notable Values"
               value={topValues}
               accent={false}
@@ -172,7 +195,7 @@ export function ChartCard({ id, analysisType, finding, hasChart = true, severity
               accent={false}
             />
             <MetaChip
-              icon={TrendingUp}
+              icon={Activity}
               label="What it means"
               value={whatItMeans}
               accent={false}
@@ -191,6 +214,28 @@ export function ChartCard({ id, analysisType, finding, hasChart = true, severity
             />
           </div>
         )}
+
+        {/* Ask about this */}
+        <div style={{ marginTop: 10, paddingTop: 10, borderTop: '1px solid #F3F4F6' }}>
+          <button
+            onClick={() => {
+              const label = (analysisType || id || '').replace(/_/g, ' ');
+              setPendingMessage(`Tell me more about the ${label} analysis`);
+            }}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 6,
+              fontSize: 12, fontWeight: 500, color: '#6366F1',
+              background: '#EEF2FF', border: '1px solid #C7D2FE',
+              borderRadius: 8, padding: '5px 12px', cursor: 'pointer',
+              transition: 'background 0.15s',
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = '#E0E7FF'}
+            onMouseLeave={e => e.currentTarget.style.background = '#EEF2FF'}
+          >
+            <MessageCircle size={12} strokeWidth={2} />
+            Ask about this
+          </button>
+        </div>
       </div>
     </motion.div>
   );

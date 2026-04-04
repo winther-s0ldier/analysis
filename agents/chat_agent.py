@@ -1,12 +1,3 @@
-"""
-Chat Agent — conversational Q&A over completed analysis results.
-
-This agent is ONLY used by the /chat endpoint after the pipeline has run.
-It has NO tools and cannot trigger any analysis. It answers questions
-using the full context injected into the prompt: synthesis, all findings,
-column profile, and dataset metadata.
-"""
-
 import sys
 import os
 
@@ -14,14 +5,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 _PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
 
-
 def _load_prompt(name: str) -> str:
     with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
         return f.read()
 
-
 _chat_agent_instance = None
-
 
 def get_chat_agent():
     global _chat_agent_instance
@@ -38,6 +26,6 @@ def get_chat_agent():
                 "triggers new analyses."
             ),
             instruction=_load_prompt("chat_agent.md"),
-            tools=[],  # no tools — answers from context only
+            tools=[],
         )
     return _chat_agent_instance

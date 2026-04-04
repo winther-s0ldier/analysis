@@ -6,38 +6,22 @@ import logging
 import traceback
 from typing import Optional
 
-
-
 _result_store: dict = {}
-
 
 def get_analysis_result(
     session_id: str,
     analysis_id: str,
 ) -> dict | None:
-    """Read stored result for session + analysis."""
     return _result_store.get(f"{session_id}:{analysis_id}")
-
 
 def store_analysis_result(
     session_id: str,
     analysis_id: str,
     result: dict,
 ) -> None:
-    """Store a result in the module-level store."""
     _result_store[f"{session_id}:{analysis_id}"] = result
 
-
-
 def lookup_library_function(analysis_type: str) -> dict:
-    """
-    Check if a pre-built library function exists.
-    Pure dict lookup, no LLM needed.
-
-    Returns:
-        dict with exists, function_name, required_args,
-        description, import_statement, example_call, col_role
-    """
     from tools.analysis_library import LIBRARY_REGISTRY
 
     entry = LIBRARY_REGISTRY.get(analysis_type)
@@ -67,16 +51,10 @@ def lookup_library_function(analysis_type: str) -> dict:
         "col_role": entry.get("col_role"),
     }
 
-
-
 def check_precomputed_result(
     session_id: str,
     analysis_type: str,
 ) -> dict:
-    """
-    Check if analysis was already precomputed.
-    Returns dict with exists (bool) and result (dict or None).
-    """
     try:
         from main import sessions
         state = sessions.get(session_id)
@@ -88,22 +66,7 @@ def check_precomputed_result(
         logging.warning(f"Precomputed result lookup failed for {analysis_type}: {_pre_err}")
     return {"exists": False, "result": None}
 
-
-
 def validate_code(code: str, csv_path: str) -> dict:
-    """
-    Validate analysis code before running it.
-
-    Checks:
-    1. Syntax — valid Python
-    2. Structure — has analyze() function
-    3. Safety — no file deletion, subprocess, eval, exec
-    4. Dry run — imports work on first 5 rows
-
-    Returns:
-        dict with valid (bool), issues (list),
-        fix_instructions (str or None)
-    """
     issues = []
 
     try:
@@ -178,8 +141,6 @@ def validate_code(code: str, csv_path: str) -> dict:
 
     return {"valid": True, "issues": [], "fix_instructions": None}
 
-
-
 def execute_analysis(
     code: str,
     csv_path: str,
@@ -187,14 +148,6 @@ def execute_analysis(
     analysis_type: str,
     output_folder: str,
 ) -> dict:
-    """
-    Execute validated analysis code in sandbox.
-    Generates chart if chart_ready_data is present.
-
-    Returns:
-        FLAT dict with execution_status, analysis result fields,
-        and chart_file_path if chart was generated.
-    """
     try:
         os.makedirs(output_folder, exist_ok=True)
 
@@ -266,20 +219,10 @@ def execute_analysis(
             ),
         }
 
-
-
 def validate_output_quality(
     result: dict,
     analysis_type: str,
 ) -> dict:
-    """
-    Validate that the result has meaningful content.
-    Pure pattern checks, no LLM.
-
-    Returns:
-        dict with quality_pass (bool), issues (list),
-        fix_instructions (str), severity (ok|warn|fail)
-    """
     issues = []
 
     if not result:
@@ -351,23 +294,18 @@ def validate_output_quality(
         "severity": "ok",
     }
 
-
-
 def submit_result(
     session_id: str,
     analysis_id: str,
     analysis_type: str,
     result: dict,
 ) -> str:
-    """
-    Store result and post A2A ANALYSIS_COMPLETE message.
-    """
     result["analysis_id"] = analysis_id
     store_analysis_result(session_id, analysis_id, result)
 
     try:
         from main import sessions
-        from a2a_messages import create_message, Intent
+        from pipeline_types import create_message, Intent
         state = sessions.get(session_id)
         if state:
             state.store_result(analysis_id, result)
@@ -390,18 +328,12 @@ def submit_result(
 
     return f"Result stored for {analysis_id} ({analysis_type}) in session {session_id}."
 
-
-
 def generate_chart(
     chart_ready_data: dict,
     analysis_id: str,
     analysis_type: str,
     output_folder: str,
 ) -> str | None:
-    """
-    Generate a Plotly HTML chart from chart_ready_data.
-    Returns path to saved HTML file, or None if failed.
-    """
     try:
         import plotly.graph_objects as go
         import plotly.express as px
@@ -409,7 +341,6 @@ def generate_chart(
         output_folder = os.path.abspath(output_folder)
         os.makedirs(output_folder, exist_ok=True)
 
-        # Normalize generic chart type names the LLM may produce to internal handler names
         _TYPE_ALIASES = {
             "bar":       "bar_chart",
             "scatter":   "generic_scatter",
@@ -557,7 +488,7 @@ def generate_chart(
                 )
 
         elif chart_type == "dropout_bar":
-            # Try canonical key names first, then common coder-agent alternatives
+
             events = (
                 chart_ready_data.get("events") or
                 chart_ready_data.get("event_names") or
@@ -578,7 +509,7 @@ def generate_chart(
                 chart_ready_data.get("dropout_rate") or
                 []
             )
-            # Last-resort: pick any list of strings as labels and any list of numbers as values
+
             if not events or not counts:
                 str_keys = [k for k, v in chart_ready_data.items() if isinstance(v, list) and v and isinstance(v[0], str)]
                 num_keys = [k for k, v in chart_ready_data.items() if isinstance(v, list) and v and isinstance(v[0], (int, float))]
@@ -742,8 +673,6 @@ def generate_chart(
                     yaxis_title="Frequency Score",
                 )
 
-        # ── NEW HANDLERS ──────────────────────────────────────────────────────
-
         elif chart_type == "horizontal_bar":
             labels = chart_ready_data.get("labels", [])
             values = chart_ready_data.get("values", [])
@@ -846,9 +775,8 @@ def generate_chart(
                     hovertemplate="%{x}: %{y}<extra></extra>",
                 ))
 
-        # ── Universal fallback: attempt to build a chart from any labels/values data ──
         if fig is None:
-            # Try to auto-detect chart data from common key patterns
+
             _labels = (chart_ready_data.get("labels") or chart_ready_data.get("x")
                        or chart_ready_data.get("categories") or chart_ready_data.get("names") or [])
             _values = (chart_ready_data.get("values") or chart_ready_data.get("y")
@@ -856,7 +784,7 @@ def generate_chart(
             if _labels and _values and len(_labels) == len(_values):
                 print(f"INFO: generate_chart — using universal fallback for chart_type='{chart_type}' "
                       f"(analysis_id={analysis_id})")
-                # If values are all numeric, use bar chart; otherwise scatter
+
                 try:
                     [float(v) for v in _values]
                     fig = go.Figure(go.Bar(
@@ -866,8 +794,6 @@ def generate_chart(
                     ))
                 except (ValueError, TypeError):
                     pass
-
-        # ─────────────────────────────────────────────────────────────────────
 
         if fig is None:
             print(f"WARNING: generate_chart — no handler for chart_type='{chart_type}' "

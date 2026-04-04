@@ -14,9 +14,7 @@ from tools.code_executor import (
 )
 from tools.model_config import get_model
 
-
 def _build_library_ref() -> str:
-    """Generate the AVAILABLE LIBRARY FUNCTIONS block from LIBRARY_REGISTRY at import time."""
     lines = []
     for atype, meta in LIBRARY_REGISTRY.items():
         fn = meta.get("function", "")
@@ -29,20 +27,11 @@ _LIBRARY_REF = _build_library_ref()
 
 _PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
 
-
 def _load_prompt(name: str) -> str:
     with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
         return f.read()
 
-
-
 def _coder_after_model_callback(callback_context, llm_response):
-    """Validate that the coder's response contains a Python code block.
-
-    If the model response is missing a ```python ... ``` block, return a
-    corrective LlmResponse that instructs the model to reformat.  Returning
-    None keeps the original response unchanged.
-    """
     text = ""
     if llm_response.content and llm_response.content.parts:
         for part in llm_response.content.parts:
@@ -69,9 +58,7 @@ def _coder_after_model_callback(callback_context, llm_response):
         )
     return None
 
-
 _coder_agent_instance = None
-
 
 def get_coder_agent():
     global _coder_agent_instance

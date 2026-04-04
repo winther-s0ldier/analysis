@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useCallback, useState } from 'react';
+import React, { useEffect, useRef, useCallback, useState, Component } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
 import { TopProgressBar } from './components/layout/TopProgressBar';
 import { ProgressRing } from './components/layout/ProgressRing';
@@ -53,7 +53,7 @@ function ResizeHandle({ onDrag, onDragEnd }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        borderLeft: '1px solid #E5E7EB',
+        borderLeft: '1px solid #DDD7CC',
         background: hovered || dragging ? 'rgba(99,102,241,0.04)' : 'transparent',
         transition: dragging ? 'none' : 'background 0.2s ease',
       }}
@@ -76,30 +76,29 @@ function ResizeHandle({ onDrag, onDragEnd }) {
 function App() {
   const { wrapperRef, contentRef } = useLenis();
   const { sessionId, phase, hasReport, canvasOpen } = usePipelineStore();
-  const { messages, addMessage, thinking, setThinking } = useChatStore();
+  const { messages, addMessage, insertAfterMessage, thinking, setThinking } = useChatStore();
   const messagesEndRef = useRef(null);
-  const [parent] = useAutoAnimate();
+  const [pipelineParent] = useAutoAnimate();
+  const [conversationParent] = useAutoAnimate();
 
   // Ask AI handler — used by SelectionPopover in the chat column and by CanvasPanel
   const handleChatAsk = useCallback(async (selectedText, question) => {
     if (!sessionId) return;
-    addMessage('user', 'canvas_question', { selectedText, question });
+    const userMsgId = addMessage('user', 'canvas_question', { selectedText, question });
     setThinking(true);
-    // When there is no selected text (e.g. from ReportAskBar) send the plain
-    // question; otherwise wrap with the quoted selection for context.
     const context = selectedText.trim()
       ? `Regarding this section:\n> "${selectedText.slice(0, 400)}"\n\n${question}`
       : question;
     try {
       const res = await sendChatMessage(sessionId, context);
-      if (res?.response) addMessage('ai', 'text', res.response);
-      else addMessage('ai', 'text', 'No response received from the AI.');
+      if (res?.response) insertAfterMessage(userMsgId, 'ai', 'text', res.response);
+      else insertAfterMessage(userMsgId, 'ai', 'text', 'No response received from the AI.');
     } catch {
-      addMessage('ai', 'text', 'Sorry, could not process your question right now.');
+      insertAfterMessage(userMsgId, 'ai', 'text', 'Sorry, could not process your question right now.');
     } finally {
       setThinking(false);
     }
-  }, [sessionId, addMessage, setThinking]);
+  }, [sessionId, addMessage, insertAfterMessage, setThinking]);
 
   // Initialize SSE connection for the session
   useSSEStream(sessionId);
@@ -134,12 +133,14 @@ function App() {
     setIsDragging(false);
   }, []);
 
-  // Auto-scroll chat on new messages or when thinking state changes
+  // Auto-scroll only when conversation messages change or thinking indicator appears.
+  // Pipeline chart messages arriving mid-analysis should NOT yank the scroll position.
+  const conversationCount = messages.filter(m => m.category === 'conversation').length;
   useEffect(() => {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [messages, thinking]);
+  }, [conversationCount, thinking]);
 
   // Fallback: if SSE missed synthesis_complete (e.g. page reload mid-pipeline),
   // fetch synthesis once when pipeline reaches complete phase.
@@ -185,6 +186,47 @@ function App() {
   return (
     <>
       <Toaster position="bottom-right" richColors theme="light" closeButton />
+      <button
+        onClick={() => window.location.href = '/user-activity/'}
+        style={{
+          position: 'fixed',
+          bottom: 20,
+          left: 20,
+          zIndex: 9999,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 7,
+          padding: '7px 13px',
+          background: '#6366F1',
+          color: '#FFFFFF',
+          border: 'none',
+          borderRadius: 20,
+          fontSize: 12,
+          fontWeight: 600,
+          fontFamily: 'inherit',
+          cursor: 'pointer',
+          boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
+          letterSpacing: '0.01em',
+          transition: 'background 0.15s, transform 0.1s',
+        }}
+        onMouseEnter={e => e.currentTarget.style.background = '#4F46E5'}
+        onMouseLeave={e => e.currentTarget.style.background = '#6366F1'}
+        onMouseDown={e => e.currentTarget.style.transform = 'scale(0.96)'}
+        onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}
+        title="Open User Activity Dashboard"
+      >
+        <span style={{
+          width: 7, height: 7, borderRadius: '50%', background: '#22C55E', flexShrink: 0,
+          boxShadow: '0 0 0 0 rgba(34,197,94,0.6)',
+          animation: 'uaPulse 2s ease-in-out infinite',
+        }} />
+        User Activity
+        <style>{`@keyframes uaPulse {
+          0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
+          70%  { box-shadow: 0 0 0 5px rgba(34,197,94,0); }
+          100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+        }`}</style>
+      </button>
       <TopProgressBar />
       <Sidebar />
       <main ref={mainRef} className="flex-1 flex overflow-hidden bg-bg-page relative font-sans">
@@ -211,36 +253,68 @@ function App() {
               className="w-full mx-auto flex flex-col gap-[18px] flex-1"
               style={{ padding: '48px 24px 16px', maxWidth: canvasOpen ? '100%' : 720 }}
             >
-              {messages.length === 0 && !thinking ? (
-                <div className="flex-1 flex flex-col items-center justify-center text-center p-[48px_24px] min-h-[320px]">
-                  <div className="text-accent mb-6 opacity-60">
-                    <motion.div
-                      animate={{ rotate: [0, 10, -10, 0], scale: [1, 1.05, 1] }}
-                      transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
-                    >
-                      <svg width="48" height="48" viewBox="0 0 20 20" fill="none">
-                        <rect x="2" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.8" />
-                        <rect x="11" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
-                        <rect x="2" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
-                        <rect x="11" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.7" />
-                      </svg>
-                    </motion.div>
+              {(() => {
+                const pipelineMessages = messages.filter(m => m.category === 'pipeline');
+                const conversationMessages = messages.filter(m => m.category === 'conversation');
+                const isEmpty = pipelineMessages.length === 0 && conversationMessages.length === 0 && !thinking;
+
+                if (isEmpty) {
+                  return (
+                    <div className="flex-1 flex flex-col items-center justify-center text-center p-[48px_24px] min-h-[320px]">
+                      <div className="text-accent mb-6 opacity-60">
+                        <motion.div
+                          animate={{ rotate: [0, 10, -10, 0], scale: [1, 1.05, 1] }}
+                          transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+                        >
+                          <svg width="48" height="48" viewBox="0 0 20 20" fill="none">
+                            <rect x="2" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.8" />
+                            <rect x="11" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
+                            <rect x="2" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
+                            <rect x="11" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.7" />
+                          </svg>
+                        </motion.div>
+                      </div>
+                      <h1 className="text-[28px] font-semibold text-text-primary mb-3 tracking-tight">What would you like to analyze?</h1>
+                      <p className="text-[16px] text-text-tertiary max-w-[400px] leading-relaxed mb-6 font-medium">Upload a data file to start a full multi-agent analysis pipeline.</p>
+                      <div className="flex gap-2 flex-wrap justify-center opacity-80">
+                        {['CSV', 'XLSX', 'JSON', 'JSONL', 'Parquet'].map(ext => (
+                          <span key={ext} className="font-mono text-[11px] font-bold text-text-muted bg-bg-surface border border-border-subtle px-2.5 py-1 rounded-md shadow-xs">{ext}</span>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="flex flex-col gap-[18px]">
+                    {/* ── Pipeline results block — all graphs/cards always here ── */}
+                    {pipelineMessages.length > 0 && (
+                      <div ref={pipelineParent} className="flex flex-col gap-[18px]">
+                        {pipelineMessages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
+                      </div>
+                    )}
+
+                    {/* ── Separator — only when both zones have content ── */}
+                    {pipelineMessages.length > 0 && (conversationMessages.length > 0 || thinking) && (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '2px 0' }}>
+                        <div style={{ flex: 1, height: 1, background: '#DDD7CC' }} />
+                        <span style={{
+                          fontSize: 10, fontWeight: 700, color: '#9C9590',
+                          letterSpacing: '0.08em', textTransform: 'uppercase',
+                        }}>Chat</span>
+                        <div style={{ flex: 1, height: 1, background: '#DDD7CC' }} />
+                      </div>
+                    )}
+
+                    {/* ── Conversation block — Q&A always at the bottom ── */}
+                    <div ref={conversationParent} className="flex flex-col gap-[18px]">
+                      {conversationMessages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
+                      {/* Pulsing dots shown while Ask AI / chat is awaiting a response */}
+                      {thinking && <ThinkingBubble />}
+                    </div>
                   </div>
-                  <h1 className="text-[28px] font-semibold text-text-primary mb-3 tracking-tight">What would you like to analyze?</h1>
-                  <p className="text-[16px] text-text-tertiary max-w-[400px] leading-relaxed mb-6 font-medium">Upload a data file to start a full multi-agent analysis pipeline.</p>
-                  <div className="flex gap-2 flex-wrap justify-center opacity-80">
-                    {['CSV', 'XLSX', 'JSON', 'JSONL', 'Parquet'].map(ext => (
-                      <span key={ext} className="font-mono text-[11px] font-bold text-text-muted bg-bg-surface border border-border-subtle px-2.5 py-1 rounded-md shadow-xs">{ext}</span>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div ref={parent} className="flex flex-col gap-[18px]">
-                  {messages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
-                  {/* Pulsing dots shown while Ask AI / chat is awaiting a response */}
-                  {thinking && <ThinkingBubble />}
-                </div>
-              )}
+                );
+              })()}
               <div ref={messagesEndRef} />
             </div>
           </div>
@@ -264,4 +338,40 @@ function App() {
   );
 }
 
-export default App;
+class AppErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex-1 flex flex-col items-center justify-center p-12 text-center gap-4">
+          <div className="text-[32px]">⚠</div>
+          <h2 className="text-[18px] font-semibold text-text-primary">Something went wrong</h2>
+          <p className="text-[13px] text-text-tertiary max-w-[360px]">
+            {this.state.error?.message || 'An unexpected error occurred in the UI.'}
+          </p>
+          <button
+            onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-4 py-2 rounded-lg text-[13px] font-medium bg-accent text-white hover:bg-accent-dark transition-colors"
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function WrappedApp() {
+  return (
+    <AppErrorBoundary>
+      <App />
+    </AppErrorBoundary>
+  );
+}

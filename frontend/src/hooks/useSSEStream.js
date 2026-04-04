@@ -30,6 +30,7 @@ function renderNewCharts(sessionId, renderedCharts, addMessage, updateChartMessa
         finding:                r.top_finding ?? null,
         hasChart:               !!r.chart_path,
         severity:               r.severity ?? null,
+        confidence:             r.confidence ?? null,
         whatItMeans:             r.narrative?.what_it_means ?? null,
         recommendation:         r.insight_summary?.recommendation ?? null,
         proposedFix:            r.narrative?.proposed_fix ?? null,
@@ -74,7 +75,13 @@ export function useSSEStream(sessionId) {
       const insights = Array.isArray(synthesis.detailed_insights)
         ? synthesis.detailed_insights
         : synthesis.detailed_insights?.insights || [];
-      if (insights.length) addMessage('ai', 'insights', insights);
+
+      // Attach critic challenges to insights so InsightCard can show inline annotations
+      const criticChallenges = synthesis._critic_review?.challenges || [];
+      if (insights.length) addMessage('ai', 'insights', { insights, criticChallenges });
+
+      // Action plan view — dispatched after insights
+      if (insights.length) addMessage('ai', 'action_plan', insights);
 
       const _rawPersonas = synthesis.key_segments ?? synthesis.personas;
       const segments = Array.isArray(_rawPersonas)
@@ -118,6 +125,7 @@ export function useSSEStream(sessionId) {
         case 'node_started':
           flushSync(() => {
             updateNodeStatus(ev.data.node_id, 'running');
+            useChatStore.getState().addSkeleton(ev.data.node_id, ev.data.analysis_type || ev.data.node_id);
           });
           break;
 
@@ -125,6 +133,7 @@ export function useSSEStream(sessionId) {
           flushSync(() => {
             updateNodeStatus(ev.data.analysis_id, 'complete');
             setPhase('analyzing');
+            useChatStore.getState().removeSkeleton(ev.data.analysis_id);
           });
 
           // Pull model (matches GitHub renderNewCharts): fetch ALL results from
@@ -136,6 +145,7 @@ export function useSSEStream(sessionId) {
         case 'node_failed':
           flushSync(() => {
             updateNodeStatus(ev.data.node_id || 'unknown', 'failed', ev.data.error || 'unknown');
+            useChatStore.getState().removeSkeleton(ev.data.node_id || 'unknown');
           });
           addMessage('ai', 'text', `⚠️ Analysis ${ev.data.node_id} could not complete: ${ev.data.error}. Other analyses will continue.`);
           break;
@@ -245,6 +255,12 @@ export function useSSEStream(sessionId) {
               ambiguousNodes: ev.data?.ambiguous_nodes || [],
               columns: ev.data?.columns || [],
             });
+          }
+          break;
+
+        default:
+          if (ev.type && !['turn_started', 'turn_ended', 'tool_called'].includes(ev.type)) {
+            console.warn('[SSE] Unhandled event type:', ev.type, ev.data);
           }
           break;
       }

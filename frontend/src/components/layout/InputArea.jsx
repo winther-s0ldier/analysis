@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { Paperclip, Send, X, FileUp } from 'lucide-react';
 import { usePipelineStore } from '../../store/pipelineStore';
 import { useChatStore } from '../../store/chatStore';
@@ -17,7 +17,7 @@ function formatSize(bytes) {
 
 export function InputArea() {
   const { sessionId, setSession, setPhase, setNodes } = usePipelineStore();
-  const { addMessage, addOrUpdateChart, clearMessages, setThinking } = useChatStore();
+  const { addMessage, insertAfterMessage, addOrUpdateChart, clearMessages, setThinking, pendingMessage, setPendingMessage } = useChatStore();
   const [file, setFile] = useState(null);
   const [textValue, setTextValue] = useState('');
   const [isHovering, setIsHovering] = useState(false);
@@ -25,6 +25,15 @@ export function InputArea() {
   const [parent] = useAutoAnimate();
 
   const textareaRef = useAutoResize(textValue);
+
+  // Consume pendingMessage (set by "Ask about this" buttons on cards)
+  useEffect(() => {
+    if (!pendingMessage) return;
+    setTextValue(pendingMessage);
+    setPendingMessage('');
+    // Focus the textarea so user can immediately send
+    setTimeout(() => textareaRef.current?.focus(), 50);
+  }, [pendingMessage]);
 
   const onSubmit = async () => {
     const currentText = textValue.trim();
@@ -70,20 +79,18 @@ export function InputArea() {
         setPhase('error');
       }
     } else if (sessionId) {
-      addMessage('user', 'text', currentText);
+      const userMsgId = addMessage('user', 'text', currentText);
       setThinking(true);
       try {
         const res = await sendChatMessage(sessionId, currentText);
         if (res?.response) {
-          // If the backend ran a new analysis, render the chart card directly
-          // from the response (SSE may not be active post-pipeline).
           if (res.analysis_status === 'success' && res.chart) {
             addOrUpdateChart(res.chart);
           }
-          addMessage('ai', 'text', res.response);
+          insertAfterMessage(userMsgId, 'ai', 'text', res.response);
         }
       } catch {
-        addMessage('ai', 'text', 'Sorry, could not reach the server.');
+        insertAfterMessage(userMsgId, 'ai', 'text', 'Sorry, could not reach the server.');
       } finally {
         setThinking(false);
       }
@@ -213,6 +220,7 @@ export function InputArea() {
             onMouseLeave={e => e.currentTarget.style.color = '#9CA3AF'}
             onClick={() => fileInputRef.current?.click()}
             title="Attach file"
+            aria-label="Attach file"
           >
             <Paperclip size={18} strokeWidth={2} />
           </button>
@@ -249,6 +257,7 @@ export function InputArea() {
             onMouseEnter={e => { if (canSend) e.currentTarget.style.background = '#4F46E5'; }}
             onMouseLeave={e => { if (canSend) e.currentTarget.style.background = '#6366F1'; }}
             onClick={onSubmit}
+            aria-label="Send message"
           >
             <Send
               size={16}

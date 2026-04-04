@@ -11,32 +11,23 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(__file__), "..")
 )
 
-from a2a_messages import create_message, Intent
-
+from pipeline_types import create_message, Intent
 
 _report_store: dict = {}
 
-
 def get_report_result(session_id: str) -> dict | None:
-    """Read stored report path for a session."""
     return _report_store.get(session_id)
-
-
 
 def tool_build_report(
     session_id: Annotated[str, Field(description="Active pipeline session ID")],
     output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.")],
     tool_context=None,
 ) -> dict:
-    """
-    Collect artifacts and assemble the final HTML report in one step.
-    """
     charts = []
     synthesis = {}
     dataset_type = ""
     csv_filename = ""
 
-    # ── Source 0: in-process session state (only works when NOT in A2A subprocess) ──
     state = None
     try:
         from main import sessions
@@ -46,11 +37,9 @@ def tool_build_report(
             csv_filename = getattr(state, "csv_filename", "")
             print(f"INFO: dag_builder got session state from main.sessions for {session_id}")
     except Exception as _imp_err:
-        # Expected in A2A subprocess mode — main.py can't be imported cleanly.
-        # File-based sources below will provide the data instead.
+
         print(f"INFO: dag_builder running without main.sessions (A2A mode): {_imp_err}")
 
-    # ── Source 1: ToolContext state (SequentialAgent in-process mode) ──
     if tool_context is not None:
         try:
             _tc_synth = tool_context.state.get("synthesis")
@@ -64,7 +53,6 @@ def tool_build_report(
         except Exception:
             pass
 
-    # ── Source 2: _synthesis_store (in-process module-level dict) ──
     if not synthesis:
         try:
             from agents.synthesis import get_synthesis_result
@@ -75,13 +63,11 @@ def tool_build_report(
         except Exception:
             pass
 
-    # ── Source 3: state.synthesis (in-process session object) ──
     if not synthesis and state:
         synthesis = getattr(state, "synthesis", {}) or {}
         if synthesis:
             print(f"INFO: dag_builder got synthesis from state.synthesis for {session_id}")
 
-    # ── Source 4: file-based cache (CRITICAL for A2A subprocess mode) ──
     if not synthesis:
         try:
             _cache_path = os.path.join(output_folder, "_synthesis_cache.json")
@@ -94,7 +80,6 @@ def tool_build_report(
         except Exception as _cache_err:
             print(f"WARNING: dag_builder failed to read _synthesis_cache.json: {_cache_err}")
 
-    # ── Source 5: inject _critic_cache.json into synthesis if not already present ──
     if synthesis and not synthesis.get("_critic_review"):
         try:
             _critic_cache_path = os.path.join(output_folder, "_critic_cache.json")
@@ -107,7 +92,6 @@ def tool_build_report(
         except Exception:
             pass
 
-    # ── Read dataset metadata from file cache when state is unavailable (A2A mode) ──
     if not dataset_type or not csv_filename:
         try:
             _meta_path = os.path.join(output_folder, "_dataset_meta.json")
@@ -121,6 +105,36 @@ def tool_build_report(
             pass
 
     if not synthesis:
+        try:
+            _results_cache_path = os.path.join(output_folder, "_results_cache.json")
+            if os.path.exists(_results_cache_path):
+                with open(_results_cache_path, "r", encoding="utf-8") as _rcf:
+                    _raw_results = json.load(_rcf)
+                if _raw_results:
+                    synthesis = {
+                        "executive_summary": {"overall_health": "Analysis completed. Synthesis unavailable — showing raw results only."},
+                        "detailed_insights": {"insights": [
+                            {
+                                "node_id": _aid,
+                                "analysis_type": _r.get("analysis_type", ""),
+                                "ai_summary": _r.get("top_finding", ""),
+                                "severity": _r.get("severity", "info"),
+                                "root_cause_hypothesis": "",
+                                "fix_priority": "medium",
+                            }
+                            for _aid, _r in _raw_results.items()
+                            if isinstance(_r, dict) and _r.get("status") == "success"
+                        ]},
+                        "conversational_report": "Synthesis was not available. The following charts show the raw analysis results.",
+                        "cross_metric_connections": {"connections": []},
+                        "_qc_passed": False,
+                        "_synthesis_skipped": True,
+                    }
+                    print(f"INFO: dag_builder built skeleton synthesis from {len(_raw_results)} results for {session_id}")
+        except Exception as _sk_err:
+            print(f"WARNING: dag_builder skeleton synthesis build failed: {_sk_err}")
+
+    if not synthesis:
         print(f"WARNING: dag_builder found no synthesis for {session_id} — report will have no insights.")
         return {
             "status": "error",
@@ -128,7 +142,6 @@ def tool_build_report(
             "session_id": session_id,
         }
 
-    # ── Collect chart artifacts from session state ──
     try:
         if state:
             for aid, result in state.results.items():
@@ -145,7 +158,7 @@ def tool_build_report(
                         "severity": result.get("severity", "info"),
                         "confidence": result.get("confidence", 0.0),
                         "narrative": result.get("data", {}).get("narrative", {}),
-                        # Per-node decision-maker insight from #10
+
                         "decision_maker_takeaway": _ins_sum.get("decision_maker_takeaway", "") if isinstance(_ins_sum, dict) else "",
                     })
     except Exception as e:
@@ -155,8 +168,7 @@ def tool_build_report(
         for fname in os.listdir(output_folder):
             if fname.endswith(".html") and fname != "report.html":
                 fpath = os.path.join(output_folder, fname)
-                # Use abspath on both sides so absolute vs relative path
-                # differences do not cause the same file to be added twice.
+
                 if not any(os.path.abspath(c["chart_path"]) == os.path.abspath(fpath) for c in charts):
                     parts = fname.replace(".html", "").split("_", 1)
                     charts.append({
@@ -185,7 +197,7 @@ def tool_build_report(
     report_path = os.path.join(output_folder, "report.html")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(html)
-        
+
     synthesis_path = os.path.join(output_folder, "synthesis.json")
     with open(synthesis_path, "w", encoding="utf-8") as f:
         json.dump(synthesis, f, indent=2)
@@ -213,453 +225,796 @@ def tool_build_report(
         logging.warning(f"Failed to post REPORT_READY message: {_rpt_err}")
     return {"status": "success", **res}
 
-
-
 def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_type: str, csv_filename: str) -> str:
-    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
-    title = f"Analysis Report — {csv_filename}" if csv_filename else "Analysis Report"
+    generated = datetime.now().strftime("%B %d, %Y")
+    generated_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    title = csv_filename or "Analytics Report"
 
-    def get_sect(name, content):
+    _SEV_COLOR = {"critical": "#DC2626", "high": "#D97706", "medium": "#2563EB", "low": "#059669", "info": "#6B7280"}
+    _SEV_BG    = {"critical": "#FEF2F2", "high": "#FFFBEB", "medium": "#EFF6FF", "low": "#F0FDF4", "info": "#F9FAFB"}
+    _SEV_LABEL = {"critical": "CRITICAL", "high": "HIGH",   "medium": "MEDIUM",  "low": "LOW",    "info": "INFO"}
+
+    def sc(s): return _SEV_COLOR.get(s, "#6B7280")
+    def sb(s): return _SEV_BG.get(s, "#F9FAFB")
+    def sl(s): return _SEV_LABEL.get(s, s.upper())
+
+    def norm_sev(s, fallback="medium"):
+        s = (s or fallback).lower()
+        return s if s in _SEV_COLOR else fallback
+
+    def badge(sev):
+        c = sc(sev); bg = sb(sev)
+        return (f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.06em;color:{c};'
+                f'background:{bg};padding:2px 8px;border-radius:9999px;white-space:nowrap;">'
+                f'{sl(sev)}</span>')
+
+    def detail_row(label, content):
         if not content: return ""
-        display_name = name.replace("_", " ").title()
-        return f'<section class="section {name}"><h2>{display_name}</h2>{content}</section>'
+        return (f'<div style="display:flex;gap:16px;padding:10px 0;'
+                f'border-bottom:1px solid #F3F4F6;font-size:13px;line-height:1.65;">'
+                f'<div style="flex-shrink:0;width:140px;font-size:10px;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.06em;color:#9CA3AF;padding-top:2px;">'
+                f'{label}</div>'
+                f'<div style="flex:1;color:#374151;">{content}</div>'
+                f'</div>')
+
+    def li_list(items, ordered=False):
+        if not items: return ""
+        tag = "ol" if ordered else "ul"
+        inner = "".join(f'<li style="margin-bottom:5px;">{x}</li>' for x in items)
+        return f'<{tag} style="margin:0;padding-left:18px;">{inner}</{tag}>'
+
+    def _extract_hero_stat(text):
+        if not text:
+            return None, None
+
+        m = re.search(r'(\d+(?:\.\d+)?)\s*%', text)
+        if m:
+            val = float(m.group(1))
+
+            if val >= 1.0:
+                return f"{m.group(1)}%", "of total"
+
+        m = re.search(r'(\d+(?:\.\d+)?)\s*[×xX]\b', text)
+        if m:
+            return f"{m.group(1)}×", "increase"
+
+        m = re.search(r'\$\s*(\d+(?:[.,]\d+)*(?:\.\d+)?)\s*([KMBkmb]?)', text)
+        if m:
+            suffix = m.group(2).upper()
+            return f"${m.group(1)}{suffix}", "impact"
+
+        m = re.search(r'\b(\d{1,3}(?:,\d{3})+)\b', text)
+        if m:
+            return m.group(1), "records"
+        return None, None
 
     ex = synthesis.get("executive_summary", {})
-    if not isinstance(ex, dict):
-        ex = {}
-    ex_h = ""
-    if ex:
-        health = ex.get("overall_health", "")
-        priorities = ex.get("top_priorities", [])
-        impact = ex.get("business_impact", "")
-        resource = ex.get("resource_allocation", "")
-        timeline = ex.get("timeline", "")
-        
-        ex_h += f'<div class="insight-block"><strong>Overall Health:</strong> <p>{health}</p></div>' if health else ""
-        if priorities:
-            bullets_html = "".join([f'<li class="bullet">{p}</li>' for p in priorities])
-            ex_h += f'<div class="insight-block"><strong>Top Priorities:</strong><ul class="bullets">{bullets_html}</ul></div>'
-        ex_h += f'<div class="insight-block"><strong>Business Impact:</strong> <p>{impact}</p></div>' if impact else ""
-        ex_h += f'<div class="insight-block"><strong>Resource Allocation:</strong> <p>{resource}</p></div>' if resource else ""
-        ex_h += f'<div class="insight-block"><strong>Timeline:</strong> <p>{timeline}</p></div>' if timeline else ""
+    if not isinstance(ex, dict): ex = {}
+    health        = ex.get("overall_health", "")
+    priorities    = ex.get("top_priorities", []) if ex else []
+    biz_impact    = ex.get("business_impact", "")
+    resource      = ex.get("resource_allocation", "")
+    ex_timeline   = ex.get("timeline", "")
 
     di = synthesis.get("detailed_insights", {})
-    # LLM sometimes returns detailed_insights as a flat list instead of {"insights": [...]}
-    if isinstance(di, list):
-        insights_list = di
-    elif isinstance(di, dict):
-        insights_list = di.get("insights", [])
-    else:
-        insights_list = []
-    di_chunks = []
-    for ins in insights_list:
-        i_title = ins.get("title", "Insight")
-        sev = ins.get("fix_priority", "Medium").lower()
-        if sev not in ["critical", "high", "medium", "low"]: sev = "info"
-        ai_sum = ins.get("ai_summary", "")
-        rc = ins.get("root_cause_hypothesis", "")
-        ux = ins.get("ux_implications", "")
-        
-        causes = ins.get("possible_causes", [])
-        causes_html = "".join([f'<li>{c}</li>' for c in causes])
-        
-        downstream = ins.get("downstream_implications", "")
-        sols = ins.get("how_to_fix", ins.get("recommended_solutions", []))
-        sols_html = "".join([f'<li>{s}</li>' for s in sols])
+    insights_raw = di if isinstance(di, list) else (di.get("insights", []) if isinstance(di, dict) else [])
+    insights_raw = [i for i in insights_raw if isinstance(i, dict)]
+    _pri_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+    insights_sorted = sorted(insights_raw, key=lambda x: _pri_order.get(norm_sev(x.get("fix_priority")), 2))
 
-        di_chunks.append(
-            f'<div class="strategy-card {sev}">'
-            f'<div class="strat-header"><span class="badge {sev}">{sev.upper()}</span> {i_title}</div>'
-            f'<div class="strat-body">'
-            f'<p><b>AI Summary:</b> {ai_sum}</p>'
-            f'<p><b>Root Cause Hypothesis:</b> {rc}</p>'
-            f'<p><b>Possible Causes:</b></p><ul style="margin-top:4px;">{causes_html}</ul>'
-            f'<p><b>UX Implications:</b> {ux}</p>'
-            + (f'<p><b>Downstream Impact:</b> {downstream}</p>' if downstream else '') +
-            f'<p><b>How to Fix:</b></p><ul style="margin-top:4px;">{sols_html}</ul>'
-            f'</div></div>'
-        )
-    di_h = "".join(di_chunks)
-
-    # --- #8: Adversarial Critic Review section ---
-    _crit_rev = synthesis.get("_critic_review", {})
-    _critic_h = ""
+    _crit_rev     = synthesis.get("_critic_review", {})
+    _cr_approved  = True
+    _cr_conf      = 1.0
+    _cr_verdict   = ""
+    _cr_challenges = []
     if isinstance(_crit_rev, dict) and _crit_rev:
-        _cr_approved = _crit_rev.get("approved", True)
+        _cr_approved   = _crit_rev.get("approved", True)
+        _cr_conf       = float(_crit_rev.get("confidence_adjustment", 1.0))
+        _cr_verdict    = _crit_rev.get("overall_verdict", "")
         _cr_challenges = _crit_rev.get("challenges", [])
-        _cr_conf = _crit_rev.get("confidence_adjustment", 1.0)
-        _cr_verdict = _crit_rev.get("overall_verdict", "")
-        _verdict_label = "&#10003; Approved" if _cr_approved else "&#9888; Issues Found"
-        _verdict_class = "low" if _cr_approved else "high"
-        _chal_html = ""
-        for _ch in _cr_challenges:
-            if not isinstance(_ch, dict):
-                continue
-            _ch_sev = _ch.get("severity", "medium").lower()
-            if _ch_sev not in ("critical", "high", "medium", "low"):
-                _ch_sev = "medium"
-            _chal_html += (
-                f'<div class="strategy-card {_ch_sev}" style="margin-bottom:10px;">'
-                f'<div class="strat-header">'
-                f'<span class="badge {_ch_sev}">{_ch_sev.upper()}</span>'
-                f'&nbsp;{_ch.get("claim", "")}'
-                f'</div>'
-                f'<div class="strat-body">{_ch.get("issue", "")}</div>'
-                f'</div>'
-            )
-        if not _cr_challenges:
-            _chal_html = '<p style="color:#27ae60;margin:0;">No significant issues found — synthesis is well-grounded.</p>'
-        _critic_h = (
-            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">'
-            f'<span class="badge {_verdict_class}" style="font-size:13px;padding:5px 12px;">{_verdict_label}</span>'
-            f'<span style="font-size:12px;color:#666;">Confidence: {int(_cr_conf * 100)}%</span>'
-            f'</div>'
-            + (f'<p style="font-size:13px;color:#555;margin-bottom:14px;">{_cr_verdict}</p>' if _cr_verdict else "")
-            + _chal_html
-        )
-        # Reliability badge injected into the report header
-        _conf_pct = int(_cr_conf * 100)
-        if _conf_pct >= 90:
-            _badge_color = "#27ae60"
-        elif _conf_pct >= 70:
-            _badge_color = "#e67e22"
-        else:
-            _badge_color = "#c0392b"
-        _reliability_badge = (
-            f'<span style="display:inline-block;margin-top:8px;padding:3px 10px;'
-            f'border-radius:12px;background:{_badge_color};color:#fff;'
-            f'font-size:11px;font-family:system-ui,sans-serif;font-weight:600;letter-spacing:0.3px;">'
-            f'Peer Review: {_conf_pct}% reliable</span>'
-        )
+
+    _node_confs = [float(c.get("confidence", 0) or 0) for c in charts if float(c.get("confidence", 0) or 0) > 0.05]
+    if _node_confs:
+        _avg_node_conf = sum(_node_confs) / len(_node_confs)
+        _conf_pct = int(min(99, (_avg_node_conf * 0.70 + _cr_conf * 0.30) * 100))
     else:
-        _reliability_badge = ""
+        _conf_pct = int(_cr_conf * 100)
 
     st = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
-    if isinstance(st, list):
-        strategies_list = st
-    elif isinstance(st, dict):
-        strategies_list = st.get("strategies", [])
-    else:
-        strategies_list = []
-    st_chunks = []
-    for s in strategies_list:
-        sev = s.get("severity", "info").lower()
-        if sev not in ["critical", "high", "medium", "low"]: sev = "info"
-        ttl = s.get("title", "Strategy")
-        rt = s.get("realtime_interventions", [])
-        pro = s.get("proactive_outreach", [])
-        
-        rt_html = "".join([f'<li>{x}</li>' for x in rt])
-        pro_html = "".join([f'<li>{x}</li>' for x in pro])
-        
-        st_chunks.append(
-            f'<div class="strategy-card {sev}">'
-            f'<div class="strat-header"><span class="badge {sev}">{sev.upper()}</span> {ttl}</div>'
-            f'<div class="strat-body" style="display:flex; gap:20px;">'
-            f'<div style="flex:1"><p style="margin-bottom:4px"><b>Real-Time Interventions:</b></p><ul style="margin-top:0;">{rt_html}</ul></div>'
-            f'<div style="flex:1"><p style="margin-bottom:4px"><b>Proactive Outreach:</b></p><ul style="margin-top:0;">{pro_html}</ul></div>'
-            f'</div></div>'
-        )
-    st_h = "".join(st_chunks)
+    strategies_list = st if isinstance(st, list) else (st.get("strategies", []) if isinstance(st, dict) else [])
 
     pe = synthesis.get("key_segments", synthesis.get("personas", {}))
-    if isinstance(pe, list):
-        personas_list = pe
-    elif isinstance(pe, dict):
-        personas_list = pe.get("segments", pe.get("personas", []))
-    else:
-        personas_list = []
-    pe_chunks = []
-    for p in personas_list:
-        p_name = p.get("name", "User Segment")
-        p_prof = p.get("profile", "")
-        p_prior = p.get("priority_level", "Medium")
-        p_prior_css = p_prior.lower() if p_prior.lower() in ["critical", "high", "medium", "low"] else "info"
-        p_pain = p.get("pain_points", [])
-        p_opp = p.get("opportunities", [])
-        
-        pain_html = "".join([f'<li>{x}</li>' for x in p_pain])
-        opp_html = "".join([f'<li>{x}</li>' for x in p_opp])
-        
-        pe_chunks.append(
-            f'<div class="persona-card">'
-            f'<div class="persona-name" style="font-weight:bold; font-size:16px; margin-bottom:8px;">{p_name} <span class="badge {p_prior_css}" style="float:right">{p_prior.upper()}</span></div>'
-            f'<div class="persona-size" style="font-style:italic; margin-bottom:12px; color:#555;">{p_prof}</div>'
-            f'<div class="persona-desc">'
-            f'<p style="margin-bottom:4px; font-weight:600;">Pain Points:</p><ul style="margin-top:0; padding-left:20px;">{pain_html}</ul>'
-            f'<p style="margin-bottom:4px; font-weight:600;">Opportunities:</p><ul style="margin-top:0; padding-left:20px;">{opp_html}</ul>'
-            f'</div></div>'
-        )
-    pe_h = f'<div class="persona-grid">{"".join(pe_chunks)}</div>' if pe_chunks else ""
+    personas_list = pe if isinstance(pe, list) else (pe.get("segments", pe.get("personas", [])) if isinstance(pe, dict) else [])
 
-    # Pre-index synthesis insight cards by analysis_id so each chart can
-    # pull its matching insight for the detailed description below the chart.
+    cx = synthesis.get("cross_metric_connections", {})
+    connections_list = cx if isinstance(cx, list) else (cx.get("connections", []) if isinstance(cx, dict) else [])
+
+    conv_rep = synthesis.get("conversational_report", "")
+    if conv_rep:
+        try:
+            import markdown as _md
+            conv_h = _md.markdown(conv_rep, extensions=["tables", "fenced_code"])
+        except Exception:
+            conv_h = f'<pre style="white-space:pre-wrap;font-size:13px;line-height:1.65;">{conv_rep}</pre>'
+    else:
+        conv_h = ""
+
     _insight_index = {}
-    _di_raw = synthesis.get("detailed_insights", {})
-    _all_insights = _di_raw if isinstance(_di_raw, list) else (_di_raw.get("insights", []) if isinstance(_di_raw, dict) else [])
-    for _ins in _all_insights:
-        if not isinstance(_ins, dict):
-            continue
-        # Scan ai_summary and root_cause_hypothesis for [AX] / [CX] node citations
+    for _ins in insights_raw:
         _text = str(_ins.get("ai_summary", "")) + str(_ins.get("root_cause_hypothesis", "")) + str(_ins.get("title", ""))
         for _m in re.findall(r'\[([AC]\d+)\]', _text):
             if _m not in _insight_index:
                 _insight_index[_m] = _ins
 
-    ch_chunks = []
-    for c in charts:
-        a_id   = c.get("analysis_id", "")
-        a_type = c.get("analysis_type", "").replace("_", " ").title()
-        sev    = c.get("severity", "info")
-        html_content = c.get("_embedded_html", "")
-        narrative = c.get("narrative", {}) if isinstance(c.get("narrative"), dict) else {}
-        top_finding = c.get("top_finding", "")
-        dm_takeaway = c.get("decision_maker_takeaway", "")
-        confidence  = c.get("confidence", 0.0)
-        conf_pct    = f"{round(confidence * 100)}%" if confidence else ""
+    total_nodes    = len(charts)
+    critical_count = sum(1 for i in insights_sorted if norm_sev(i.get("fix_priority")) == "critical")
+    high_count     = sum(1 for i in insights_sorted if norm_sev(i.get("fix_priority")) == "high")
+    total_insights = len(insights_sorted)
+    crit_col = "#059669" if _conf_pct >= 90 else "#D97706" if _conf_pct >= 70 else "#DC2626"
+    crit_bg2 = "#ECFDF5" if _conf_pct >= 90 else "#FFFBEB" if _conf_pct >= 70 else "#FEF2F2"
 
-        safe_html = (
-            html_content
-            .replace("&", "&amp;")
-            .replace('"', "&quot;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+    def stat_card(value, label, color, bg):
+        return (f'<div style="flex:1;min-width:130px;background:{bg};border:1px solid {color}22;'
+                f'border-top:3px solid {color};border-radius:8px;padding:16px 18px;text-align:center;">'
+                f'<div style="font-size:28px;font-weight:800;color:{color};line-height:1;margin-bottom:4px;">{value}</div>'
+                f'<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:#6B7280;">{label}</div>'
+                f'</div>')
+
+    kpi_row = (
+        stat_card(total_nodes, "Analyses Run", "#4F46E5", "#EEF2FF") +
+        stat_card(total_insights, "Findings", "#0F766E", "#F0FDFA") +
+        (stat_card(critical_count, "Critical", "#DC2626", "#FEF2F2") if critical_count else "") +
+        (stat_card(high_count, "High Priority", "#D97706", "#FFFBEB") if high_count else "") +
+        stat_card(f"{_conf_pct}%", "Reliability", crit_col, crit_bg2)
+    )
+
+    _hero = next((i for i in insights_sorted if norm_sev(i.get("fix_priority")) in ("critical", "high")),
+                 insights_sorted[0] if insights_sorted else None)
+    if _hero:
+        hero_title   = _hero.get("title", "")
+        hero_summary = _hero.get("ai_summary", "")
+        hero_sev     = norm_sev(_hero.get("fix_priority"))
+        hero_col     = sc(hero_sev)
+    else:
+        hero_title   = ""
+        hero_summary = health
+        hero_sev     = "medium"
+        hero_col     = "#2563EB"
+
+    _sev_bar_parts = []
+    for _s in ["critical", "high", "medium", "low"]:
+        _cnt = sum(1 for i in insights_sorted if norm_sev(i.get("fix_priority")) == _s)
+        if _cnt:
+            _sev_bar_parts.append(
+                f'<span style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;'
+                f'font-weight:600;color:{sc(_s)};">'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:{sc(_s)};'
+                f'display:inline-block;flex-shrink:0;"></span>{_cnt} {sl(_s)}</span>'
+            )
+    sev_bar = (
+        f'<div style="display:flex;gap:24px;flex-wrap:wrap;padding:14px 0;'
+        f'margin-bottom:20px;border-bottom:1px solid #F3F4F6;">'
+        + "".join(_sev_bar_parts) + "</div>"
+    ) if _sev_bar_parts else ""
+
+    priority_cards = ""
+    _sev_prog = ["critical", "high", "medium"]
+    for i, p in enumerate(priorities[:3]):
+        s = _sev_prog[min(i, 2)]
+        priority_cards += (
+            f'<div style="flex:1;min-width:220px;border:1px solid {sc(s)}22;border-left:3px solid {sc(s)};'
+            f'border-radius:8px;padding:14px 16px;background:{sb(s)};">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:{sc(s)};margin-bottom:6px;">Priority {i+1}</div>'
+            f'<div style="font-size:13.5px;font-weight:600;color:#111827;line-height:1.45;">{p}</div>'
+            f'</div>'
         )
 
-        # --- Pre-chart: decision-maker takeaway (from #10) ---
-        pre_chart = ""
-        if dm_takeaway:
-            pre_chart = (
-                f'<div class="dm-takeaway">'
-                f'<span style="font-size:18px;">&#128161;</span>'
-                f'<strong> Decision-Maker Insight</strong>'
-                f'<p style="margin:6px 0 0 0;">{dm_takeaway}</p>'
-                f'</div>'
-            )
-        elif top_finding:
-            pre_chart = (
-                f'<div class="dm-takeaway">'
-                f'<span style="font-size:18px;">&#128269;</span>'
-                f'<strong> Key Finding</strong>'
-                f'<p style="margin:6px 0 0 0;">{top_finding}</p>'
+    exec_left = ""
+    if health:
+        exec_left += (f'<p style="font-size:14px;color:#374151;line-height:1.8;margin:0 0 18px 0;">{health}</p>')
+    if biz_impact:
+        exec_left += (
+            f'<div style="background:#FFFBEB;border-left:3px solid #F59E0B;padding:14px 16px;'
+            f'border-radius:0 8px 8px 0;margin-bottom:18px;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:#B45309;margin-bottom:5px;">Business Impact</div>'
+            f'<p style="font-size:13.5px;color:#78350F;margin:0;line-height:1.65;">{biz_impact}</p>'
+            f'</div>'
+        )
+    if resource:
+        exec_left += (f'<p style="font-size:13.5px;color:#4B5563;line-height:1.7;margin:0;">'
+                      f'<strong style="color:#111827;">Resource Focus:</strong> {resource}</p>')
+
+    exec_right = ""
+    if ex_timeline:
+        exec_right += (
+            f'<div style="background:#F8F9FB;border:1px solid #E5E7EB;border-radius:8px;padding:16px;margin-bottom:16px;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:#6B7280;margin-bottom:10px;">Action Timeline</div>'
+            f'<p style="font-size:13px;color:#374151;line-height:1.65;margin:0;">{ex_timeline}</p>'
+            f'</div>'
+        )
+
+    exec_body = ""
+    if exec_left or exec_right:
+        exec_body = (
+            f'<div style="display:flex;gap:32px;flex-wrap:wrap;">'
+            f'<div style="flex:2;min-width:260px;">{exec_left}</div>'
+            f'<div style="flex:1;min-width:200px;">{exec_right}</div>'
+            f'</div>'
+        )
+    if priority_cards:
+        exec_body += (
+            f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:20px;padding-top:20px;'
+            f'border-top:1px solid #F3F4F6;">{priority_cards}</div>'
+        )
+
+    insight_cards = ""
+    for idx, ins in enumerate(insights_sorted):
+        sev = norm_sev(ins.get("fix_priority"))
+        col = sc(sev); bg = sb(sev)
+        i_title   = ins.get("title", "Insight")
+        ai_sum    = ins.get("ai_summary", "")
+        rc        = ins.get("root_cause_hypothesis", "")
+        causes    = ins.get("possible_causes", [])
+        ds_impl   = ins.get("downstream_implications", "")
+        ux        = ins.get("ux_implications", "")
+        fixes     = ins.get("how_to_fix", ins.get("recommended_solutions", []))
+        impact    = float(ins.get("impact_score", 0) or 0)
+        t_bucket  = ins.get("timeline_bucket", "")
+        impact_pct = int((impact / 10) * 100)
+
+        deep_rows = (
+            detail_row("Root Cause", rc) +
+            detail_row("Possible Causes", li_list(causes)) +
+            detail_row("Downstream Impact", ds_impl) +
+            detail_row("UX Implications", ux)
+        )
+
+        impact_bar = ""
+        if impact:
+            impact_bar = (
+                f'<div style="display:flex;align-items:center;gap:10px;margin-top:10px;">'
+                f'<span style="font-size:11px;color:#9CA3AF;white-space:nowrap;">Impact {impact:.1f}/10</span>'
+                f'<div style="flex:1;height:4px;background:#F3F4F6;border-radius:9999px;">'
+                f'<div style="height:4px;width:{impact_pct}%;background:{col};border-radius:9999px;"></div></div>'
                 f'</div>'
             )
 
-        # --- Post-chart: narrative (what it means + proposed fix) ---
+        bucket_tag = ""
+        if t_bucket:
+            bucket_tag = (f'<span style="font-size:10px;color:#9CA3AF;background:#F3F4F6;'
+                          f'padding:2px 8px;border-radius:9999px;margin-left:6px;">{t_bucket}</span>')
+
+        fixes_html = li_list(fixes, ordered=True)
+
+        _stat_num, _stat_unit = _extract_hero_stat(ai_sum or i_title)
+        stat_callout = ""
+        if _stat_num and sev in ("critical", "high", "medium"):
+            stat_callout = (
+                f'<div style="float:right;margin-left:20px;margin-bottom:4px;'
+                f'text-align:center;padding:10px 14px;background:{sb(sev)};'
+                f'border-radius:10px;border:1px solid {col}33;flex-shrink:0;">'
+                f'<div style="font-size:26px;font-weight:800;color:{col};'
+                f'line-height:1;letter-spacing:-0.02em;">{_stat_num}</div>'
+                f'<div style="font-size:9px;font-weight:600;color:{col}AA;'
+                f'text-transform:uppercase;letter-spacing:0.06em;margin-top:3px;">'
+                f'{_stat_unit}</div>'
+                f'</div>'
+            )
+
+        _open_attr = "open" if sev in ("critical", "high") and idx < 3 else ""
+
+        insight_cards += (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'margin-bottom:14px;background:#fff;border-left:4px solid {col};">'
+            f'<details {_open_attr} style="margin:0;">'
+
+            f'<summary style="list-style:none;cursor:pointer;padding:18px 20px;'
+            f'display:flex;align-items:flex-start;gap:14px;'
+            f'transition:background 0.15s;" '
+            f'onmouseover="this.style.background=\'#FAFAFA\'" '
+            f'onmouseout="this.style.background=\'transparent\'">'
+            f'<div style="flex-shrink:0;width:26px;height:26px;border-radius:50%;background:{bg};'
+            f'display:flex;align-items:center;justify-content:center;font-size:11px;'
+            f'font-weight:700;color:{col};margin-top:1px;">{idx+1}</div>'
+            f'<div style="flex:1;min-width:0;">'
+            f'<div style="display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px;">'
+            f'{badge(sev)}{bucket_tag}'
+            f'<span style="font-size:10px;color:#9CA3AF;margin-left:auto;padding-right:4px;">▼ details</span>'
+            f'</div>'
+            f'{stat_callout}'
+            f'<div style="font-size:15px;font-weight:700;color:#111827;margin-bottom:8px;line-height:1.35;">{i_title}</div>'
+            f'<p style="font-size:13.5px;color:#4B5563;line-height:1.75;margin:0;">{ai_sum}</p>'
+            f'<div style="clear:both"></div>'
+            f'{impact_bar}'
+            f'</div></summary>'
+
+            + (f'<div style="border-top:1px solid #F3F4F6;padding:4px 20px 4px 60px;background:#FAFAFA;">{deep_rows}</div>' if deep_rows else "")
+            + (f'<div style="border-top:1px solid #F3F4F6;padding:16px 20px;">'
+               f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+               f'color:#6B7280;margin-bottom:8px;">Action Steps</div>'
+               f'<div style="font-size:13.5px;color:#374151;line-height:1.7;">{fixes_html}</div>'
+               f'</div>' if fixes_html else "")
+            + f'</details></div>'
+        )
+
+    _buckets_def = [
+        ("Quick Win",  "1–2 weeks", "#059669", "#ECFDF5"),
+        ("Medium Fix", "1 month",   "#D97706", "#FFFBEB"),
+        ("Strategic",  "3+ months", "#6366F1", "#EEF2FF"),
+    ]
+    _bucket_rows_map = {b[0]: [] for b in _buckets_def}
+    for ins in insights_sorted:
+        tb = ins.get("timeline_bucket", "")
+        bucket_key = "Strategic"
+        for bname, _, _, _ in _buckets_def:
+            if bname.lower() in tb.lower():
+                bucket_key = bname
+                break
+        else:
+            sev = norm_sev(ins.get("fix_priority"))
+            bucket_key = "Quick Win" if sev in ("critical", "high") else ("Medium Fix" if sev == "medium" else "Strategic")
+        fixes = ins.get("how_to_fix", ins.get("recommended_solutions", []))
+        _bucket_rows_map[bucket_key].append({
+            "title": ins.get("title", ""),
+            "fix":   fixes[0] if fixes else "—",
+            "sev":   norm_sev(ins.get("fix_priority")),
+            "score": float(ins.get("impact_score", 0) or 0),
+        })
+
+    action_plan_html = ""
+    for bname, bsub, bcol, bbg in _buckets_def:
+        rows = _bucket_rows_map.get(bname, [])
+        if not rows: continue
+        rows_html = ""
+        for r in rows:
+            rows_html += (
+                f'<tr style="border-bottom:1px solid #F3F4F6;">'
+                f'<td style="padding:10px 14px;vertical-align:top;">{badge(r["sev"])}</td>'
+                f'<td style="padding:10px 14px;font-weight:600;color:#111827;font-size:13.5px;vertical-align:top;">{r["title"]}</td>'
+                f'<td style="padding:10px 14px;color:#4B5563;font-size:13px;vertical-align:top;">{r["fix"]}</td>'
+                f'<td style="padding:10px 14px;text-align:center;vertical-align:top;">'
+                f'<span style="font-size:13px;font-weight:700;color:{sc(r["sev"])};">{r["score"]:.1f}</span></td>'
+                f'</tr>'
+            )
+        action_plan_html += (
+            f'<div style="margin-bottom:24px;">'
+            f'<div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px;">'
+            f'<span style="font-size:13px;font-weight:700;color:{bcol};">{bname}</span>'
+            f'<span style="font-size:11px;color:#9CA3AF;">{bsub}</span>'
+            f'</div>'
+            f'<div style="border:1px solid #E5E7EB;border-radius:8px;overflow:hidden;">'
+            f'<table style="width:100%;border-collapse:collapse;font-size:13.5px;">'
+            f'<thead><tr style="background:{bbg};">'
+            f'<th style="padding:8px 14px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{bcol};border-bottom:2px solid {bcol}33;white-space:nowrap;">Priority</th>'
+            f'<th style="padding:8px 14px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{bcol};border-bottom:2px solid {bcol}33;">Finding</th>'
+            f'<th style="padding:8px 14px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{bcol};border-bottom:2px solid {bcol}33;">First Action</th>'
+            f'<th style="padding:8px 14px;text-align:center;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:{bcol};border-bottom:2px solid {bcol}33;white-space:nowrap;">Impact</th>'
+            f'</tr></thead>'
+            f'<tbody>{rows_html}</tbody>'
+            f'</table></div></div>'
+        )
+
+    segments_html = ""
+    for p in personas_list:
+        p_name  = p.get("name", "User Segment")
+        p_prof  = p.get("profile", "")
+        p_prior = norm_sev(p.get("priority_level"), "medium")
+        p_col   = sc(p_prior); p_bg = sb(p_prior)
+        pain_html = li_list(p.get("pain_points", []))
+        opp_html  = li_list(p.get("opportunities", []))
+        segments_html += (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'background:#fff;border-top:3px solid {p_col};">'
+            f'<div style="padding:14px 18px;background:#FAFAFA;border-bottom:1px solid #F3F4F6;'
+            f'display:flex;align-items:center;justify-content:space-between;">'
+            f'<div style="font-size:15px;font-weight:700;color:#111827;">{p_name}</div>'
+            f'{badge(p_prior)}</div>'
+            + (f'<div style="padding:10px 18px;font-size:13px;color:#6B7280;font-style:italic;'
+               f'border-bottom:1px solid #F3F4F6;">{p_prof}</div>' if p_prof else "")
+            + f'<div style="padding:16px 18px;display:flex;gap:24px;flex-wrap:wrap;">'
+            f'<div style="flex:1;min-width:160px;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:#DC2626;margin-bottom:8px;">Pain Points</div>'
+            f'<div style="font-size:13px;color:#374151;line-height:1.65;">{pain_html}</div></div>'
+            f'<div style="flex:1;min-width:160px;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+            f'color:#059669;margin-bottom:8px;">Opportunities</div>'
+            f'<div style="font-size:13px;color:#374151;line-height:1.65;">{opp_html}</div></div>'
+            f'</div></div>'
+        )
+    segments_grid = (f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));'
+                     f'gap:16px;">{segments_html}</div>') if segments_html else ""
+
+    connections_html = ""
+    for conn in connections_list:
+        fa      = conn.get("finding_a", "")
+        fb      = conn.get("finding_b", "")
+        meaning = conn.get("synthesized_meaning", "")
+        connections_html += (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'background:#fff;margin-bottom:12px;">'
+            f'<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;'
+            f'background:#FAFAFA;border-bottom:1px solid #F3F4F6;flex-wrap:wrap;">'
+            f'<span style="font-size:12px;font-weight:600;color:#4F46E5;background:#EEF2FF;'
+            f'padding:4px 10px;border-radius:6px;">{fa}</span>'
+            f'<span style="font-size:18px;color:#9CA3AF;line-height:1;">&#8594;</span>'
+            f'<span style="font-size:12px;font-weight:600;color:#4F46E5;background:#EEF2FF;'
+            f'padding:4px 10px;border-radius:6px;">{fb}</span>'
+            f'</div>'
+            + (f'<div style="padding:12px 18px;font-size:13.5px;color:#374151;line-height:1.65;">{meaning}</div>'
+               if meaning else "")
+            + f'</div>'
+        )
+
+    recommendations_html = ""
+    for s in strategies_list:
+        sev = norm_sev(s.get("severity"))
+        col = sc(sev); bg = sb(sev)
+        ttl = s.get("title", "Strategy")
+        rt  = s.get("realtime_interventions", [])
+        pro = s.get("proactive_outreach", [])
+        recommendations_html += (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'background:#fff;margin-bottom:16px;border-left:4px solid {col};">'
+            f'<div style="display:flex;align-items:center;gap:10px;padding:14px 18px;'
+            f'background:#FAFAFA;border-bottom:1px solid #F3F4F6;">'
+            f'{badge(sev)}'
+            f'<span style="font-size:14.5px;font-weight:700;color:#111827;">{ttl}</span>'
+            f'</div>'
+            f'<div style="display:flex;gap:0;flex-wrap:wrap;">'
+            + (f'<div style="flex:1;min-width:220px;padding:16px 18px;border-right:1px solid #F3F4F6;">'
+               f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+               f'color:#6B7280;margin-bottom:8px;">Real-Time Interventions</div>'
+               f'<div style="font-size:13px;color:#374151;line-height:1.65;">{li_list(rt)}</div>'
+               f'</div>' if rt else "")
+            + (f'<div style="flex:1;min-width:220px;padding:16px 18px;">'
+               f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+               f'color:#6B7280;margin-bottom:8px;">Proactive Outreach</div>'
+               f'<div style="font-size:13px;color:#374151;line-height:1.65;">{li_list(pro)}</div>'
+               f'</div>' if pro else "")
+            + f'</div></div>'
+        )
+
+    charts_html = ""
+    for fig_num, c in enumerate(charts, 1):
+        a_id        = c.get("analysis_id", "")
+        a_type      = c.get("analysis_type", "").replace("_", " ").title()
+        sev         = norm_sev(c.get("severity"), "info")
+        col         = sc(sev); bg = sb(sev)
+        html_content = c.get("_embedded_html", "")
+        narrative   = c.get("narrative", {}) if isinstance(c.get("narrative"), dict) else {}
+        top_finding = c.get("top_finding", "")
+        dm_takeaway = c.get("decision_maker_takeaway", "")
+        confidence  = float(c.get("confidence", 0) or 0)
+        conf_pct    = int(round(confidence * 100))
+
+        safe_html = (html_content
+                     .replace("&", "&amp;").replace('"', "&quot;")
+                     .replace("<", "&lt;").replace(">", "&gt;"))
+
+        conf_bar = ""
+        if conf_pct:
+            cc = "#059669" if conf_pct >= 80 else "#D97706" if conf_pct >= 60 else "#DC2626"
+            conf_bar = (
+                f'<div style="display:flex;align-items:center;gap:10px;padding:8px 20px;'
+                f'background:#FAFAFA;border-bottom:1px solid #F3F4F6;">'
+                f'<span style="font-size:11px;color:#9CA3AF;white-space:nowrap;">Confidence</span>'
+                f'<div style="flex:1;height:3px;background:#F3F4F6;border-radius:9999px;">'
+                f'<div style="height:3px;width:{conf_pct}%;background:{cc};border-radius:9999px;"></div></div>'
+                f'<span style="font-size:11px;color:{cc};font-weight:600;">{conf_pct}%</span>'
+                + (f'<span style="font-size:10px;color:#D97706;margin-left:4px;">directional</span>' if conf_pct < 75 else "")
+                + f'</div>'
+            )
+
+        takeaway = dm_takeaway or top_finding
+        takeaway_html = ""
+        if takeaway:
+            _t_num, _t_unit = _extract_hero_stat(takeaway)
+            _t_stat = ""
+            if _t_num:
+                _t_stat = (
+                    f'<div style="float:right;margin-left:16px;text-align:center;'
+                    f'padding:6px 12px;background:rgba(245,158,11,0.12);'
+                    f'border-radius:8px;border:1px solid rgba(245,158,11,0.3);">'
+                    f'<div style="font-size:22px;font-weight:800;color:#B45309;line-height:1;">{_t_num}</div>'
+                    f'<div style="font-size:9px;font-weight:600;color:#D97706;text-transform:uppercase;'
+                    f'letter-spacing:0.06em;margin-top:2px;">{_t_unit}</div>'
+                    f'</div>'
+                )
+            takeaway_html = (
+                f'<div style="padding:12px 20px;background:#FFFBEB;border-bottom:1px solid #F3F4F6;'
+                f'border-left:3px solid #F59E0B;">'
+                f'{_t_stat}'
+                f'<strong style="color:#92400E;font-size:10px;text-transform:uppercase;letter-spacing:0.06em;">Key Finding</strong>'
+                f'<p style="margin:4px 0 0 0;font-size:13.5px;color:#78350F;line-height:1.55;">{takeaway}</p>'
+                f'<div style="clear:both"></div>'
+                f'</div>'
+            )
+
         what_it_means = narrative.get("what_it_means", "")
         proposed_fix  = narrative.get("proposed_fix", "")
-        narr_severity = narrative.get("severity", sev)
-        if narr_severity not in ["critical", "high", "medium", "low", "info"]:
-            narr_severity = "info"
+        narr_html = ""
+        if what_it_means or proposed_fix:
+            narr_html = '<div style="display:flex;gap:0;flex-wrap:wrap;border-top:1px solid #F3F4F6;">'
+            if what_it_means:
+                narr_html += (
+                    f'<div style="flex:1;min-width:220px;padding:14px 18px;background:#EFF6FF;border-right:1px solid #DBEAFE;">'
+                    f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#1D4ED8;margin-bottom:6px;">What It Means</div>'
+                    f'<p style="margin:0;font-size:13px;color:#1E3A8A;line-height:1.65;">{what_it_means}</p></div>'
+                )
+            if proposed_fix:
+                narr_html += (
+                    f'<div style="flex:1;min-width:220px;padding:14px 18px;background:#FFF7ED;">'
+                    f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;color:#C2410C;margin-bottom:6px;">Proposed Fix</div>'
+                    f'<p style="margin:0;font-size:13px;color:#7C2D12;line-height:1.65;">{proposed_fix}</p></div>'
+                )
+            narr_html += '</div>'
 
-        narrative_html = ""
-        if what_it_means:
-            narrative_html += (
-                f'<div class="narrative-what">'
-                f'<span class="narrative-icon">&#128269;</span>'
-                f'<strong>WHAT IT MEANS</strong>'
-                f'<p>{what_it_means}</p>'
-                f'</div>'
-            )
-        if proposed_fix:
-            narrative_html += (
-                f'<div class="narrative-fix">'
-                f'<span class="narrative-icon">&#9889;</span>'
-                f'<strong>PROPOSED FIX</strong>'
-                f'<span class="badge {narr_severity}" style="float:right;margin-top:-2px">{narr_severity.upper()}</span>'
-                f'<p>{proposed_fix}</p>'
-                f'</div>'
-            )
-
-        # --- Matched synthesis insight card for this node ---
         matched_ins = _insight_index.get(a_id)
-        insight_detail_html = ""
+        deep_html = ""
         if matched_ins:
             _ai_sum  = matched_ins.get("ai_summary", "")
             _rc      = matched_ins.get("root_cause_hypothesis", "")
             _causes  = matched_ins.get("possible_causes", [])
             _ds_impl = matched_ins.get("downstream_implications", "")
             _fixes   = matched_ins.get("how_to_fix", matched_ins.get("recommended_solutions", []))
-            _pri     = matched_ins.get("fix_priority", "medium").lower()
-            if _pri not in ["critical","high","medium","low"]: _pri = "medium"
-            _causes_html = "".join(f"<li>{x}</li>" for x in _causes) if _causes else ""
-            _fixes_html  = "".join(f"<li>{x}</li>" for x in _fixes)  if _fixes  else ""
-            insight_detail_html = (
-                f'<div class="insight-deep-dive">'
-                f'<div class="idive-header"><span class="badge {_pri}">{_pri.upper()}</span>&nbsp;Deep Dive Analysis [{a_id}]</div>'
-                + (f'<div class="idive-row"><strong>&#129302; AI Analysis</strong><p>{_ai_sum}</p></div>' if _ai_sum else "")
-                + (f'<div class="idive-row"><strong>&#128279; Root Cause Chain</strong><p>{_rc}</p></div>' if _rc else "")
-                + (f'<div class="idive-row"><strong>&#128270; Possible Causes</strong><ul>{_causes_html}</ul></div>' if _causes_html else "")
-                + (f'<div class="idive-row"><strong>&#128200; Downstream Impact</strong><p>{_ds_impl}</p></div>' if _ds_impl else "")
-                + (f'<div class="idive-row"><strong>&#9989; How to Fix</strong><ul>{_fixes_html}</ul></div>' if _fixes_html else "")
-                + f'</div>'
+            _pri     = norm_sev(matched_ins.get("fix_priority"))
+            deep_rows = (
+                detail_row("AI Analysis", _ai_sum) +
+                detail_row("Root Cause", _rc) +
+                detail_row("Possible Causes", li_list(_causes)) +
+                detail_row("Downstream Impact", _ds_impl) +
+                detail_row("How to Fix", li_list(_fixes, ordered=True))
             )
+            if deep_rows:
+                deep_html = (
+                    f'<div style="border-top:1px solid #F3F4F6;padding:14px 20px;background:#FAFAFA;">'
+                    f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;'
+                    f'color:#6B7280;margin-bottom:8px;">Synthesis Deep Dive [{a_id}] {badge(_pri)}</div>'
+                    f'{deep_rows}</div>'
+                )
 
-        post_chart = ""
-        if narrative_html or insight_detail_html:
-            post_chart = f'<div class="narrative-block">{narrative_html}{insight_detail_html}</div>'
-
-        conf_badge = f'<span style="font-size:11px;color:#888;margin-left:8px;">confidence {conf_pct}</span>' if conf_pct else ""
-
-        ch_chunks.append(
-            f'<div class="chart-container">'
-            f'<div class="chart-header"><span>{a_type} [{a_id}]</span><span class="badge {sev}">{sev}</span>{conf_badge}</div>'
-            + pre_chart +
-            f'<iframe srcdoc="{safe_html}" width="100%" height="500" frameborder="0"></iframe>'
-            + post_chart +
+        charts_html += (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'background:#fff;margin-bottom:28px;">'
+            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+            f'padding:12px 20px;background:#FAFAFA;border-bottom:1px solid #F3F4F6;">'
+            f'<div>'
+            f'<span style="font-size:10px;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.06em;font-weight:600;">Figure {fig_num}</span>'
+            f'<span style="font-size:14.5px;font-weight:700;color:#111827;margin-left:10px;">{a_type}</span>'
+            f'<span style="font-size:11px;color:#9CA3AF;margin-left:6px;">[{a_id}]</span>'
+            f'</div>{badge(sev)}</div>'
+            f'{conf_bar}'
+            f'{takeaway_html}'
+            f'<iframe srcdoc="{safe_html}" width="100%" height="480" frameborder="0" style="display:block;"></iframe>'
+            f'{narr_html}'
+            f'{deep_html}'
             f'</div>'
         )
-    ch_h = "".join(ch_chunks)
 
-    conv_rep = synthesis.get("conversational_report", "")
+    _nav_items = []
+    _sec_num = [0]
+    def _next_num():
+        _sec_num[0] += 1
+        return _sec_num[0]
 
-    if conv_rep:
-        try:
-            import markdown
-            conv_h = markdown.markdown(conv_rep, extensions=['tables'])
-        except ImportError:
-            conv_h = f'<div style="white-space: pre-wrap; font-family: monospace; background: #f5f5f5; padding: 20px; border-radius: 8px;">{conv_rep}</div>'
-    else:
-        conv_h = ""
+    if exec_body:            _nav_items.append(("executive",       "Executive Summary"))
+    if conv_h:               _nav_items.append(("findings",        "Key Findings"))
+    if insight_cards:        _nav_items.append(("insights",        "Findings"))
+    if action_plan_html:     _nav_items.append(("action-plan",     "Action Plan"))
+    if segments_grid:        _nav_items.append(("segments",        "Segments"))
+    if connections_html:     _nav_items.append(("connections",     "Connections"))
+    if recommendations_html: _nav_items.append(("recommendations", "Recommendations"))
+    if charts_html:          _nav_items.append(("charts",          "Appendix: Charts"))
 
-    # Cross-metric connections (present in UI, previously missing from report)
-    cx = synthesis.get("cross_metric_connections", {})
-    if isinstance(cx, list):
-        connections_list = cx
-    elif isinstance(cx, dict):
-        connections_list = cx.get("connections", [])
-    else:
-        connections_list = []
-    cx_chunks = []
-    for conn in connections_list:
-        fa = conn.get("finding_a", "")
-        fb = conn.get("finding_b", "")
-        meaning = conn.get("synthesized_meaning", "")
-        cx_chunks.append(
-            f'<div class="strategy-card info">'
-            f'<div class="strat-header">&#128279; Cross-Metric Connection</div>'
-            f'<div class="strat-body">'
-            f'<p style="margin-bottom:6px;"><b>Finding A:</b> {fa}</p>'
-            f'<p style="margin-bottom:6px;"><b>Finding B:</b> {fb}</p>'
-            f'<p style="margin-bottom:0;"><b>Synthesised Meaning:</b> {meaning}</p>'
-            f'</div></div>'
+    nav_links = "".join(
+        f'<a href="#{a}" style="color:rgba(255,255,255,0.6);text-decoration:none;font-size:12px;'
+        f'font-weight:500;padding:4px 8px;border-radius:4px;white-space:nowrap;"'
+        f' onmouseover="this.style.background=\'rgba(255,255,255,0.12)\'"'
+        f' onmouseout="this.style.background=\'transparent\'">{lbl}</a>'
+        for a, lbl in _nav_items
+    )
+
+    toc_items_html = ""
+    for i, (a, lbl) in enumerate(_nav_items):
+        num_str = f"{i+1:02d}"
+        toc_items_html += (
+            f'<a href="#{a}" style="display:flex;align-items:center;gap:10px;padding:10px 12px;'
+            f'border:1px solid #F3F4F6;border-radius:8px;text-decoration:none;'
+            f'background:#FAFAFA;transition:background 0.15s;"'
+            f' onmouseover="this.style.background=\'#EEF2FF\'" '
+            f' onmouseout="this.style.background=\'#FAFAFA\'">'
+            f'<span style="font-size:12px;font-weight:800;color:#C7D2FE;width:24px;">{num_str}</span>'
+            f'<span style="font-size:13px;font-weight:600;color:#374151;">{lbl}</span>'
+            f'</a>'
         )
-    cx_h = "".join(cx_chunks)
+    toc_html = (
+        f'<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;'
+        f'padding:22px 24px;margin-bottom:36px;page-break-inside:avoid;">'
+        f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;'
+        f'color:#9CA3AF;margin-bottom:14px;">Contents</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;">'
+        f'{toc_items_html}</div></div>'
+    ) if toc_items_html else ""
 
-    # Section display names (IEEE-style labels, no "Part N" prefixes)
-    _sect_labels = {
-        "executive_summary":       "Executive Summary",
-        "key_findings":            "Key Findings",
-        "detailed_insights":       "Detailed Insights",
-        "adversarial_review":      "&#128269; Adversarial Review",
-        "key_segments":            "Key Segments",
-        "cross_metric_connections":"Cross-Metric Connections",
-        "recommendations":         "Recommendations",
-        "analysis_charts":         "Analysis Charts",
-    }
+    def section(anchor, label, body, divider=False):
+        if not body: return ""
+        num = _next_num()
+        num_str = f"{num:02d}"
+        div_style = "border-top:1px solid #F3F4F6;margin-top:36px;padding-top:36px;" if divider else ""
+        return (
+            f'<section id="{anchor}" style="{div_style}margin-bottom:40px;page-break-inside:avoid;">'
+            f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">'
+            f'<span style="font-size:12px;font-weight:800;color:#C7D2FE;">{num_str}</span>'
+            f'<h2 style="font-size:18px;font-weight:800;color:#0F1F3D;margin:0;letter-spacing:-0.3px;">{label}</h2>'
+            f'<div style="flex:1;height:1px;background:#E5E7EB;"></div>'
+            f'</div>'
+            f'{body}</section>'
+        )
 
-    def get_sect_labeled(key, content):
-        if not content:
-            return ""
-        label = _sect_labels.get(key, key.replace("_", " ").title())
-        return f'<section class="section {key}"><h2>{label}</h2>{content}</section>'
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title} — Analytics Report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #F0F2F5;
+    color: #111827;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }}
+  /* Nav */
+  .top-nav {{
+    position: sticky; top: 0; z-index: 100;
+    background: #0F1F3D;
+    padding: 0 32px;
+    display: flex; align-items: center; gap: 4px;
+    overflow-x: auto; white-space: nowrap;
+    height: 44px;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.08);
+  }}
+  .top-nav .brand {{
+    font-size: 12px; font-weight: 700; color: rgba(255,255,255,0.9);
+    letter-spacing: 0.04em; text-transform: uppercase; margin-right: 20px;
+    white-space: nowrap; flex-shrink: 0;
+  }}
+  /* Cover */
+  .cover {{
+    background: linear-gradient(135deg, #0F1F3D 0%, #1E3A6E 60%, #1a3a5c 100%);
+    color: white; padding: 48px 48px 36px 48px;
+  }}
+  .cover-eyebrow {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.12em; color: rgba(255,255,255,0.5); margin-bottom: 12px;
+  }}
+  .cover-title {{
+    font-size: 28px; font-weight: 800; color: #fff;
+    letter-spacing: -0.5px; line-height: 1.2; margin-bottom: 12px;
+    max-width: 700px;
+  }}
+  .cover-meta {{
+    font-size: 12.5px; color: rgba(255,255,255,0.5);
+    display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 28px;
+  }}
+  .cover-meta span {{ display: flex; align-items: center; gap: 5px; }}
+  .kpi-band {{
+    display: flex; gap: 12px; flex-wrap: wrap;
+    margin-top: 0; padding-top: 24px;
+    border-top: 1px solid rgba(255,255,255,0.12);
+  }}
+  /* Body container */
+  .body-wrap {{ max-width: 1100px; margin: 0 auto; padding: 40px 32px 80px 32px; }}
+  /* Prose — conversational report */
+  .prose h1 {{ font-size: 18px; font-weight: 700; color: #0F1F3D; margin: 24px 0 10px; }}
+  .prose h2 {{ font-size: 16px; font-weight: 700; color: #0F1F3D; margin: 20px 0 8px; }}
+  .prose h3 {{ font-size: 14px; font-weight: 600; color: #374151; margin: 16px 0 6px; }}
+  .prose p  {{ font-size: 14px; color: #374151; margin-bottom: 12px; line-height: 1.75; }}
+  .prose ul, .prose ol {{ font-size: 14px; color: #374151; padding-left: 22px; margin-bottom: 12px; }}
+  .prose li {{ margin-bottom: 5px; line-height: 1.65; }}
+  .prose strong {{ font-weight: 600; color: #111827; }}
+  .prose table {{ width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 13px; }}
+  .prose th {{ background: #F8F9FB; font-weight: 600; color: #374151; padding: 8px 12px;
+               border: 1px solid #E5E7EB; text-align: left; font-size: 11px;
+               text-transform: uppercase; letter-spacing: 0.04em; }}
+  .prose td {{ padding: 8px 12px; border: 1px solid #E5E7EB; color: #4B5563; vertical-align: top; }}
+  .prose tr:nth-child(even) td {{ background: #FAFAFA; }}
+  /* details/summary collapsible reset */
+  details > summary {{ list-style: none; }}
+  details > summary::-webkit-details-marker {{ display: none; }}
+  details[open] > summary .tog {{ transform: rotate(180deg); }}
+  /* Print */
+  @media print {{
+    .top-nav, .hero-band {{ display: none; }}
+    body {{ background: white; font-size: 12px; }}
+    .cover {{
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+      padding: 32px 40px 24px;
+    }}
+    section {{ page-break-inside: avoid; }}
+    details {{ open: true; }}
+    details > summary {{ pointer-events: none; }}
+    .body-wrap {{ padding: 24px 32px; }}
+  }}
+</style>
+</head>
+<body>
 
-    return f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>{title}</title>
-    <style>
-        body {{ font-family: "Georgia", "Times New Roman", serif; background: #f5f6fa; color: #222; line-height: 1.65; }}
-        .header {{ background: #1a2535; color: white; padding: 28px 32px; border-radius: 8px; margin-bottom: 28px; }}
-        .header h1 {{ margin: 0 0 8px 0; font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }}
-        .header p {{ margin: 0; opacity: 0.75; font-size: 13px; font-family: system-ui, sans-serif; }}
-        .section {{ background: white; padding: 28px 32px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }}
-        h2 {{ font-size: 17px; font-weight: 700; border-bottom: 2px solid #e8e8e8; padding-bottom: 10px; margin-top: 0; margin-bottom: 18px; color: #1a2535; letter-spacing: -0.2px; }}
-        .insight-block {{ background: #f8f9fa; border-left: 4px solid #3498db; padding: 12px 16px; margin-bottom: 12px; border-radius: 4px; }}
-        .insight-block p {{ margin: 5px 0 0 0; font-size: 14px; }}
-        .badge {{ padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; text-transform: uppercase; font-family: system-ui, sans-serif; }}
-        .critical {{ color: #721c24; background-color: #f8d7da; border: 1px solid #f5c6cb; }}
-        .high {{ color: #856404; background-color: #fff3cd; border: 1px solid #ffeeba; }}
-        .medium {{ color: #004085; background-color: #cce5ff; border: 1px solid #b8daff; }}
-        .low {{ color: #155724; background-color: #d4edda; border: 1px solid #c3e6cb; }}
-        .info {{ color: #383d41; background-color: #e2e3e5; border: 1px solid #d6d8db; }}
-        .strategy-card {{ border: 1px solid #e4e4e4; border-radius: 6px; margin-bottom: 16px; overflow: hidden; }}
-        .strat-header {{ padding: 12px 16px; font-weight: bold; background: #fafafa; border-bottom: 1px solid #e4e4e4; font-size: 14px; }}
-        .strat-body {{ padding: 16px; font-size: 14px; }}
-        .strat-body p {{ margin-bottom: 8px; }}
-        .strat-body ul {{ margin-top: 4px; padding-left: 20px; }}
-        .strat-body li {{ margin-bottom: 4px; }}
-        .persona-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }}
-        .persona-card {{ border: 1px solid #e4e4e4; border-radius: 6px; padding: 16px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); font-size: 14px; }}
-        /* Chart figures — numbered captions */
-        .chart-container {{ border: 1px solid #ddd; border-radius: 8px; margin-bottom: 28px; overflow: hidden; background: white; }}
-        .chart-header {{ background: #f8f9fa; padding: 10px 16px; font-weight: 600; border-bottom: 1px solid #ddd; display: flex; justify-content: space-between; align-items: center; font-size: 14px; font-family: system-ui, sans-serif; }}
-        .chart-fig-num {{ font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: .05em; font-weight: 400; margin-right: 8px; }}
-        /* Markdown table styles (IEEE-compatible) */
-        table {{ border-collapse: collapse; width: 100%; margin-bottom: 1.2rem; font-size: 13px; font-family: system-ui, sans-serif; }}
-        th {{ background: #f0f0f0; font-weight: 600; }}
-        th, td {{ padding: 8px 12px; vertical-align: top; border: 1px solid #ddd; text-align: left; }}
-        thead th {{ border-bottom: 2px solid #bbb; }}
-        tbody tr:nth-of-type(odd) {{ background-color: #fafafa; }}
-        /* Narrative blocks */
-        .narrative-block {{ margin-top: 0; border-top: 1px solid #eee; display: flex; gap: 0; }}
-        .narrative-what {{
-            flex: 1; padding: 14px 18px; background: #f0f4ff;
-            border-left: 4px solid #3498db;
-        }}
-        .narrative-fix {{
-            flex: 1; padding: 14px 18px; background: #fff9f0;
-            border-left: 4px solid #e67e22;
-        }}
-        .narrative-what strong, .narrative-fix strong {{
-            display: block; font-size: 11px; letter-spacing: .05em;
-            text-transform: uppercase; color: #666; margin-bottom: 6px; font-family: system-ui, sans-serif;
-        }}
-        .narrative-what p, .narrative-fix p {{ margin: 0; font-size: 13px; line-height: 1.55; }}
-        .narrative-icon {{ margin-right: 5px; }}
-        /* Key findings / conversational report prose */
-        .key_findings h1, .key_findings h2, .key_findings h3 {{ font-family: "Georgia", serif; }}
-        .key_findings p {{ font-size: 14px; margin-bottom: 12px; }}
-        .key_findings ul, .key_findings ol {{ font-size: 14px; padding-left: 22px; }}
-        .key_findings li {{ margin-bottom: 6px; }}
-        /* Decision-maker takeaway block (pre-chart highlight) */
-        .dm-takeaway {{ padding: 12px 18px; background: #fffde7; border-left: 4px solid #f9a825; margin: 0; font-family: system-ui, sans-serif; }}
-        .dm-takeaway p {{ margin: 6px 0 0 0; font-size: 14px; line-height: 1.5; }}
-        /* Deep-dive synthesis insight section (post-chart) */
-        .insight-deep-dive {{ border-top: 1px solid #e0e0e0; padding: 16px 18px; background: #fafafa; font-family: system-ui, sans-serif; }}
-        .idive-header {{ font-weight: 700; font-size: 13px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }}
-        .idive-row {{ margin-bottom: 10px; font-size: 13px; line-height: 1.55; }}
-        .idive-row strong {{ display: block; font-size: 11px; text-transform: uppercase; color: #666; margin-bottom: 4px; letter-spacing: 0.4px; }}
-        .idive-row p {{ margin: 0; }}
-        .idive-row ul {{ margin: 4px 0; padding-left: 20px; }}
-        .idive-row li {{ margin-bottom: 4px; }}
-    </style></head><body>
-    <div class="header">
-        <h1>{title}</h1>
-        <p>Dataset: {dataset_type}&nbsp;&nbsp;|&nbsp;&nbsp;Generated: {generated}&nbsp;&nbsp;|&nbsp;&nbsp;Session: {session_id}</p>
-        {_reliability_badge}
+<!-- Sticky nav -->
+<nav class="top-nav">
+  <div class="brand">Analytics</div>
+  {nav_links}
+</nav>
+
+<!-- Cover band -->
+<div class="cover">
+  <div style="max-width:1036px;margin:0 auto;">
+    <div class="cover-eyebrow">Confidential &mdash; AI-Assisted Analysis</div>
+    <div class="cover-title">{title}</div>
+    <div class="cover-meta">
+      <span>Dataset Type: {dataset_type or "—"}</span>
+      <span>Generated: {generated}</span>
+      <span>Session: {session_id[:8]}…</span>
     </div>
-    {get_sect_labeled("executive_summary", ex_h)}
-    {get_sect_labeled("key_findings", conv_h)}
-    {get_sect_labeled("detailed_insights", di_h)}
-    {get_sect_labeled("adversarial_review", _critic_h)}
-    {get_sect_labeled("key_segments", pe_h)}
-    {get_sect_labeled("cross_metric_connections", cx_h)}
-    {get_sect_labeled("recommendations", st_h)}
-    {get_sect_labeled("analysis_charts", ch_h)}
-    <div style="text-align:center; color:#aaa; font-size:12px; margin-top:28px; font-family:system-ui,sans-serif;">
-        Analytics Report &mdash; {generated}
-    </div>
-    </body></html>"""
+    <div class="kpi-band">{kpi_row}</div>
+  </div>
+</div>
 
+<!-- Hero statement band -->
+{f'''<div class="hero-band" style="background:#0F1F3D;border-top:1px solid rgba(255,255,255,0.08);padding:28px 48px;">
+  <div style="max-width:1036px;margin:0 auto;">
+    <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;
+                color:{hero_col};margin-bottom:8px;">Top Finding</div>
+    <div style="font-size:20px;font-weight:800;color:#fff;line-height:1.3;margin-bottom:8px;
+                max-width:800px;">{hero_title}</div>
+    <p style="font-size:13.5px;color:rgba(255,255,255,0.6);line-height:1.7;margin:0;max-width:720px;">{hero_summary}</p>
+  </div>
+</div>''' if hero_title or hero_summary else ''}
+
+<div class="body-wrap">
+
+  {toc_html}
+
+  {section("executive", "Executive Summary", exec_body)}
+  {section("findings", "Key Findings", f'<div class="prose">{conv_h}</div>' if conv_h else "", divider=bool(exec_body))}
+  {section("insights", "Detailed Findings", sev_bar + insight_cards, divider=bool(conv_h or exec_body))}
+  {section("action-plan", "Action Plan", action_plan_html, divider=True)}
+  {section("segments", "User Segments", segments_grid, divider=True)}
+  {section("connections", "Cross-Metric Connections", connections_html, divider=True)}
+  {section("recommendations", "Recommendations", recommendations_html, divider=True)}
+  {section("charts", "Appendix: Analysis Charts", charts_html, divider=True)}
+
+  <div style="text-align:center;color:#9CA3AF;font-size:11px;padding-top:32px;border-top:1px solid #F3F4F6;">
+    {title} &mdash; {generated} &mdash; Confidential
+  </div>
+
+</div>
+</body>
+</html>"""
 
 _dag_builder_instance = None
 
-
 _PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
 
-
 def _load_prompt(name: str) -> str:
-    with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
-        return f.read()
-
+    path = os.path.join(_PROMPT_DIR, name)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        raise RuntimeError(f"Prompt file missing: {path}. Ensure the prompts/ directory is present.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load prompt {name}: {e}") from e
 
 def get_dag_builder_agent():
     global _dag_builder_instance

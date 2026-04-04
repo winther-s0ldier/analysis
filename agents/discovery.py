@@ -8,7 +8,7 @@ from pydantic import Field
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from a2a_messages import (
+from pipeline_types import (
     create_message,
     Intent,
     MetricSpec,
@@ -16,19 +16,14 @@ from a2a_messages import (
 
 _PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
 
-
 def _load_prompt(name: str) -> str:
     with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
         return f.read()
 
-
 _plan_store: dict = {}
 
-
 def get_analysis_plan(session_id: str) -> dict | None:
-    """Read and consume stored plan for a session."""
     return _plan_store.pop(session_id, None)
-
 
 def build_dag_deterministic(
     dataset_type: str,
@@ -37,9 +32,7 @@ def build_dag_deterministic(
     row_count: int,
 ) -> dict:
     nodes = []
-    
-    # If the LLM profiler didn't provide entity/time/event but we requested
-    # a session-dependent analysis, we add session_detection as a prerequisite
+
     needs_session = any(a in selected_analyses for a in [
         "funnel_analysis", "survival_analysis", "user_segmentation",
         "sequential_pattern_mining", "transition_analysis", "dropout_analysis"
@@ -58,7 +51,7 @@ def build_dag_deterministic(
     for i, analysis in enumerate(selected_analyses):
         if analysis == "session_detection":
             continue
-            
+
         node_id = f"A{len(nodes) + 1}"
         deps = ["A1"] if needs_session and analysis not in [
             "distribution_analysis", "categorical_analysis", "correlation_matrix",
@@ -76,7 +69,7 @@ def build_dag_deterministic(
         })
 
     from tools.analysis_library import LIBRARY_REGISTRY
-    
+
     final_dag = []
     metrics_ui = []
 
@@ -84,12 +77,12 @@ def build_dag_deterministic(
         atype = node.get("analysis_type")
         if not atype:
             continue
-            
+
         lib_entry = LIBRARY_REGISTRY.get(atype, {})
         name = node.get("name") or atype.replace("_", " ").title()
         desc = node.get("description") or lib_entry.get("description", atype)
         lib_fn = node.get("library_function") or lib_entry.get("function")
-        
+
         spec = {
             "id": node.get("id"),
             "name": name,
@@ -108,38 +101,30 @@ def build_dag_deterministic(
     data_summary = f"{dataset_type.replace('_', ' ').title()} dataset with {row_count:,} rows. {len(final_dag)} analyses planned."
     return {"status": "success", "dag": final_dag, "data_summary": data_summary, "node_count": len(final_dag)}
 
-
 def tool_submit_analysis_plan(
     session_id: Annotated[str, Field(description="Active pipeline session ID")],
     dag_json_str: Annotated[str, Field(description="JSON string of the analysis DAG -- a list of node objects or a dict with a 'dag' key")],
-    tool_context=None,  # ADK injects ToolContext automatically when declared
+    tool_context=None,
 ) -> str:
-    """
-    Submit the final analysis plan as structured JSON.
-    MUST be called to complete the discovery process.
-    """
     try:
         from tools.analysis_library import LIBRARY_REGISTRY
-        
-        # Helper function to extract JSON from mixed text
+
         def _extract_json_from_text(text: str):
             text = text.strip()
-            # 1. Try markdown block
+
             match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
             if match:
                 text = match.group(1).strip()
-            
-            # 2. Find first [ or {
+
             start_idx = -1
             for i, c in enumerate(text):
                 if c in '{[':
                     start_idx = i
                     break
-            
+
             if start_idx == -1:
-                return text # Give up, let json.loads fail naturally
-                
-            # 3. Find matching closing bracket (string-aware)
+                return text
+
             bracket_stack = []
             in_string = False
             escape_next = False
@@ -165,14 +150,14 @@ def tool_submit_analysis_plan(
                         if not bracket_stack:
                             end_idx = i
                             break
-                        
+
             if end_idx != -1:
                 return text[start_idx:end_idx+1]
-                
+
             return text[start_idx:]
-            
+
         clean_json = _extract_json_from_text(dag_json_str)
-        
+
         try:
             parsed = json.loads(clean_json)
         except json.JSONDecodeError as e:
@@ -180,7 +165,7 @@ def tool_submit_analysis_plan(
             print(f"DEBUG: Raw input: {dag_json_str[:100]}...")
             print(f"DEBUG: Clean input: {clean_json[:100]}...")
             return f"Error parsing JSON: {e}. Please ensure you return valid JSON."
-        
+
         if isinstance(parsed, list):
             nodes = parsed
         elif isinstance(parsed, dict) and "dag" in parsed:
@@ -188,14 +173,10 @@ def tool_submit_analysis_plan(
         else:
             print(f"DEBUG: Invalid Discovery JSON structure: {type(parsed)}")
             return "Error: Invalid JSON schema. Expected a list of nodes or a dict with a 'dag' key."
-            
+
         final_dag = []
         metrics_ui = []
-        
-        # -- Alias map: silently remap common LLM-generated synonyms to registered types
-        # This keeps the LLM free to propose analyses by any reasonable name while
-        # ensuring the coder agent gets a type it can look up. Unknown types without
-        # an alias are kept as-is -- the coder agent will write custom code for them.
+
         ALIAS_MAP = {
             "path_analysis":           "user_journey_analysis",
             "retention_analysis":      "cohort_analysis",
@@ -214,7 +195,6 @@ def tool_submit_analysis_plan(
             if not atype:
                 continue
 
-            # Apply alias remapping before registry lookup
             original_atype = atype
             atype = ALIAS_MAP.get(atype, atype)
             if atype != original_atype:
@@ -225,9 +205,7 @@ def tool_submit_analysis_plan(
             name = node.get("name") or atype.replace("_", " ").title()
             desc = node.get("description") or lib_entry.get("description", atype)
             lib_fn = node.get("library_function") or lib_entry.get("function")
-            
-            # Extract cohort_window from column_roles if LLM placed it there,
-            # then remove it from column_roles so it doesn't confuse the coder agent.
+
             _col_roles = dict(node.get("column_roles", {}))
             _cohort_window = _col_roles.pop("cohort_window", None)
 
@@ -247,7 +225,7 @@ def tool_submit_analysis_plan(
             if _cohort_window and atype == "cohort_analysis":
                 spec["cohort_window"] = _cohort_window
             final_dag.append(spec)
-            
+
             metrics_ui.append({
                 "id": spec["id"],
                 "name": spec["name"],
@@ -258,9 +236,6 @@ def tool_submit_analysis_plan(
                 "status": "pending"
             })
 
-        # Deduplicate by analysis_type -- keep first occurrence of each type.
-        # The LLM sometimes proposes the same analysis_type multiple times with
-        # slightly different node IDs, producing near-identical charts.
         _seen_types: set = set()
         _deduped: list = []
         _deduped_ui: list = []
@@ -276,9 +251,6 @@ def tool_submit_analysis_plan(
         final_dag = _deduped
         metrics_ui = _deduped_ui
 
-        # Check for LOW-feasibility nodes that could benefit from user clarification.
-        # If ALL nodes are LOW feasibility, pause the pipeline and request clarification
-        # rather than proceeding with a likely-broken DAG.
         _low_feas = [n for n in final_dag if n.get("feasibility", "").upper() == "LOW"]
         if _low_feas:
             try:
@@ -297,7 +269,7 @@ def tool_submit_analysis_plan(
                             "Please confirm the role of each column below before proceeding."
                         ),
                     }
-                    from a2a_messages import create_message, Intent
+                    from pipeline_types import create_message, Intent
                     _state.post_message(create_message(
                         intent=Intent.CLARIFICATION_NEEDED,
                         sender="discovery_agent",
@@ -315,7 +287,6 @@ def tool_submit_analysis_plan(
         }
         _plan_store[session_id] = plan
 
-        # A2A server mode: write plan to file so orchestrator (main process) can read it
         try:
             from agent_servers.a2a_orchestrator import lookup_session as _lookup_s
             _abs_out = _lookup_s(session_id)
@@ -328,8 +299,6 @@ def tool_submit_analysis_plan(
         except Exception as _pce:
             print(f"WARNING: [A2A] plan cache write failed: {_pce}")
 
-        # ADK-native: write to ToolContext state so downstream SequentialAgent
-        # sub-agents (synthesis, dag_builder) can read dag without importing main
         if tool_context is not None:
             try:
                 tool_context.state["dag"] = final_dag
@@ -346,16 +315,9 @@ def tool_submit_analysis_plan(
             print("Discovery parsing error: (traceback unprintable)")
         return f"Error parsing JSON: {str(e)}"
 
-
 _discovery_agent_instance = None
 
-
 def _discovery_after_model_callback(callback_context, llm_response):
-    """Validate that the discovery response contains an analysis_plan / dag key.
-
-    Returns a corrective LlmResponse if the required structure is missing or
-    the response is not valid JSON. Returns None to keep the original response.
-    """
     from google.adk.models.llm_response import LlmResponse
     from google.genai import types
 
@@ -367,7 +329,6 @@ def _discovery_after_model_callback(callback_context, llm_response):
     if not text:
         return None
 
-    # Extract JSON block if wrapped in ```json ... ```
     match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
     json_text = match.group(1) if match else text
     first = json_text.find("{")
@@ -392,7 +353,6 @@ def _discovery_after_model_callback(callback_context, llm_response):
         ))]))
 
     return None
-
 
 def get_discovery_agent():
     global _discovery_agent_instance

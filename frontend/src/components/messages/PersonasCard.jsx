@@ -48,7 +48,7 @@ export function PersonasCard({ personas = [] }) {
                 <div className="mt-auto pt-2 border-t border-border-subtle">
                   <div className="text-[11px] font-semibold text-text-muted uppercase tracking-wider mb-1">Pain Points</div>
                   <ul className="text-[12px] text-text-secondary space-y-0.5 list-disc list-inside">
-                    {segment.pain_points.slice(0, 2).map((p, i) => <li key={i}>{p}</li>)}
+                    {segment.pain_points.map((p, i) => <li key={i}>{p}</li>)}
                   </ul>
                 </div>
               )}
@@ -56,7 +56,7 @@ export function PersonasCard({ personas = [] }) {
                 <div className="mt-2">
                   <div className="text-[11px] font-semibold text-status-success uppercase tracking-wider mb-1">Opportunities</div>
                   <ul className="text-[12px] text-text-secondary space-y-0.5 list-disc list-inside">
-                    {segment.opportunities.slice(0, 2).map((o, i) => <li key={i}>{o}</li>)}
+                    {segment.opportunities.map((o, i) => <li key={i}>{o}</li>)}
                   </ul>
                 </div>
               )}

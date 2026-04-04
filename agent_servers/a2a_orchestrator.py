@@ -1,24 +1,3 @@
-"""
-agent_servers/a2a_orchestrator.py
-==================================
-A2A HTTP client for calling remote agent servers.
-Used by orchestrator.py when USE_A2A_MULTISERVER=true.
-
-Agents still called in same logical order — the difference is each
-call goes over HTTP JSON-RPC instead of a direct Python import.
-
-Fallback: if USE_A2A_MULTISERVER is not set or false, orchestrator.py
-uses its existing direct-Python paths. a2a_messages.py is untouched in
-both modes (it tracks internal DAG job state, not transport).
-
-Agent server URLs are read from env vars with localhost defaults:
-    PROFILER_URL    = http://localhost:8001
-    DISCOVERY_URL   = http://localhost:8002
-    CODER_URL       = http://localhost:8003  (not used — coder needs local file access)
-    SYNTHESIS_URL   = http://localhost:8004
-    CRITIC_URL      = http://localhost:8005
-    DAG_BUILDER_URL = http://localhost:8006
-"""
 import os
 import uuid
 import json
@@ -26,15 +5,12 @@ import asyncio
 import threading
 from typing import Optional
 
-# ── Session registry (shared file so A2A servers can resolve session_id -> output_folder) ──
-# Written by the orchestrator before calling any A2A agent.
-# Read by synthesis/critic/dag_builder tools when running as standalone A2A servers.
 _A2A_SESSIONS_FILE = os.path.join(os.path.dirname(__file__), "..", "_a2a_sessions.json")
 _registry_lock = threading.Lock()
 
+_AGENT_AUTH_TOKEN = os.getenv("AGENT_AUTH_TOKEN", "")
 
 def register_session(session_id: str, output_folder: str) -> None:
-    """Register session_id -> output_folder so A2A agent servers can find it."""
     try:
         with _registry_lock:
             data: dict = {}
@@ -53,9 +29,7 @@ def register_session(session_id: str, output_folder: str) -> None:
     except Exception as e:
         print(f"WARNING: A2A session registry write failed: {e}")
 
-
 def lookup_session(session_id: str) -> str:
-    """Return absolute output_folder for session_id, or '' if not found."""
     try:
         with open(_A2A_SESSIONS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -63,11 +37,7 @@ def lookup_session(session_id: str) -> str:
     except Exception:
         return ""
 
-
-# ── URL registry ──────────────────────────────────────────────────────────────
-
 def _get_agent_url(name: str) -> str:
-    """Return the base URL for a named agent server."""
     defaults = {
         "profiler":    "http://localhost:8001",
         "discovery":   "http://localhost:8002",
@@ -86,14 +56,7 @@ def _get_agent_url(name: str) -> str:
     }
     return os.getenv(env_keys[name], defaults[name])
 
-
-# ── Health check ──────────────────────────────────────────────────────────────
-
 async def check_agent_available(name: str, timeout: float = 3.0) -> bool:
-    """
-    Returns True if the agent server is reachable (Agent Card responds 200).
-    Fast check — used at startup to decide whether to use A2A mode.
-    """
     try:
         import httpx
         url = f"{_get_agent_url(name)}/.well-known/agent-card.json"
@@ -103,12 +66,7 @@ async def check_agent_available(name: str, timeout: float = 3.0) -> bool:
     except Exception:
         return False
 
-
 async def check_all_agents_available(timeout: float = 3.0) -> dict:
-    """
-    Returns dict {agent_name: bool} — True if reachable.
-    Skips coder since it runs in-process.
-    """
     agents_to_check = ["profiler", "discovery", "synthesis", "critic", "dag_builder"]
     results = await asyncio.gather(
         *[check_agent_available(a, timeout) for a in agents_to_check],
@@ -119,19 +77,7 @@ async def check_all_agents_available(timeout: float = 3.0) -> dict:
         for name, r in zip(agents_to_check, results)
     }
 
-
-# ── Core send helper ──────────────────────────────────────────────────────────
-
 async def _call_agent(name: str, message_text: str, timeout: float = 300.0) -> str:
-    """
-    Send a message to a remote A2A agent server and return the text response.
-
-    Constructs a valid A2A SendMessageRequest using the a2a-sdk types,
-    POSTs it to the agent's JSON-RPC endpoint, and extracts the response text
-    from the returned Task or Message object.
-
-    Returns the agent's text response, or raises RuntimeError on failure.
-    """
     try:
         import httpx
         from a2a.client import A2AClient
@@ -159,44 +105,34 @@ async def _call_agent(name: str, message_text: str, timeout: float = 300.0) -> s
         ),
     )
 
-    async with httpx.AsyncClient(timeout=timeout) as http:
+    _auth_headers = {"Authorization": f"Bearer {_AGENT_AUTH_TOKEN}"} if _AGENT_AUTH_TOKEN else {}
+    async with httpx.AsyncClient(timeout=timeout, headers=_auth_headers) as http:
         client = A2AClient(httpx_client=http, url=url)
         response = await client.send_message(request)
 
     return _extract_response_text(response)
 
-
 def _extract_response_text(response) -> str:
-    """
-    Extract plain text from an A2A SendMessageResponse.
-
-    The response root is either:
-      - Task   → look in task.history[-1].parts for TextPart
-      - Message → look in message.parts for TextPart
-    """
     try:
         root = response.root
-        # Success response has .result which is Task | Message
+
         result = getattr(root, "result", None)
         if result is None:
-            # Error response
+
             err = getattr(root, "error", None)
             raise RuntimeError(f"A2A agent returned error: {err}")
 
-        # Task response — last message in history is the agent's reply
         if hasattr(result, "history") and result.history:
             for msg in reversed(result.history):
                 text = _parts_to_text(msg.parts)
                 if text:
                     return text
 
-        # Message response (some agents return directly)
         if hasattr(result, "parts"):
             text = _parts_to_text(result.parts)
             if text:
                 return text
 
-        # Status message (task completed with a status description)
         if hasattr(result, "status") and hasattr(result.status, "message"):
             msg = result.status.message
             if msg and hasattr(msg, "parts"):
@@ -210,21 +146,16 @@ def _extract_response_text(response) -> str:
     except Exception as e:
         raise RuntimeError(f"Failed to extract response text: {e}") from e
 
-
 def _parts_to_text(parts) -> str:
-    """Extract concatenated text from a list of Part objects."""
     if not parts:
         return ""
     chunks = []
     for part in parts:
-        # Part is a RootModel wrapping TextPart | FilePart | DataPart
+
         inner = getattr(part, "root", part)
         if hasattr(inner, "text"):
             chunks.append(inner.text or "")
     return "".join(chunks)
-
-
-# ── Named agent callers (used by orchestrator) ────────────────────────────────
 
 async def call_profiler(session_id: str, csv_path: str) -> str:
     prompt = (
@@ -233,7 +164,6 @@ async def call_profiler(session_id: str, csv_path: str) -> str:
         f"Call tool_profile_and_classify now."
     )
     return await _call_agent("profiler", prompt)
-
 
 async def call_discovery(
     session_id: str,
@@ -257,7 +187,6 @@ async def call_discovery(
     )
     return await _call_agent("discovery", prompt)
 
-
 async def call_synthesis(
     session_id: str,
     output_folder: str,
@@ -272,14 +201,12 @@ async def call_synthesis(
     )
     return await _call_agent("synthesis", prompt, timeout=600.0)
 
-
 async def call_critic(session_id: str) -> str:
     prompt = (
         f"Session ID: {session_id}\n"
         "Review the synthesis and call tool_submit_critique."
     )
     return await _call_agent("critic", prompt, timeout=180.0)
-
 
 async def call_dag_builder(session_id: str, output_folder: str) -> str:
     prompt = (

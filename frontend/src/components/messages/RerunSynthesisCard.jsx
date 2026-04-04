@@ -7,7 +7,7 @@ import { useChatStore } from '../../store/chatStore';
 export function RerunSynthesisCard() {
   const [val, setVal] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const { sessionId, setPhase } = usePipelineStore();
+  const { sessionId, setPhase, startPipelineRun } = usePipelineStore();
   const { addMessage } = useChatStore();
 
   const handleRerun = async () => {
@@ -19,10 +19,9 @@ export function RerunSynthesisCard() {
     }
 
     try {
+      startPipelineRun(); // increment pipelineRunId → triggers SSE reconnection in useSSEStream
       setPhase('synthesizing');
       await rerunSynthesis(sessionId, val);
-      // Restarting SSE for rerun isn't strictly necessary if it never closed, 
-      // but in the actual implementation the hook should handle reconnect if needed.
     } catch (e) {
       addMessage('ai', 'text', `Rerun failed: ${e.message}`);
       setPhase('error');

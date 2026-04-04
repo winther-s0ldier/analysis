@@ -1,21 +1,7 @@
 import pandas as pd
 from typing import Any
 
-
 def profile_csv(csv_path: str) -> dict:
-    """
-    Profile a CSV file and return raw facts about every column.
-    
-    This is a SENSOR — it reports what it sees. It does NOT decide what to do.
-    The Discovery Agent (the BRAIN) reads this profile and reasons about it.
-    
-    Args:
-        csv_path: Absolute path to the CSV file.
-    
-    Returns:
-        dict with raw facts: row_count, column_count, columns (per-column stats),
-        sample_data, correlations. No suggestions, no metric proposals.
-    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except UnicodeDecodeError:
@@ -118,15 +104,9 @@ def profile_csv(csv_path: str) -> dict:
         "memory_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
     }
 
-    # Semantic mapping and dataset classification are handled by the Profiler LLM Agent.
-    # The deprecated stubs below returned empty/wrong defaults and were overwriting
-    # whatever the LLM correctly populated — removed to fix profile corruption.
-
     return result
 
-
 def _is_datetime_column(series: pd.Series) -> bool:
-    """Heuristic check if a column contains datetime values."""
     if pd.api.types.is_datetime64_any_dtype(series):
         return True
     if series.dtype == object:
@@ -140,19 +120,10 @@ def _is_datetime_column(series: pd.Series) -> bool:
             return False
     return False
 
-
 def infer_column_semantics(profile: dict) -> dict:
-    """
-    Deprecated: Semantic mapping is now handled dynamically by the Profiler LLM Agent.
-    This function returns an empty dict to maintain backwards compatibility.
-    """
     return {}
 
 def classify_dataset(profile: dict, semantic_map: dict) -> dict:
-    """
-    Deprecated: Dataset classification is now handled dynamically by the Profiler LLM Agent.
-    This function returns a generic fallback dict to maintain backwards compatibility.
-    """
     return {
         "dataset_type": "tabular_generic",
         "confidence": 0.0,

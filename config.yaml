@@ -1,9 +1,11 @@
 pipeline:
-  max_parallel_nodes: 3        # orchestrator.py DAG semaphore
+  max_parallel_nodes: 5        # orchestrator.py DAG semaphore
   sse_poll_interval: 0.4       # main.py SSE generator sleep
   synthesis_delay: 2.0         # orchestrator.py pre-synthesis pause
   session_ttl: 86400           # main.py session TTL (seconds)
   sse_sleep_spacing: 0.45      # orchestrator.py staggered SSE push sleep
+  session_restore_interval: 3600   # main.py in-memory session eviction loop sleep (seconds)
+  rate_limit_default_delay: 20     # main.py fallback base delay when API rate-limits (seconds)
 
 retry:
   max_attempts: 3              # orchestrator.py LLM retry count
@@ -16,11 +18,20 @@ agents:
     synthesis: 8004
     critic: 8005
     dag_builder: 8006
+  max_turns:
+    discovery: 12         # main.py /discover endpoint
+    critic: 8             # main.py rerun-synthesis critic call
+    intent_classify: 1    # main.py chat intent classification
+    chat: 4               # main.py chat Q&A response
+    post_dag: 150         # orchestrator.py synthesis+critic+dag_builder sequential agent
+    default: 15           # main.py run_agent_pipeline fallback default
 
 data_quality:
   null_warn_pct: 30            # tools/data_gate.py high null density threshold (%)
   null_critical_pct: 90        # tools/data_gate.py critical null density threshold (%)
   duplicate_warn_pct: 50       # tools/data_gate.py duplicate row threshold (%)
+  duplicate_secondary_pct: 20  # tools/data_gate.py secondary notice threshold (%)
+  type_check_sample_size: 500  # tools/data_gate.py rows sampled for mixed-type detection
   profiler_confidence_threshold: 0.7   # orchestrator.py triggers clarification below this
   column_match_cutoff: 0.6     # orchestrator.py difflib fuzzy column matching cutoff
 

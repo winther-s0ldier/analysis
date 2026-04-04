@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ADHOPSUN Analysis</title>
+  <meta name="description" content="ADHOPSUN Analysis – Agentic user behaviour intelligence platform">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+
+<header>
+  <div class="h-brand">
+    <div class="h-logo"><i data-lucide="shopping-bag" style="width:20px;height:20px;color:#fff;stroke-width:1.8"></i></div>
+    <div>
+      <div class="h-title">ADHOPSUN Analysis</div>
+      <div class="h-sub">User Behaviour Intelligence Platform</div>
+    </div>
+  </div>
+  <div class="h-right">
+    <button onclick="window.location.href='/'" style="display:inline-flex;align-items:center;gap:6px;background:#6366F1;border:none;color:#fff;border-radius:8px;padding:7px 16px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:background 0.15s;box-shadow:0 2px 8px rgba(99,102,241,0.35);" onmouseover="this.style.background='#4F46E5'" onmouseout="this.style.background='#6366F1'">
+      <i data-lucide="arrow-left" style="width:14px;height:14px"></i> Back to Chat
+    </button>
+    <div class="live-wrap"><div class="live-dot" id="liveDot"></div><span id="liveLabel">Loading…</span></div>
+    <div id="clock"></div>
+  </div>
+</header>
+
+<main>
+  <div class="stats-grid">
+    <div class="sc"><div class="sc-lbl"><i data-lucide="wifi" style="width:12px;height:12px"></i> Active Users</div><div class="sc-val gn" id="sActive">—</div><div class="sc-sub">Interacted &lt;10s ago</div></div>
+    <div class="sc"><div class="sc-lbl"><i data-lucide="clock" style="width:12px;height:12px"></i> Idle Users</div><div class="sc-val am" id="sIdle">—</div><div class="sc-sub">Inactive 10–15s</div></div>
+    <div class="sc"><div class="sc-lbl"><i data-lucide="user-x" style="width:12px;height:12px"></i> Inactive</div><div class="sc-val rd" id="sInactive">—</div><div class="sc-sub">Inactive ≥15s</div></div>
+    <div class="sc"><div class="sc-lbl"><i data-lucide="indian-rupee" style="width:12px;height:12px"></i> Cart at Risk</div><div class="sc-val cy" id="sCart">₹—</div><div class="sc-sub">From inactive sessions</div></div>
+    <div class="sc"><div class="sc-lbl"><i data-lucide="bot" style="width:12px;height:12px"></i> AGENT INTERVENTIONS</div><div class="sc-val vi" id="sNotifs">0</div><div class="sc-sub">This session</div></div>
+    <div class="sc"><div class="sc-lbl"><i data-lucide="trending-up" style="width:12px;height:12px"></i> Recovery Rate</div><div class="sc-val gn" id="sRecovered">0 (0%)</div><div class="sc-sub">Users re-engaged</div></div>
+  </div>
+
+  <div class="main-grid">
+    <div class="card">
+      <div class="card-hdr">
+        <div class="sec-title"><i data-lucide="bar-chart-2" style="width:16px;height:16px"></i> Live Sessions</div>
+        <div class="tbl-controls">
+          <div class="stage-badge" id="stageBadge" style="display:none">
+            <i data-lucide="filter" style="width:11px;height:11px"></i>
+            <span id="stageBadgeLabel"></span>
+            <button class="stage-badge-clear" onclick="clearStageFilter()"><i data-lucide="x" style="width:10px;height:10px"></i></button>
+          </div>
+          <div class="filters" id="filters">
+            <button class="fb on" data-f="all">All</button>
+            <button class="fb" data-f="active">Active</button>
+            <button class="fb" data-f="idle">Idle</button>
+            <button class="fb" data-f="inactive">Inactive</button>
+          </div>
+        </div>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>User</th><th>Page</th><th>Dev</th><th>Inactive</th><th>Cart ₹</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel card" id="panel">
+        <div id="pEmpty" class="p-empty">
+          <div style="margin-bottom:12px;opacity:.2"><i data-lucide="bot" style="width:44px;height:44px;stroke-width:1"></i></div>
+          <p style="font-weight:600;color:var(--t1);margin-bottom:6px">Agent standing by</p>
+          <p>Select a user or wait — agents auto-dispatch<br>when inactivity is detected</p>
+        </div>
+
+        <div id="pContent" style="display:none">
+          <div class="p-pin-bar" id="pPinBar" style="display:none">
+            <i data-lucide="pin" style="width:13px;height:13px"></i>
+            <span>Pinned to this user</span>
+            <button class="unpin-btn" onclick="unpinPanel()">
+              <i data-lucide="pin-off" style="width:11px;height:11px"></i> Unpin
+            </button>
+          </div>
+          <div class="p-head">
+            <div class="p-tabs">
+              <button class="ptab-btn on" data-ptab="intervention" onclick="setPanelTab('intervention')">Intervention</button>
+              <button class="ptab-btn" data-ptab="details" onclick="setPanelTab('details')">User Details</button>
+            </div>
+            <div class="p-user-row">
+              <div class="p-av" id="pAv"></div>
+              <div>
+                <div class="p-name" id="pName"></div>
+                <div class="p-meta" id="pMeta"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="pTabIntervention">
+            <div class="agent-bar">
+              <i data-lucide="bot" style="width:15px;height:15px;flex-shrink:0"></i>
+              <span>ADHOPSUN Agent dispatched all channels</span>
+              <span class="agent-time" id="agentTime"></span>
+            </div>
+            <div class="dispatch-log" id="dispatchLog"></div>
+            <div style="padding:0 18px 18px">
+              <button class="btn-redispatch" id="btnRedispatch" onclick="redispatch()">
+                <i data-lucide="refresh-cw" style="width:13px;height:13px"></i> Repeat Interventions
+              </button>
+            </div>
+          </div>
+
+          <div id="pTabDetails" style="display:none;padding:18px">
+            <div class="p-det-list" id="pDetList"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card flow-card">
+    <div class="card-hdr">
+      <div class="sec-title"><i data-lucide="git-branch-plus" style="width:16px;height:16px"></i> User Journey Flow</div>
+      <div class="hint">Click a stage to filter the table &nbsp;·&nbsp; Hover avatars for details</div>
+    </div>
+    <div class="flow-wrap" id="flowWrap"></div>
+  </div>
+
+  <div class="card funnel-card">
+    <div class="card-hdr">
+      <div class="sec-title"><i data-lucide="trending-down" style="width:16px;height:16px"></i> Conversion Funnel</div>
+      <div class="hint">Click a stage bar to drill down into the session table</div>
+    </div>
+    <div class="funnel-body" id="funnelBody">
+      <div class="loading-state"><div class="loading-spinner"></div><span>Initialising…</span></div>
+    </div>
+  </div>
+
+  <div class="card feed-card">
+    <div class="card-hdr">
+      <div class="sec-title"><i data-lucide="activity" style="width:16px;height:16px"></i> Event Log</div>
+      <div class="feed-tabs" id="feedTabs">
+        <button class="ftab on" data-tab="activity"><span class="ftab-dot"></span>USER ACTIVITY</button>
+        <button class="ftab" data-tab="dispatch">INTERVENTIONS</button>
+      </div>
+    </div>
+    <div class="card-body">
+      <div id="feedBody" class="feed-body"></div>
+      <div id="dispatchBody" class="dispatch-body" style="display:none"></div>
+    </div>
+  </div>
+</main>
+
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>

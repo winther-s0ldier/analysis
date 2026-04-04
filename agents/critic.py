@@ -1,48 +1,24 @@
-"""
-critic.py — Adversarial Critic Agent (#8)
-==========================================
-Reviews the synthesis output for:
-  1. Unsupported claims (no [AX] citation)
-  2. Contradictions between node findings
-  3. Overconfident assertions without statistical backing
-  4. Vague action items without specific steps
-  5. Important patterns in fact_sheet not addressed by synthesis
-
-Output stored in _critic_store[session_id] and injected into
-_synthesis_store[session_id]["_critic_review"] by orchestrator.
-"""
 import os
 import sys
 import re
+import json
 from typing import List, Optional
 from pydantic import BaseModel, Field, field_validator
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# ── In-memory store ───────────────────────────────────────────────────────────
 _critic_store: dict = {}
 _critic_instance = None
 
-
 def get_critic_store_result(session_id: str) -> dict:
-    """Retrieve critic result for a session."""
     return _critic_store.get(session_id, {})
 
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
-
 def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
-    """
-    Retrieve the current synthesis + pre-extracted fact_sheet for this session.
-    The synthesis contains all the insight cards, cross-metric connections,
-    executive summary, and conversational report.
-    The fact_sheet contains the verified numbers each node actually produced.
-    Use both to check: does every claim in synthesis trace back to a real number?
-    """
     try:
-        # Source 0: ToolContext.state — fastest path in SequentialAgent in-process mode.
-        # synthesis_agent writes tool_context.state["synthesis"] before this tool is called.
+        from agents.synthesis import _extract_node_facts
+
         synthesis = {}
+
         if tool_context is not None:
             try:
                 _tc_synth = tool_context.state.get("synthesis")
@@ -52,54 +28,53 @@ def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
             except Exception:
                 pass
 
-        # Source 1: in-memory store (single-server in-process mode)
         if not synthesis:
-            from agents.synthesis import _synthesis_store
-            synthesis = _synthesis_store.get(session_id, {})
+            try:
+                from agents.synthesis import _synthesis_store
+                synthesis = _synthesis_store.get(session_id, {})
+            except Exception:
+                pass
 
-        # Source 2 (A2A server mode fallback): read _synthesis_cache.json when in-memory store is empty
         if not synthesis:
             try:
                 from agent_servers.a2a_orchestrator import lookup_session as _lookup
-                import json as _json
                 _abs_out = _lookup(session_id)
                 if _abs_out:
-                    import os as _os
-                    _cache = _os.path.join(_abs_out, "_synthesis_cache.json")
-                    if _os.path.exists(_cache):
+                    _cache = os.path.join(_abs_out, "_synthesis_cache.json")
+                    if os.path.exists(_cache):
                         with open(_cache, "r", encoding="utf-8") as _f:
-                            synthesis = _json.load(_f)
+                            synthesis = json.load(_f)
                         print(f"INFO: [A2A] critic loaded synthesis from file cache for {session_id}")
             except Exception as _fe:
                 print(f"WARNING: [A2A] critic synthesis file fallback failed: {_fe}")
 
-        from agents.orchestrator import get_pipeline_state
-        from agents.synthesis import _extract_node_facts
-        state = get_pipeline_state(session_id)
-
         fact_sheet = {}
-        if state:
-            for aid, res in state.results.items():
-                if isinstance(res, dict) and res.get("status") == "success":
-                    try:
-                        fact_sheet[aid] = _extract_node_facts(aid, aid, res)
-                    except Exception:
-                        fact_sheet[aid] = {
-                            "analysis_type": res.get("analysis_type", "unknown"),
-                            "top_finding": res.get("top_finding", ""),
-                        }
-        elif not fact_sheet:
-            # A2A server mode: build fact_sheet from _results_cache.json
+
+        try:
+            from agents.orchestrator import get_pipeline_state
+            state = get_pipeline_state(session_id)
+            if state:
+                for aid, res in state.results.items():
+                    if isinstance(res, dict) and res.get("status") == "success":
+                        try:
+                            fact_sheet[aid] = _extract_node_facts(aid, aid, res)
+                        except Exception:
+                            fact_sheet[aid] = {
+                                "analysis_type": res.get("analysis_type", "unknown"),
+                                "top_finding": res.get("top_finding", ""),
+                            }
+        except Exception:
+            pass
+
+        if not fact_sheet:
             try:
                 from agent_servers.a2a_orchestrator import lookup_session as _lookup_r
-                import json as _rjson
-                import os as _ros
                 _abs_out_r = _lookup_r(session_id)
                 if _abs_out_r:
-                    _rcache = _ros.path.join(_abs_out_r, "_results_cache.json")
-                    if _ros.path.exists(_rcache):
+                    _rcache = os.path.join(_abs_out_r, "_results_cache.json")
+                    if os.path.exists(_rcache):
                         with open(_rcache, "r", encoding="utf-8") as _rf:
-                            _cached_results = _rjson.load(_rf)
+                            _cached_results = json.load(_rf)
                         for aid, res in _cached_results.items():
                             try:
                                 fact_sheet[aid] = _extract_node_facts(aid, aid, res)
@@ -112,7 +87,6 @@ def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
             except Exception as _rfe:
                 print(f"WARNING: [A2A] critic results cache fallback failed: {_rfe}")
 
-        # Pull out key text blobs for easy review
         insights = []
         di = synthesis.get("detailed_insights", {})
         if isinstance(di, list):
@@ -140,12 +114,14 @@ def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
     except Exception as e:
         return {"session_id": session_id, "error": str(e), "synthesis_available": False}
 
-
 class ChallengeItem(BaseModel):
     claim: str = Field(description="Exact text from synthesis that is problematic")
     issue: str = Field(description="What is wrong: unsupported, contradicts X, vague, etc.")
     severity: str = Field(default="medium", description="high | medium | low")
-
+    related_insight_index: Optional[int] = Field(
+        default=None,
+        description="0-based index into detailed_insights.insights[] that this challenge refers to, if determinable"
+    )
 
 class CritiqueInput(BaseModel):
     session_id: str = Field(description="Active pipeline session ID")
@@ -175,31 +151,15 @@ class CritiqueInput(BaseModel):
         except (TypeError, ValueError):
             return 1.0
 
-
 def tool_submit_critique(
     session_id: str,
     approved: bool,
-    challenges: list,
+    challenges: List[dict],
     confidence_adjustment: float,
     overall_verdict: str,
     tool_context=None,
 ) -> dict:
-    """
-    Submit the adversarial critique of the synthesis.
 
-    Args:
-        session_id: Pipeline session.
-        approved: True if synthesis is reliable enough for decisions despite minor issues.
-                  False if there are 2+ high-severity factual/logical errors.
-        challenges: List of dicts, each with keys:
-                    - "claim": the exact text from synthesis that is problematic
-                    - "issue": what is wrong (unsupported, contradicts X, vague, etc.)
-                    - "severity": "high" | "medium" | "low"
-        confidence_adjustment: Float 0.0–1.0. 1.0 = synthesis is fully reliable.
-                                0.7 = some concerns. 0.4 = significant issues.
-        overall_verdict: One paragraph summarising the review (2–4 sentences).
-    """
-    # Validate and coerce inputs via Pydantic model
     try:
         _validated = CritiqueInput(
             session_id=session_id,
@@ -213,7 +173,7 @@ def tool_submit_critique(
         confidence_adjustment = _validated.confidence_adjustment
         overall_verdict = _validated.overall_verdict
     except Exception:
-        # Fallback: manual coercion (keeps existing behaviour on unexpected input)
+
         confidence_adjustment = max(0.0, min(1.0, float(confidence_adjustment)))
         challenges = challenges if isinstance(challenges, list) else []
         overall_verdict = str(overall_verdict) if overall_verdict else ""
@@ -225,8 +185,6 @@ def tool_submit_critique(
         "overall_verdict": overall_verdict,
     }
 
-    # ADK-native: write to ToolContext state so dag_builder (next in SequentialAgent)
-    # reads critique directly — no more _synthesis_store injection race condition
     if tool_context is not None:
         try:
             tool_context.state["critique"] = _critic_store[session_id]
@@ -239,7 +197,6 @@ def tool_submit_critique(
         f"challenges={n}, conf_adj={confidence_adjustment:.2f}"
     )
 
-    # A2A server mode: write _critic_cache.json so dag_builder server can read it
     try:
         from agent_servers.a2a_orchestrator import lookup_session as _lookup
         import json as _json
@@ -251,14 +208,13 @@ def tool_submit_critique(
                 _json.dump(_critic_store[session_id], _cf)
             print(f"INFO: [A2A] critic cache written to {_cache}")
     except Exception as _ce:
-        pass  # Non-fatal — in-process mode doesn't need this
+        pass
 
-    # Escalate the LoopAgent when approved — signals "done" to LoopAgent wrapper
     if tool_context is not None and approved:
         try:
             tool_context.actions.escalate = True
         except AttributeError:
-            pass  # Not inside a LoopAgent — ignore
+            pass
 
     return {
         "status": "critique_stored",
@@ -267,16 +223,41 @@ def tool_submit_critique(
         "confidence_adjustment": confidence_adjustment,
     }
 
+def _critic_after_model_callback(callback_context, llm_response):
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
 
-# ── Agent factory ─────────────────────────────────────────────────────────────
+    if not llm_response.content or not llm_response.content.parts:
+        return None
+
+    has_function_call = any(
+        getattr(part, "function_call", None) is not None
+        for part in llm_response.content.parts
+    )
+    if has_function_call:
+        return None
+
+    text = "".join(getattr(p, "text", "") or "" for p in llm_response.content.parts).strip()
+    if not text:
+        return None
+
+    return LlmResponse(content=types.Content(parts=[types.Part(text=(
+        "You must call `tool_submit_critique` to submit your review — do not return plain text. "
+        "Call the tool now with: session_id, approved (bool), challenges (list of dicts with "
+        "'claim', 'issue', 'severity'), confidence_adjustment (float 0.0-1.0), overall_verdict (string)."
+    ))]))
 
 _PROMPT_DIR = os.path.join(os.path.dirname(__file__), '..', 'prompts')
 
-
 def _load_prompt(name: str) -> str:
-    with open(os.path.join(_PROMPT_DIR, name), 'r', encoding='utf-8') as f:
-        return f.read()
-
+    path = os.path.join(_PROMPT_DIR, name)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except FileNotFoundError:
+        raise RuntimeError(f"Prompt file missing: {path}. Ensure the prompts/ directory is present.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load prompt {name}: {e}") from e
 
 def get_critic_agent():
     global _critic_instance
@@ -294,5 +275,6 @@ def get_critic_agent():
                     "contradictions, overconfidence, and vague recommendations.",
         instruction=_load_prompt("critic.md"),
         tools=[FunctionTool(tool_get_synthesis_for_critique), FunctionTool(tool_submit_critique)],
+        after_model_callback=_critic_after_model_callback,
     )
     return _critic_instance

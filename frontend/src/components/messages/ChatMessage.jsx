@@ -8,6 +8,7 @@ import { DiscoveryCard } from './DiscoveryCard';
 import { TerminalCard } from './TerminalCard';
 import { ChartCard } from './ChartCard';
 import { InsightCard } from './InsightCard';
+import { ActionPlanCard } from './ActionPlanCard';
 import { PersonasCard } from './PersonasCard';
 import { InterventionsCard } from './InterventionsCard';
 import { CriticCard } from './CriticCard';
@@ -17,6 +18,51 @@ import { RerunSynthesisCard } from './RerunSynthesisCard';
 import { RunAnalysisCard } from './RunAnalysisCard';
 import { ClarificationCard } from './ClarificationCard';
 import { usePipelineStore } from '../../store/pipelineStore';
+
+// ── Skeleton card shown while a node is executing ─────────────────────────────
+function SkeletonChartCard({ analysisType }) {
+  const label = (analysisType || '').replace(/_/g, ' ');
+  return (
+    <motion.div
+      className="w-full rounded-xl overflow-hidden mt-4 mb-2"
+      style={{ border: '1px solid #E5E7EB', background: '#fff' }}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.25 }}
+    >
+      {/* Shimmer chart area */}
+      <div style={{ height: 220, background: '#F9FAFB', overflow: 'hidden', position: 'relative' }}>
+        <div style={{
+          position: 'absolute', inset: 0,
+          background: 'linear-gradient(90deg, #F3F4F6 25%, #E9EAEC 50%, #F3F4F6 75%)',
+          backgroundSize: '200% 100%',
+          animation: 'shimmer 1.4s infinite',
+        }} />
+        {/* Fake bar chart silhouette */}
+        <div style={{ position: 'absolute', bottom: 24, left: 32, right: 32, display: 'flex', alignItems: 'flex-end', gap: 10 }}>
+          {[60, 85, 45, 70, 55, 90, 40].map((h, i) => (
+            <div key={i} style={{ flex: 1, height: h, background: '#E5E7EB', borderRadius: '4px 4px 0 0', opacity: 0.6 }} />
+          ))}
+        </div>
+      </div>
+      {/* Footer */}
+      <div style={{ padding: '12px 16px', borderTop: '1px solid #F3F4F6' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <div style={{ height: 9, width: 90, background: '#F3F4F6', borderRadius: 4 }} />
+          <div style={{ height: 9, width: 48, background: '#F3F4F6', borderRadius: 9999 }} />
+        </div>
+        <div style={{ height: 8, width: '65%', background: '#F3F4F6', borderRadius: 4, marginBottom: 5 }} />
+        <div style={{ height: 8, width: '45%', background: '#F3F4F6', borderRadius: 4 }} />
+        {label && (
+          <div style={{ marginTop: 10, fontSize: 11, color: '#9CA3AF', fontStyle: 'italic' }}>
+            Running {label}…
+          </div>
+        )}
+      </div>
+      <style>{`@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }`}</style>
+    </motion.div>
+  );
+}
 
 export function ChatMessage({ message }) {
   const { canvasOpen } = usePipelineStore();
@@ -74,6 +120,7 @@ export function ChatMessage({ message }) {
           finding={message.payload.finding}
           hasChart={message.payload.hasChart}
           severity={message.payload.severity}
+          confidence={message.payload.confidence}
           decisionMakerTakeaway={message.payload.decisionMakerTakeaway}
           keyFinding={message.payload.keyFinding}
           topValues={message.payload.topValues}
@@ -83,8 +130,14 @@ export function ChatMessage({ message }) {
           proposedFix={message.payload.proposedFix}
         />
       );
-    case 'insights':
-      return <InsightCard insights={message.payload} />;
+    case 'insights': {
+      // payload is either an array (old) or { insights, criticChallenges } (new)
+      const insightArr = Array.isArray(message.payload) ? message.payload : (message.payload?.insights || []);
+      const challenges = Array.isArray(message.payload) ? [] : (message.payload?.criticChallenges || []);
+      return <InsightCard insights={insightArr} criticChallenges={challenges} />;
+    }
+    case 'action_plan':
+      return <ActionPlanCard insights={Array.isArray(message.payload) ? message.payload : []} />;
     case 'personas':
       return <PersonasCard personas={message.payload} />;
     case 'interventions':
@@ -113,6 +166,8 @@ export function ChatMessage({ message }) {
           columns={message.payload.columns}
         />
       );
+    case 'skeleton':
+      return <SkeletonChartCard analysisType={message.payload?.analysisType} />;
     default:
        return null;
   }

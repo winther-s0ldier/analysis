@@ -1,44 +1,21 @@
-"""
-A2A-style internal message protocol for agent-to-agent communication.
-Messages are stored in Analytics SessionState for inter-agent coordination.
-"""
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import uuid
 import json
 
-
 class Intent:
-    PROFILE_REQUEST = "PROFILE_REQUEST"
+
     PROFILE_COMPLETE = "PROFILE_COMPLETE"
-
-    DISCOVER_METRICS = "DISCOVER_METRICS"
     PLAN_READY = "PLAN_READY"
-    PLAN_APPROVED = "PLAN_APPROVED"
-
-    RUN_ANALYSIS = "RUN_ANALYSIS"
     ANALYSIS_COMPLETE = "ANALYSIS_COMPLETE"
     ANALYSIS_FAILED = "ANALYSIS_FAILED"
-    DEPENDENCY_BLOCKED = "DEPENDENCY_BLOCKED"
-    DEPENDENCY_RESOLVED = "DEPENDENCY_RESOLVED"
-
-    SYNTHESIZE = "SYNTHESIZE"
     SYNTHESIS_COMPLETE = "SYNTHESIS_COMPLETE"
-
-    BUILD_REPORT = "BUILD_REPORT"
     REPORT_READY = "REPORT_READY"
-
-    STATUS_UPDATE = "STATUS_UPDATE"
-    ERROR = "ERROR"
-    TASK_COMPLETE = "TASK_COMPLETE"
-
     CLARIFICATION_NEEDED = "CLARIFICATION_NEEDED"
     CLARIFICATION_PROVIDED = "CLARIFICATION_PROVIDED"
 
-
 class NodeStatus:
-    """Status of a single DAG node (analysis task)."""
     PENDING = "pending"
     BLOCKED = "blocked"
     RUNNING = "running"
@@ -46,9 +23,8 @@ class NodeStatus:
     FAILED = "failed"
     SKIPPED = "skipped"
 
-
 @dataclass
-class A2AMessage:
+class PipelineMessage:
     sender: str
     recipient: str
     intent: str
@@ -69,9 +45,8 @@ class A2AMessage:
         return json.dumps(self.to_dict(), indent=2)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "A2AMessage":
+    def from_dict(cls, data: dict) -> "PipelineMessage":
         return cls(**data)
-
 
 def create_message(
     sender: str,
@@ -80,9 +55,8 @@ def create_message(
     payload: Dict[str, Any],
     session_id: str = "",
     parent_id: Optional[str] = None,
-) -> A2AMessage:
-    """Create an A2A message."""
-    return A2AMessage(
+) -> PipelineMessage:
+    return PipelineMessage(
         sender=sender,
         recipient=recipient,
         intent=intent,
@@ -91,52 +65,34 @@ def create_message(
         parent_message_id=parent_id,
     )
 
-
 def get_messages_by_intent(
     message_log: List[Any],
     intent: str,
 ) -> List[Any]:
-    """Get all messages with a specific intent."""
     return [
         m for m in message_log
         if (m.get("intent") if isinstance(m, dict) else m.intent) == intent
     ]
 
-
 def get_messages_from(
     message_log: List[Any],
     sender: str,
 ) -> List[Any]:
-    """Get all messages from a specific sender."""
     return [
         m for m in message_log
         if (m.get("sender") if isinstance(m, dict) else m.sender) == sender
     ]
 
-
 def get_messages_to(
     message_log: List[Any],
     recipient: str,
 ) -> List[Any]:
-    """Get all messages addressed to a specific recipient."""
     return [
         m for m in message_log
         if (m.get("recipient") if isinstance(m, dict) else m.recipient) == recipient
     ]
 
-
 class MessageMailbox:
-    """
-    Per-recipient indexed view of a message log.
-
-    Builds a dict index on construction so all lookups are O(1) instead of
-    O(n) scans over the flat message_log list.  Recreate when the log grows.
-
-    Usage:
-        mb = MessageMailbox(state.message_log)
-        msgs = mb.inbox("orchestrator")
-        last = mb.latest("orchestrator", intent=Intent.ANALYSIS_COMPLETE)
-    """
 
     def __init__(self, message_log: List[Any]) -> None:
         self._index: Dict[str, List[Any]] = {}
@@ -145,11 +101,9 @@ class MessageMailbox:
             self._index.setdefault(r, []).append(msg)
 
     def inbox(self, recipient: str) -> List[Any]:
-        """All messages addressed to *recipient*, in arrival order."""
         return self._index.get(recipient, [])
 
     def latest(self, recipient: str, intent: str = None) -> Optional[Any]:
-        """Most recent message to *recipient*, optionally filtered by intent."""
         msgs = self.inbox(recipient)
         if intent:
             msgs = [
@@ -164,23 +118,16 @@ class MessageMailbox:
         )[-1]
 
     def unread(self, recipient: str, after_timestamp: str) -> List[Any]:
-        """Messages to *recipient* with timestamp > *after_timestamp*."""
         return [
             m for m in self.inbox(recipient)
             if ((m.get("timestamp") if isinstance(m, dict) else m.timestamp) or "") > after_timestamp
         ]
-
 
 def get_latest_message(
     message_log: List[Any],
     intent: str = None,
     sender: str = None,
 ) -> Optional[Any]:
-    """
-    Get the most recent message matching filters.
-    Can filter by intent, sender, or both.
-    Returns None if no match found.
-    """
     matches = message_log
     if intent:
         matches = [m for m in matches if (m.get("intent") if isinstance(m, dict) else m.intent) == intent]
@@ -188,23 +135,16 @@ def get_latest_message(
         matches = [m for m in matches if (m.get("sender") if isinstance(m, dict) else m.sender) == sender]
     if not matches:
         return None
-    # Sort by timestamp (ISO8601 string — lexicographic sort is correct)
-    # Ensures chronologically latest message is returned even if delivered out of order
+
     matches = sorted(
         matches,
         key=lambda m: (m.get("timestamp") if isinstance(m, dict) else m.timestamp) or "",
     )
     return matches[-1]
 
-
 def get_completed_analysis_ids(
     message_log: List[Any],
 ) -> List[str]:
-    """
-    Returns list of analysis_ids that have sent
-    ANALYSIS_COMPLETE messages.
-    A2A sole source of truth for completed nodes.
-    """
     complete_msgs = get_messages_by_intent(
         message_log, Intent.ANALYSIS_COMPLETE
     )
@@ -214,15 +154,9 @@ def get_completed_analysis_ids(
         if (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
     ]
 
-
 def get_failed_analysis_ids(
     message_log: List[Any],
 ) -> List[str]:
-    """
-    Returns list of analysis_ids that have sent
-    ANALYSIS_FAILED messages.
-    A2A sole source of truth for failed nodes.
-    """
     failed_msgs = get_messages_by_intent(
         message_log, Intent.ANALYSIS_FAILED
     )
@@ -232,25 +166,15 @@ def get_failed_analysis_ids(
         if (m.get("payload", {}) if isinstance(m, dict) else m.payload).get("analysis_id")
     ]
 
-
 def is_dependency_resolved(
     depends_on: List[str],
     message_log: List[Any],
 ) -> bool:
-    """
-    Check if all dependency analysis_ids are complete.
-    Used by Coder Agent before starting a blocked analysis.
-    """
     completed = set(get_completed_analysis_ids(message_log))
     return all(dep in completed for dep in depends_on)
 
-
 @dataclass
 class MetricSpec:
-    """
-    Full specification for one node in the analysis DAG.
-    Created by Discovery Agent, executed by Coder Agent.
-    """
     id: str
     name: str
     description: str
@@ -276,15 +200,8 @@ class MetricSpec:
     def from_dict(cls, data: dict) -> "MetricSpec":
         return cls(**data)
 
-
 @dataclass
 class AnalysisResult:
-    """
-    Standardized result envelope returned by every
-    Coder Agent execution. Matches _make_result() in
-    analysis_library.py exactly.
-    The Synthesis Agent always receives this shape.
-    """
     analysis_id: str
     analysis_type: str
     status: str
@@ -317,24 +234,14 @@ class AnalysisResult:
         return cls(**data)
 
     def is_usable(self) -> bool:
-        """
-        True if result has meaningful content the
-        Synthesis Agent can work with.
-        """
         return (
             self.status == "success"
             and self.top_finding != ""
             and bool(self.data)
         )
 
-
 @dataclass
 class PipelineState:
-    """
-    Tracks the full execution state of the analysis DAG.
-    Stored in SessionState. Read by Orchestrator to decide
-    what to run next, what is blocked, what failed.
-    """
     session_id: str
     total_nodes: int = 0
     nodes: Dict[str, Any] = field(default_factory=dict)
@@ -348,8 +255,9 @@ class PipelineState:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
 
+    results: Dict[str, Any] = field(default_factory=dict)
+
     def get_status(self, analysis_id: str) -> str:
-        """Get status of a node."""
         node_data = self.nodes.get(analysis_id)
         if isinstance(node_data, dict):
             return node_data.get("status", NodeStatus.PENDING)
@@ -402,12 +310,6 @@ class PipelineState:
         completed_ids: List[str],
         failed_ids: List[str] = None
     ) -> List[str]:
-        """
-        Returns analysis IDs that are either pending with
-        no dependencies, or blocked but whose dependencies
-        are now all complete.
-        Called by Orchestrator after each ANALYSIS_COMPLETE.
-        """
         ready = []
         completed_set = set(completed_ids)
         failed_set = set(failed_ids) if failed_ids else set()
@@ -416,9 +318,7 @@ class PipelineState:
             status = self.get_status(aid)
             if status in (NodeStatus.PENDING, NodeStatus.BLOCKED):
                 depends_on = node_data.get("depends_on") or [] if isinstance(node_data, dict) else []
-                # Treat failed dependencies as satisfied — dependent nodes run on raw data.
-                # This prevents session_detection failure from cascading and blocking all
-                # behavioral analyses, which gracefully fall back to the unenriched CSV.
+
                 resolved_set = completed_set | failed_set
                 if all(dep in resolved_set for dep in depends_on):
                     ready.append(aid)

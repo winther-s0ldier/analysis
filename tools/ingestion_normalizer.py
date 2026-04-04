@@ -4,31 +4,12 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-
 SUPPORTED_EXTENSIONS = {
     ".csv", ".xlsx", ".xls",
     ".json", ".jsonl", ".parquet"
 }
 
-
 def normalize_file(file_path: str) -> dict:
-    """
-    Entry point. Takes any supported file and returns
-    a clean CSV path ready for the Profiler Agent.
-
-    Args:
-        file_path: Absolute path to uploaded file.
-
-    Returns:
-        dict with:
-            status: success | error | unsupported
-            csv_path: path to normalized CSV
-            original_format: detected format
-            row_count: rows in output
-            col_count: columns in output
-            warnings: list of non-fatal issues detected
-            original_filename: original file name
-    """
     path = Path(file_path)
     ext  = path.suffix.lower()
 
@@ -92,27 +73,13 @@ def normalize_file(file_path: str) -> dict:
             "original_format": ext,
         }
 
-
 def _get_output_path(file_path: str) -> str:
-    """
-    Deterministic output path.
-    Always saves next to original with _normalized.csv suffix.
-    Example: uploads/data.xlsx -> uploads/data_normalized.csv
-    """
     path = Path(file_path)
     return str(
         path.parent / f"{path.stem}_normalized.csv"
     )
 
-
 def _load_csv(file_path: str):
-    """
-    Load CSV handling:
-    - BOM (UTF-8 with BOM from Excel exports)
-    - Common encodings (utf-8, latin-1, cp1252)
-    - Blank rows at top
-    - Trailing whitespace in headers
-    """
     warnings = []
     df = None
 
@@ -142,15 +109,7 @@ def _load_csv(file_path: str):
 
     return df, warnings
 
-
 def _load_excel(file_path: str):
-    """
-    Load Excel handling:
-    - Multi-sheet: use first non-empty sheet
-    - Skip junk rows at top (find header row automatically)
-    - Merged cells: forward-fill
-    - Multiple header rows: flatten to single
-    """
     warnings = []
 
     xl = pd.ExcelFile(file_path)
@@ -220,14 +179,7 @@ def _load_excel(file_path: str):
 
     return df, warnings
 
-
 def _load_json(file_path: str):
-    """
-    Load JSON handling:
-    - Array of objects (most common API format)
-    - Single object with array values
-    - Nested objects: auto-flatten one level
-    """
     warnings = []
 
     with open(file_path, "r", encoding="utf-8") as f:
@@ -276,13 +228,7 @@ def _load_json(file_path: str):
 
     return df, warnings
 
-
 def _load_jsonl(file_path: str):
-    """
-    Load JSONL (newline-delimited JSON).
-    One JSON object per line.
-    Common format for event streams, log exports.
-    """
     warnings = []
     records  = []
     errors   = 0
@@ -315,12 +261,7 @@ def _load_jsonl(file_path: str):
 
     return df, warnings
 
-
 def _load_parquet(file_path: str):
-    """
-    Load Parquet file.
-    Handles nested columns by serializing to JSON strings.
-    """
     warnings = []
 
     try:
@@ -349,15 +290,7 @@ def _load_parquet(file_path: str):
 
     return df, warnings
 
-
 def _clean_dataframe(df: pd.DataFrame):
-    """
-    Apply standard cleaning to any loaded dataframe.
-    - Strip whitespace from string columns
-    - Clean column names (no spaces, special chars)
-    - Drop fully duplicate rows
-    - Reset index
-    """
     warnings = []
 
     original_cols = df.columns.tolist()
@@ -415,12 +348,8 @@ def _clean_dataframe(df: pd.DataFrame):
 
     return df, warnings
 
-
 def get_supported_extensions() -> list:
-    """Return list of supported file extensions."""
     return sorted(SUPPORTED_EXTENSIONS)
 
-
 def is_supported(file_path: str) -> bool:
-    """Check if a file extension is supported."""
     return Path(file_path).suffix.lower() in SUPPORTED_EXTENSIONS
