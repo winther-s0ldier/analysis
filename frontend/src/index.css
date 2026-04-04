@@ -149,3 +149,42 @@
   50%  { transform: scale(1.05); opacity: 1; }
   100% { transform: scale(0.95); opacity: 0.5; }
 }
+
+/* ── Mobile responsive overrides ─────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  html, body {
+    overflow: auto;
+  }
+
+  #root {
+    flex-direction: column;
+    min-height: 100%;
+    height: auto;
+    overflow: auto;
+  }
+
+  /* Push main content down to avoid overlap with fixed hamburger button */
+  main {
+    flex-direction: column !important;
+    min-height: 0;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* Chat column fills full width on mobile */
+  main > div:first-child {
+    width: 100% !important;
+    flex-shrink: 1 !important;
+  }
+
+  /* Hide canvas/report panel on very small screens */
+  main > div:last-child[style*="flex: 1"] {
+    display: none;
+  }
+
+  /* Give space at top for the hamburger button */
+  .flex-col.overflow-hidden > div:first-child {
+    padding-top: 0;
+  }
+}
+

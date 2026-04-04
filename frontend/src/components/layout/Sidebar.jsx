@@ -1,9 +1,9 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePipelineStore } from '../../store/pipelineStore';
 import {
   PanelLeftClose, PanelLeft,
-  Database, Search, Activity, Cpu, FileText, Upload,
+  Database, Search, Activity, Cpu, FileText, Upload, BarChart2,
 } from 'lucide-react';
 import { cn } from '../ui/Badge';
 
@@ -31,8 +31,9 @@ function getStageStatus(stageId, currentPhase) {
 }
 
 export function Sidebar() {
-  const { phase } = usePipelineStore();
-  const [collapsed, setCollapsed] = useState(false);
+  const { phase, sidebarCollapsed: collapsed, setSidebarCollapsed } = usePipelineStore();
+  const setCollapsed = (v) => setSidebarCollapsed(v);
+  const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
 
   return (
     <>
@@ -41,7 +42,18 @@ export function Sidebar() {
           <motion.aside
             key="sidebar"
             className="flex flex-col shrink-0 z-10 overflow-hidden"
-            style={{ backgroundColor: '#3D2B1A', borderRight: '1px solid rgba(255,255,255,0.07)' }}
+            style={{
+              backgroundColor: '#3D2B1A',
+              borderRight: '1px solid rgba(255,255,255,0.07)',
+              // On mobile: fixed overlay drawer; on desktop: inline
+              ...(isMobile ? {
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                height: '100%',
+                zIndex: 9999,
+              } : {}),
+            }}
             initial={{ width: 0, opacity: 0 }}
             animate={{ width: 220, opacity: 1 }}
             exit={{ width: 0, opacity: 0 }}
@@ -76,7 +88,7 @@ export function Sidebar() {
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', marginBottom: 8 }} />
 
             {/* Stage list */}
-            <nav className="flex-1 px-2 pb-4 overflow-y-auto space-y-0.5">
+            <nav className="flex-1 px-2 overflow-y-auto space-y-0.5">
               {STAGES.map((s) => {
                 const status = getStageStatus(s.id, phase);
                 const isActive   = status === 'active';
@@ -157,13 +169,47 @@ export function Sidebar() {
                 );
               })}
             </nav>
+
+            {/* Divider */}
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '0 0 8px' }} />
+
+            {/* User Activity button — bottom of expanded sidebar */}
+            <div className="px-2 pb-4 shrink-0">
+              <button
+                onClick={() => window.location.href = '/user-activity/'}
+                className="w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl transition-all duration-200"
+                style={{
+                  background: 'rgba(99,102,241,0.18)',
+                  border: '1px solid rgba(99,102,241,0.35)',
+                  cursor: 'pointer',
+                }}
+                onMouseEnter={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.30)'; e.currentTarget.style.borderColor = 'rgba(99,102,241,0.6)'; }}
+                onMouseLeave={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.18)'; e.currentTarget.style.borderColor = 'rgba(99,102,241,0.35)'; }}
+                title="Open User Activity Dashboard"
+              >
+                {/* Pulse dot */}
+                <span style={{
+                  width: 7, height: 7, borderRadius: '50%',
+                  background: '#22C55E', flexShrink: 0,
+                  animation: 'uaPulse 2s ease-in-out infinite',
+                }} />
+                <style>{`@keyframes uaPulse {
+                  0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
+                  70%  { box-shadow: 0 0 0 5px rgba(34,197,94,0); }
+                  100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
+                }`}</style>
+                <span className="text-[12.5px] font-semibold leading-none tracking-tight" style={{ color: '#C4C6FF' }}>
+                  User Activity
+                </span>
+              </button>
+            </div>
           </motion.aside>
         )}
       </AnimatePresence>
 
-      {/* Collapsed expand button */}
+      {/* Collapsed expand button — hidden on mobile (hamburger in App.jsx handles it) */}
       <AnimatePresence>
-        {collapsed && (
+        {collapsed && !isMobile && (
           <motion.div
             key="collapsed-rail"
             className="flex flex-col items-center pt-5 shrink-0 z-10"
@@ -190,7 +236,7 @@ export function Sidebar() {
 
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', width: '100%', marginTop: 12, marginBottom: 8 }} />
 
-            <div className="flex flex-col gap-1 px-1.5 w-full">
+            <div className="flex flex-col gap-1 px-1.5 w-full flex-1">
               {STAGES.map((s) => {
                 const status = getStageStatus(s.id, phase);
                 const isActive   = status === 'active';
@@ -215,6 +261,26 @@ export function Sidebar() {
                 );
               })}
             </div>
+
+            {/* User Activity icon — bottom of collapsed rail */}
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', width: '100%', marginBottom: 8 }} />
+            <button
+              onClick={() => window.location.href = '/user-activity/'}
+              className="w-8 h-8 flex items-center justify-center rounded-lg mb-4 transition-colors duration-200 relative"
+              style={{ color: 'rgba(255,255,255,0.35)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+              onMouseEnter={e => { e.currentTarget.style.color = '#22C55E'; e.currentTarget.style.background = 'rgba(34,197,94,0.1)'; }}
+              onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.35)'; e.currentTarget.style.background = 'transparent'; }}
+              title="User Activity Dashboard"
+            >
+              <BarChart2 size={15} />
+              {/* Live pulse indicator */}
+              <span style={{
+                position: 'absolute', top: 6, right: 6,
+                width: 5, height: 5, borderRadius: '50%',
+                background: '#22C55E',
+                animation: 'uaPulse 2s ease-in-out infinite',
+              }} />
+            </button>
           </motion.div>
         )}
       </AnimatePresence>

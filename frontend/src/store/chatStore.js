@@ -13,12 +13,17 @@ function msgCategory(type) {
   return PIPELINE_TYPES.has(type) ? 'pipeline' : 'conversation';
 }
 
+function genId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
 export const useChatStore = create((set) => ({
   messages: [], // { id, role, type, payload, category, timestamp }
   thinking: false, // true while Ask AI / chat is awaiting a backend response
 
   addMessage: (role, type, payload) => {
-    const id = crypto.randomUUID();
+    const id = genId();
     set((state) => ({
       messages: [...state.messages, { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() }]
     }));
@@ -26,7 +31,7 @@ export const useChatStore = create((set) => ({
   },
 
   insertAfterMessage: (afterId, role, type, payload) => {
-    const id = crypto.randomUUID();
+    const id = genId();
     set((state) => {
       const idx = state.messages.findIndex(m => m.id === afterId);
       const newMsg = { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() };
@@ -70,7 +75,7 @@ export const useChatStore = create((set) => ({
     );
     return {
       messages: [...filtered, {
-        id: crypto.randomUUID(),
+        id: genId(),
         role: 'ai',
         type: 'chart',
         category: 'pipeline',

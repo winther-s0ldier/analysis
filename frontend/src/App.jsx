@@ -15,6 +15,7 @@ import { useSSEStream } from './hooks/useSSEStream';
 import { Toaster } from 'sonner';
 import { useAutoAnimate } from '@formkit/auto-animate/react';
 import { motion } from 'framer-motion';
+import { Menu } from 'lucide-react';
 
 // ── Resizable Split Handle ─────────────────────────────────────────────────
 function ResizeHandle({ onDrag, onDragEnd }) {
@@ -75,11 +76,21 @@ function ResizeHandle({ onDrag, onDragEnd }) {
 
 function App() {
   const { wrapperRef, contentRef } = useLenis();
-  const { sessionId, phase, hasReport, canvasOpen } = usePipelineStore();
+  const { sessionId, phase, hasReport, canvasOpen, sidebarCollapsed, setSidebarCollapsed } = usePipelineStore();
   const { messages, addMessage, insertAfterMessage, thinking, setThinking } = useChatStore();
   const messagesEndRef = useRef(null);
   const [pipelineParent] = useAutoAnimate();
   const [conversationParent] = useAutoAnimate();
+
+  // Detect mobile viewport
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= 768);
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth <= 768);
+    window.addEventListener('resize', handler);
+    // On mobile, collapse sidebar by default
+    if (window.innerWidth <= 768) setSidebarCollapsed(true);
+    return () => window.removeEventListener('resize', handler);
+  }, [setSidebarCollapsed]);
 
   // Ask AI handler — used by SelectionPopover in the chat column and by CanvasPanel
   const handleChatAsk = useCallback(async (selectedText, question) => {
@@ -183,58 +194,63 @@ function App() {
     }
   }, [phase, sessionId, addMessage]);
 
+
   return (
     <>
       <Toaster position="bottom-right" richColors theme="light" closeButton />
-      <button
-        onClick={() => window.location.href = '/user-activity/'}
-        style={{
-          position: 'fixed',
-          bottom: 20,
-          left: 20,
-          zIndex: 9999,
-          display: 'flex',
-          alignItems: 'center',
-          gap: 7,
-          padding: '7px 13px',
-          background: '#6366F1',
-          color: '#FFFFFF',
-          border: 'none',
-          borderRadius: 20,
-          fontSize: 12,
-          fontWeight: 600,
-          fontFamily: 'inherit',
-          cursor: 'pointer',
-          boxShadow: '0 2px 10px rgba(0,0,0,0.22)',
-          letterSpacing: '0.01em',
-          transition: 'background 0.15s, transform 0.1s',
-        }}
-        onMouseEnter={e => e.currentTarget.style.background = '#4F46E5'}
-        onMouseLeave={e => e.currentTarget.style.background = '#6366F1'}
-        onMouseDown={e => e.currentTarget.style.transform = 'scale(0.96)'}
-        onMouseUp={e => e.currentTarget.style.transform = 'scale(1)'}
-        title="Open User Activity Dashboard"
-      >
-        <span style={{
-          width: 7, height: 7, borderRadius: '50%', background: '#22C55E', flexShrink: 0,
-          boxShadow: '0 0 0 0 rgba(34,197,94,0.6)',
-          animation: 'uaPulse 2s ease-in-out infinite',
-        }} />
-        User Activity
-        <style>{`@keyframes uaPulse {
-          0%   { box-shadow: 0 0 0 0 rgba(34,197,94,0.5); }
-          70%  { box-shadow: 0 0 0 5px rgba(34,197,94,0); }
-          100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); }
-        }`}</style>
-      </button>
+
+      {/* Mobile hamburger — only visible on mobile, always accessible */}
+      {isMobile && (
+        <button
+          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          style={{
+            position: 'fixed',
+            top: 12,
+            left: 12,
+            zIndex: 10000,
+            width: 36,
+            height: 36,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            background: '#3D2B1A',
+            color: '#F0EBE3',
+            border: 'none',
+            borderRadius: 10,
+            boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+            cursor: 'pointer',
+          }}
+          aria-label="Toggle sidebar"
+        >
+          <Menu size={18} />
+        </button>
+      )}
+
+      {/* Mobile sidebar overlay backdrop */}
+      {isMobile && !sidebarCollapsed && (
+        <div
+          onClick={() => setSidebarCollapsed(true)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.45)',
+            zIndex: 9998,
+          }}
+        />
+      )}
+
       <TopProgressBar />
       <Sidebar />
-      <main ref={mainRef} className="flex-1 flex overflow-hidden bg-bg-page relative font-sans">
-        {/* Chat column — shrinks when canvas is open */}
+      <main
+        ref={mainRef}
+        className="flex-1 flex overflow-hidden bg-bg-page relative font-sans"
+        style={isMobile ? { flexDirection: 'column' } : {}}
+      >
+        {/* Chat column */}
         <div
           className="flex flex-col overflow-hidden"
           style={{
-            width: canvasOpen ? `${chatPct}%` : '100%',
+            width: isMobile ? '100%' : (canvasOpen ? `${chatPct}%` : '100%'),
             minWidth: 0,
             flexShrink: 0,
             transition: isDragging ? 'none' : 'width 0.3s ease',
@@ -251,7 +267,7 @@ function App() {
             <div
               ref={contentRef}
               className="w-full mx-auto flex flex-col gap-[18px] flex-1"
-              style={{ padding: '48px 24px 16px', maxWidth: canvasOpen ? '100%' : 720 }}
+              style={{ padding: isMobile ? '64px 16px 80px' : '48px 24px 16px', maxWidth: canvasOpen ? '100%' : 720 }}
             >
               {(() => {
                 const pipelineMessages = messages.filter(m => m.category === 'pipeline');
