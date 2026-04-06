@@ -1692,7 +1692,7 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
             pipe_state = get_pipeline_state(session_id)
             effective_state = pipe_state or state
             dag = getattr(state, "dag", []) or []
-            prompt, images = build_synthesis_prompt(session_id, effective_state, dag)
+            prompt, images = build_synthesis_prompt(session_id, effective_state, dag, output_folder=getattr(state, "output_folder", None))
             if user_instructions:
                 prompt = prompt + f"\n\nUSER INSTRUCTIONS FOR THIS SYNTHESIS:\n{user_instructions}\n"
 

@@ -174,7 +174,7 @@ def get_post_dag_agent():
     )
     return _post_dag_agent_instance
 
-def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
+def build_synthesis_prompt(session_id: str, state, dag: list = None, output_folder: str = None) -> tuple:
     dag = dag or getattr(state, "dag", []) or []
 
     def _clean(obj):
@@ -275,7 +275,7 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None) -> tuple:
         f"3. Build the synthesis JSON using the fact sheet above. "
         f"Cite [NodeID] + specific number for every insight. "
         f"conversational_report MUST contain '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
-        f"4. Call tool_submit_synthesis(session_id, synthesis_json_str) immediately after step 3."
+        f"4. Call tool_submit_synthesis(session_id='{session_id}', synthesis_json_str=..., output_folder='{output_folder}') immediately after step 3."
     )
 
     images = []
@@ -574,7 +574,7 @@ async def run_full_pipeline(
             except Exception as _rce:
                 print(f"WARNING: [A2A] results cache write failed: {_rce}")
 
-        synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag)
+        synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag, output_folder=output_folder)
 
         _mode = "A2A HTTP" if _USE_A2A_MULTISERVER else "SequentialAgent (ADK-native)"
         print(f"INFO: [{session_id}] Stages 4-6  - Synthesis -> Critic -> Report ({_mode})")
