@@ -1149,8 +1149,13 @@ async def _execute_single_node(
                 agent_getter="coder",
             )
 
-        code_match = re.search(r"```python\s*(.*?)\s*```", response, re.DOTALL)
-        code = code_match.group(1) if code_match else response.strip()
+        import re
+        code_match = re.search(r"```(?:python)?\s*(.*?)\s*```", response, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            code = code_match.group(1).strip()
+        else:
+            func_match = re.search(r"(import\s+pandas.*|def\s+analyze.*)", response, re.DOTALL | re.IGNORECASE)
+            code = func_match.group(1).strip() if func_match else response.strip()
 
     try:
 
