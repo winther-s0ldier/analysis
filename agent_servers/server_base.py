@@ -14,6 +14,7 @@ except ImportError:
 
 _raw = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if _raw:
+    _raw = _raw.strip('"\'')
     os.environ.setdefault("GOOGLE_API_KEY", _raw)
     os.environ.setdefault("GEMINI_API_KEY", _raw)
 
