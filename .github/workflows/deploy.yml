@@ -16,13 +16,40 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           timeout: 600s
           script: |
+            set -e
             cd /home/ubuntu/analysis
-            git stash
+
+            # Pull latest code (stash any local changes)
+            git stash || true
             git pull origin main
+
+            # Ensure required runtime dirs exist
+            mkdir -p logs output uploads data
+
+            # Ensure .env exists (with GOOGLE_API_KEY set on server)
+            if [ ! -f .env ]; then
+              echo "WARNING: .env file missing on server — pipeline will fail without GOOGLE_API_KEY"
+            fi
+
+            # Install / upgrade Python dependencies
             source venv/bin/activate
             pip install -r requirements.txt --quiet
+
+            # Build frontend (Vite → dist/)
             cd frontend
             npm install --quiet
             npm run build
             cd ..
+
+            # Update supervisord config and reload ALL processes
+            sudo cp supervisord.conf /etc/supervisor/conf.d/adhopsun.conf
+            sudo supervisorctl reread
+            sudo supervisorctl update
+
+            # Restart everything: agents first, then main backend
+            sudo supervisorctl restart all-agents:*
+            sleep 8
             sudo supervisorctl restart adk
+
+            echo "✅ Deploy complete"
+            sudo supervisorctl status
