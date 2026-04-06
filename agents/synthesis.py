@@ -410,7 +410,7 @@ def tool_submit_synthesis(
     session_id: Annotated[str, Field(description="Active pipeline session ID")],
     synthesis_json_str: Annotated[str, Field(description="Complete synthesis result as a JSON string matching the required output schema")],
     reasoning_notes: Annotated[str, Field(description="2-3 sentence summary of key deductions made during synthesis. Stored and injected on retry.", default="")] = "",
-    output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.", default="")] = "",
+    output_folder: Annotated[str, Field(description="Absolute path to the session output directory. Copy exactly from the prompt.")],
     tool_context=None,
 ) -> str:
     try:
