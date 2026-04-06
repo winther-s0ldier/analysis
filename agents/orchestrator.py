@@ -192,11 +192,15 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
             n.get("analysis_type"): n.get("id")
             for n in dag if n.get("id") and n.get("analysis_type")
         }
-        for _aid, _res in state.results.items():
-            if not isinstance(_res, dict): continue
-            _atype = _res.get("analysis_type", "unknown")
-            _nid   = _atype_to_id.get(_atype, _aid)
-            _fact_sheet[_nid] = _efs(_nid, _aid, _res)
+        _node_confs = [float(_res.get("confidence", 0) or 0) for _res in state.results.values()
+                       if isinstance(_res, dict) and float(_res.get("confidence", 0) or 0) > 0.05]
+        _avg_conf = sum(_node_confs) / len(_node_confs) if _node_confs else 0.85
+        _reliability_pct = int(_avg_conf * 100)
+
+        _fact_sheet["metadata"] = {
+            "aggregate_data_reliability": f"{_reliability_pct}%",
+            "reliability_assessment_context": "Calculated across all analysis nodes. 100% is near-total certainty."
+        }
         _fact_json = json.dumps(_clean(_fact_sheet), indent=2)
     except Exception as _e:
         _fact_json = "{}"
@@ -274,6 +278,8 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
         f"Keep thinking to 3-5 sentences. Do NOT write a long essay.\n"
         f"3. Build the synthesis JSON using the fact sheet above. "
         f"Cite [NodeID] + specific number for every insight. "
+        f"In '# Confidence Assessment', MUST EXPLAIN why the 'aggregate_data_reliability' is "
+        f"{_reliability_pct}% based on which specific nodes were noisy or strong.\n"
         f"conversational_report MUST contain '# Key Findings', '# Action Roadmap', '# Confidence Assessment'.\n"
         f"4. Call tool_submit_synthesis(session_id='{session_id}', synthesis_json_str=..., output_folder='{output_folder}') immediately after step 3."
     )
