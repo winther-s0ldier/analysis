@@ -666,6 +666,9 @@ async def index():
     html_path = BASE_DIR / "frontend" / "dist" / "index.html"
     return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
 
+# Mount the Vite assets folder so JS and CSS load properly
+app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")), name="assets")
+
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
     if not is_supported(file.filename):
