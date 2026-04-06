@@ -230,16 +230,17 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     generated_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     title = csv_filename or "Analytics Report"
 
-    _SEV_COLOR = {"critical": "#DC2626", "high": "#D97706", "medium": "#2563EB", "low": "#059669", "info": "#6B7280"}
-    _SEV_BG    = {"critical": "#FEF2F2", "high": "#FFFBEB", "medium": "#EFF6FF", "low": "#F0FDF4", "info": "#F9FAFB"}
-    _SEV_LABEL = {"critical": "CRITICAL", "high": "HIGH",   "medium": "MEDIUM",  "low": "LOW",    "info": "INFO"}
+    _SEV_COLOR = {"critical": "#BE123C", "high": "#B45309", "medium": "#1E40AF", "low": "#065F46", "info": "#475569"}
+    _SEV_BG    = {"critical": "#FFF1F2", "high": "#FFFBEB", "medium": "#EFF6FF", "low": "#ECFDF5", "info": "#F8FAFC"}
+    _SEV_LABEL = {"critical": "CRITICAL RISK", "high": "HIGH PRIORITY", "medium": "MODERATE", "low": "LOW", "info": "INFO"}
 
-    def sc(s): return _SEV_COLOR.get(s, "#6B7280")
-    def sb(s): return _SEV_BG.get(s, "#F9FAFB")
+    def sc(s): return _SEV_COLOR.get(s, "#475569")
+    def sb(s): return _SEV_BG.get(s, "#F8FAFC")
     def sl(s): return _SEV_LABEL.get(s, s.upper())
 
     def norm_sev(s, fallback="medium"):
         s = (s or fallback).lower()
+        if s == "high" and "critical" in (s or ""): s = "critical"
         return s if s in _SEV_COLOR else fallback
 
     def badge(sev):
@@ -403,10 +404,10 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
     crit_bg2 = "#ECFDF5" if _conf_pct >= 90 else "#FFFBEB" if _conf_pct >= 70 else "#FEF2F2"
 
     def stat_card(value, label, color, bg):
-        return (f'<div style="flex:1;min-width:130px;background:{bg};border:1px solid {color}22;'
-                f'border-top:3px solid {color};border-radius:8px;padding:16px 18px;text-align:center;">'
-                f'<div style="font-size:28px;font-weight:800;color:{color};line-height:1;margin-bottom:4px;">{value}</div>'
-                f'<div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:#6B7280;">{label}</div>'
+        return (f'<div style="flex:1;min-width:130px;background:#fff;border:1px solid #E2E8F0;'
+                f'border-top:4px solid {color};border-radius:12px;padding:20px 22px;text-align:left;box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1);">'
+                f'<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:#64748B;margin-bottom:6px;">{label}</div>'
+                f'<div style="font-size:32px;font-weight:800;color:{color};line-height:1;">{value}</div>'
                 f'</div>')
 
     kpi_row = (
@@ -881,12 +882,16 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             f'</a>'
         )
     toc_html = (
-        f'<div style="background:#fff;border:1px solid #E5E7EB;border-radius:10px;'
-        f'padding:22px 24px;margin-bottom:36px;page-break-inside:avoid;">'
-        f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;'
-        f'color:#9CA3AF;margin-bottom:14px;">Contents</div>'
-        f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px;">'
+        f'<div style="background:#fff;border:1px solid #E2E8F0;border-radius:12px;'
+        f'padding:32px;margin-bottom:48px;box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);">'
+        f'<div style="font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:0.1em;'
+        f'color:#94A3B8;margin-bottom:20px;">Report Navigation</div>'
+        f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;">'
         f'{toc_items_html}</div></div>'
+        f'<div style="margin-bottom:48px;padding:24px;background:#F8FAFC;border-radius:12px;border:1px solid #E2E8F0;display:flex;gap:20px;align-items:center;">'
+        f'<div style="background:#10B981;color:white;padding:10px 14px;border-radius:8px;font-weight:800;font-size:14px;">Insight</div>'
+        f'<div style="font-size:14px;color:#475569;line-height:1.5;">This AI-generated analysis follows the <strong>Pyramid Principle</strong>: conclusions and strategic recommendations are presented before technical data.</div>'
+        f'</div>'
     ) if toc_items_html else ""
 
     def section(anchor, label, body, divider=False):
@@ -938,17 +943,18 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
   }}
   /* Cover */
   .cover {{
-    background: linear-gradient(135deg, #0F1F3D 0%, #1E3A6E 60%, #1a3a5c 100%);
-    color: white; padding: 48px 48px 36px 48px;
+    background: #0F172A; /* Deep McKinsey Navy */
+    color: white; padding: 64px 48px 48px 48px;
+    border-bottom: 6px solid #10B981; /* Strategic Emerald Accent */
   }}
   .cover-eyebrow {{
     font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.12em; color: rgba(255,255,255,0.5); margin-bottom: 12px;
+    letter-spacing: 0.15em; color: #10B981; margin-bottom: 16px;
   }}
   .cover-title {{
-    font-size: 28px; font-weight: 800; color: #fff;
-    letter-spacing: -0.5px; line-height: 1.2; margin-bottom: 12px;
-    max-width: 700px;
+    font-size: 36px; font-weight: 800; color: #fff;
+    letter-spacing: -1px; line-height: 1.1; margin-bottom: 16px;
+    max-width: 800px;
   }}
   .cover-meta {{
     font-size: 12.5px; color: rgba(255,255,255,0.5);
@@ -1018,13 +1024,20 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
 </div>
 
 <!-- Hero statement band -->
-{f'''<div class="hero-band" style="background:#0F1F3D;border-top:1px solid rgba(255,255,255,0.08);padding:28px 48px;">
-  <div style="max-width:1036px;margin:0 auto;">
-    <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;
-                color:{hero_col};margin-bottom:8px;">Top Finding</div>
-    <div style="font-size:20px;font-weight:800;color:#fff;line-height:1.3;margin-bottom:8px;
-                max-width:800px;">{hero_title}</div>
-    <p style="font-size:13.5px;color:rgba(255,255,255,0.6);line-height:1.7;margin:0;max-width:720px;">{hero_summary}</p>
+{f'''<div class="hero-band" style="background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:40px 48px;">
+  <div style="max-width:1036px;margin:0 auto;display:flex;gap:40px;align-items:flex-start;">
+    <div style="flex:1;">
+      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;
+                  color:#10B981;margin-bottom:12px;">Strategic Priority</div>
+      <div style="font-size:24px;font-weight:800;color:#0F172A;line-height:1.2;margin-bottom:16px;
+                  letter-spacing:-0.02em;">{hero_title}</div>
+      <p style="font-size:15px;color:#475569;line-height:1.7;margin:0;max-width:700px;">{hero_summary}</p>
+    </div>
+    {f'<div style="width:1px;height:120px;background:#E2E8F0;"></div><div style="width:200px;flex-shrink:0;">'
+     f'<div style="font-size:10px;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:8px;">Data Quality</div>'
+     f'<div style="font-size:24px;font-weight:800;color:{crit_col};">{_conf_pct}%</div>'
+     f'<div style="font-size:11px;color:#64748B;line-height:1.4;">Reliability index for current session.</div>'
+     f'</div>' if _conf_pct else ''}
   </div>
 </div>''' if hero_title or hero_summary else ''}
 
