@@ -21,8 +21,8 @@ agents:
   max_turns:
     discovery: 12         # main.py /discover endpoint
     critic: 8             # main.py rerun-synthesis critic call
-    intent_classify: 1    # main.py chat intent classification
-    chat: 4               # main.py chat Q&A response
+    intent_classify: 2    # main.py chat intent classification
+    chat: 10              # main.py chat Q&A response
     post_dag: 150         # orchestrator.py synthesis+critic+dag_builder sequential agent
     default: 15           # main.py run_agent_pipeline fallback default
 

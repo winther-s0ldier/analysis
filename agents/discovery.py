@@ -236,16 +236,18 @@ def tool_submit_analysis_plan(
                 "status": "pending"
             })
 
-        _seen_types: set = set()
+        _seen_keys: set = set()
         _deduped: list = []
         _deduped_ui: list = []
         for _n, _m in zip(final_dag, metrics_ui):
             _at = _n.get("analysis_type")
-            if _at and _at in _seen_types:
-                print(f"INFO: Dropping duplicate analysis_type='{_at}' (node {_n.get('id')})")
+            _cr = json.dumps(_n.get("column_roles", {}), sort_keys=True)
+            _dedup_key = (_at, _cr)
+            if _at and _dedup_key in _seen_keys:
+                print(f"INFO: Dropping duplicate analysis_type='{_at}' with same columns (node {_n.get('id')})")
                 continue
             if _at:
-                _seen_types.add(_at)
+                _seen_keys.add(_dedup_key)
             _deduped.append(_n)
             _deduped_ui.append(_m)
         final_dag = _deduped
@@ -288,7 +290,7 @@ def tool_submit_analysis_plan(
         _plan_store[session_id] = plan
 
         try:
-            from agent_servers.a2a_orchestrator import lookup_session as _lookup_s
+            from agent_servers.a2a_client import lookup_session as _lookup_s
             _abs_out = _lookup_s(session_id)
             if _abs_out:
                 os.makedirs(_abs_out, exist_ok=True)

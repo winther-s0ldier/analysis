@@ -337,7 +337,54 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             import markdown as _md
             conv_h = _md.markdown(conv_rep, extensions=["tables", "fenced_code"])
         except Exception:
-            conv_h = f'<pre style="white-space:pre-wrap;font-size:13px;line-height:1.65;">{conv_rep}</pre>'
+            # Fallback: lightweight regex-based markdown → HTML (no external deps)
+            import html as _html
+            import re as _re
+            _s = _html.escape(conv_rep)
+            # headings
+            _s = _re.sub(r'^### (.+)$', r'<h3 style="font-size:15px;font-weight:700;margin:18px 0 6px;">\1</h3>', _s, flags=_re.MULTILINE)
+            _s = _re.sub(r'^## (.+)$',  r'<h2 style="font-size:17px;font-weight:700;margin:22px 0 8px;">\1</h2>', _s, flags=_re.MULTILINE)
+            _s = _re.sub(r'^# (.+)$',   r'<h1 style="font-size:20px;font-weight:700;margin:26px 0 10px;">\1</h1>', _s, flags=_re.MULTILINE)
+            # bold / italic
+            _s = _re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', _s)
+            _s = _re.sub(r'\*(.+?)\*',     r'<em>\1</em>', _s)
+            # unordered list items
+            _s = _re.sub(r'^[-*] (.+)$', r'<li style="margin-bottom:4px;">\1</li>', _s, flags=_re.MULTILINE)
+            _s = _re.sub(r'(<li.*</li>)', r'<ul style="padding-left:20px;margin:8px 0;">\1</ul>', _s, flags=_re.DOTALL)
+            # horizontal rule
+            _s = _re.sub(r'^---+$', r'<hr style="border:none;border-top:1px solid #E5E7EB;margin:16px 0;">', _s, flags=_re.MULTILINE)
+            # simple table rows (|col|col|)
+            def _tbl(m):
+                rows = [r.strip() for r in m.group(0).strip().split('\n') if '|' in r and not _re.match(r'^[\|\s\-:]+$', r)]
+                if not rows: return m.group(0)
+                html_rows = []
+                for i, row in enumerate(rows):
+                    cells = [c.strip() for c in row.strip('|').split('|')]
+                    tag = 'th' if i == 0 else 'td'
+                    style = 'padding:8px 12px;border:1px solid #E5E7EB;' + ('font-weight:600;background:#F9FAFB;' if i == 0 else '')
+                    html_rows.append('<tr>' + ''.join(f'<{tag} style="{style}">{c}</{tag}>' for c in cells) + '</tr>')
+                return '<table style="border-collapse:collapse;width:100%;margin:12px 0;">' + ''.join(html_rows) + '</table>'
+            _s = _re.sub(r'((?:^\|.+\|\n?)+)', _tbl, _s, flags=_re.MULTILINE)
+            # wrap remaining plain text lines in paragraphs
+            def _paras(text):
+                out, buf = [], []
+                for line in text.split('\n'):
+                    stripped = line.strip()
+                    if not stripped:
+                        if buf:
+                            out.append(f'<p style="margin:8px 0;line-height:1.75;color:#374151;">{"".join(buf)}</p>')
+                            buf = []
+                    elif stripped.startswith('<'):
+                        if buf:
+                            out.append(f'<p style="margin:8px 0;line-height:1.75;color:#374151;">{"".join(buf)}</p>')
+                            buf = []
+                        out.append(stripped)
+                    else:
+                        buf.append(stripped + ' ')
+                if buf:
+                    out.append(f'<p style="margin:8px 0;line-height:1.75;color:#374151;">{"".join(buf)}</p>')
+                return '\n'.join(out)
+            conv_h = _paras(_s)
     else:
         conv_h = ""
 

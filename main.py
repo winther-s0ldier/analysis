@@ -187,6 +187,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+HISTORY_FILE = OUTPUT_DIR / "history_index.json"
 
 def _build_session_service():
     _redis_url = os.getenv("REDIS_URL")
@@ -234,6 +235,7 @@ class SessionState:
         self.user_instructions: str = ""
         self.conversation_history: list = []
         self.clarification_request: dict = {}
+        self.csv_hash: str = ""
 
     def post_message(self, message) -> None:
         d = message.to_dict()
@@ -284,6 +286,7 @@ class SessionState:
             "user_instructions":    self.user_instructions,
             "conversation_history": self.conversation_history,
             "message_count":        len(self.message_log),
+            "csv_hash":             self.csv_hash,
         }
 
     @classmethod
@@ -307,6 +310,7 @@ class SessionState:
         state.gate_result          = d.get("gate_result", {})
         state.user_instructions    = d.get("user_instructions", "")
         state.conversation_history = d.get("conversation_history", [])
+        state.csv_hash             = d.get("csv_hash", "")
         return state
 
 sessions: Dict[str, SessionState] = {}
@@ -324,8 +328,15 @@ async def _cleanup_stale_sessions() -> None:
             if (now - getattr(state, "created_at", now)) > _SESSION_MAX_AGE
         ]
         for sid in stale:
-            sessions.pop(sid, None)
+            _stale_state = sessions.pop(sid, None)
             _sse_events.pop(sid, None)
+            # Free cached DataFrame for this session's CSV
+            if _stale_state and getattr(_stale_state, "csv_path", None):
+                try:
+                    from tools.csv_profiler import clear_df_cache
+                    clear_df_cache(_stale_state.csv_path)
+                except Exception:
+                    pass
 
             try:
                 from agents.synthesis import _synthesis_store, _reasoning_store
@@ -375,6 +386,73 @@ def _restore_sessions_from_redis() -> None:
             print(f"INFO: Restored {restored} session(s) from Redis")
     except Exception as e:
         print(f"WARNING: Redis session restore failed: {e}")
+
+# ── History helpers ───────────────────────────────────────────────────────────
+
+def _load_history() -> list:
+    """Return list of history entries from disk, newest-first."""
+    try:
+        if HISTORY_FILE.exists():
+            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception as _he:
+        print(f"WARNING: Could not read history index: {_he}")
+    return []
+
+
+def _save_to_history(state: "SessionState") -> None:
+    """Append or update an entry in the persistent history index."""
+    import time as _time
+    try:
+        entries = _load_history()
+        # Update existing entry if session already recorded
+        entry = next((e for e in entries if e.get("session_id") == state.session_id), None)
+        top_priority = ""
+        node_count = len(state.dag)
+        if state.synthesis:
+            exec_summary = state.synthesis.get("executive_summary", {})
+            priorities = exec_summary.get("top_priorities", [])
+            if priorities:
+                top_priority = str(priorities[0])[:120]
+        _rp = state.raw_profile if state.raw_profile else {}
+        row_count = _rp.get("row_count", 0)
+        _ct = _rp.get("column_types", {})
+        col_count = len((_ct.get("numeric", []) or []) + (_ct.get("categorical", []) or []) + (_ct.get("datetime", []) or []))
+
+        new_entry = {
+            "session_id":   state.session_id,
+            "csv_filename": state.csv_filename,
+            "csv_hash":     state.csv_hash,
+            "csv_path":     state.csv_path,
+            "created_at":   state.created_at,
+            "completed_at": _time.time(),
+            "dataset_type": state.dataset_type,
+            "row_count":    row_count,
+            "col_count":    col_count,
+            "node_count":   node_count,
+            "top_priority": top_priority,
+            "has_report":   os.path.exists(os.path.join(state.output_folder, "report.html")),
+            "output_folder": state.output_folder,
+            "status":       "complete",
+        }
+        if entry:
+            entries = [new_entry if e.get("session_id") == state.session_id else e for e in entries]
+        else:
+            entries.insert(0, new_entry)
+        HISTORY_FILE.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    except Exception as _he:
+        print(f"WARNING: Could not save history entry for {state.session_id}: {_he}")
+
+
+def _find_cached_session(csv_hash: str) -> dict | None:
+    """Return the history entry for a previously completed session with the same CSV hash."""
+    if not csv_hash:
+        return None
+    for entry in _load_history():
+        if entry.get("csv_hash") == csv_hash and entry.get("status") == "complete":
+            return entry
+    return None
+
+# ── SSE events ────────────────────────────────────────────────────────────────
 
 _sse_events: Dict[str, list] = {}
 
@@ -571,10 +649,16 @@ def extract_json(response: str) -> dict:
         return {"error": str(e), "raw": response[:500]}
 
 async def _validate_via_llm(prompt: str) -> dict:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     from tools.model_config import get_model
-    model = genai.GenerativeModel(get_model("discovery"))
-    response = model.generate_content(prompt)
+    client = genai.Client()
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=get_model("discovery"),
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(temperature=0.1),
+    )
     return extract_json(response.text) or {}
 
 @app.get("/", response_class=HTMLResponse)
@@ -606,6 +690,114 @@ async def upload_csv(file: UploadFile = File(...)):
     saved_file_path = UPLOAD_DIR / f"{output_folder}{ext}"
 
     content = await file.read()
+
+    # Compute hash before writing so we can detect duplicate uploads
+    import hashlib as _hashlib
+    csv_hash = _hashlib.sha256(content).hexdigest()
+    cached_entry = _find_cached_session(csv_hash)
+    if cached_entry:
+        # Same CSV detected — create a brand-new session but pre-load profile + DAG
+        # from the old session's caches so we skip re-running those expensive steps.
+        # The user gets a fresh session they can work with normally (add metrics, run, etc.)
+        old_output = Path(cached_entry.get("output_folder", ""))
+        _profile_data: dict = {}
+        _discovery_data: dict = {}
+
+        _pcp = old_output / "_profile_cache.json"
+        if _pcp.exists():
+            try:
+                _pc = json.loads(_pcp.read_text(encoding="utf-8"))
+                _raw = _pc.get("raw_profile", {})
+                _cls = _pc.get("classification", {})
+                _profile_data = {
+                    "profile": {
+                        "filename":     _raw.get("filename", cached_entry.get("csv_filename", "")),
+                        "row_count":    _raw.get("row_count", cached_entry.get("row_count", 0)),
+                        "column_count": _raw.get("column_count", cached_entry.get("col_count", 0)),
+                        "columns":      _raw.get("columns", []),
+                        "column_types": _raw.get("column_types", {}),
+                        "correlations": _raw.get("correlations"),
+                        "memory_mb":    _raw.get("memory_mb"),
+                        "column_roles": _raw.get("column_roles", {}),
+                    },
+                    "classification": _cls,
+                    "dataset_type":   _cls.get("dataset_type", cached_entry.get("dataset_type", "")),
+                    "row_count":      _raw.get("row_count", cached_entry.get("row_count", 0)),
+                    "column_count":   _raw.get("column_count", cached_entry.get("col_count", 0)),
+                    "status": "profiled",
+                }
+            except Exception:
+                pass
+
+        _dcp = old_output / "_plan_cache.json"
+        if _dcp.exists():
+            try:
+                _dc = json.loads(_dcp.read_text(encoding="utf-8"))
+                _discovery_data = {
+                    "dag":          _dc.get("dag", []),
+                    "node_count":   len(_dc.get("dag", [])),
+                    "dataset_type": cached_entry.get("dataset_type", ""),
+                    "status":       "discovered",
+                }
+            except Exception:
+                pass
+
+        # Write the CSV to uploads so the new session has a valid csv_path
+        def _write_cached():
+            with open(saved_file_path, "wb") as f:
+                f.write(content)
+        await asyncio.to_thread(_write_cached)
+
+        norm_result = normalize_file(str(saved_file_path.resolve()))
+        new_csv_path = norm_result.get("csv_path", str(saved_file_path))
+
+        new_output_folder = output_folder
+        (OUTPUT_DIR / new_output_folder).mkdir(exist_ok=True)
+
+        new_state = SessionState(session_id)
+        new_state.csv_path = new_csv_path
+        new_state.csv_filename = cached_entry.get("csv_filename", file.filename)
+        new_state.output_folder = str(OUTPUT_DIR / new_output_folder)
+        new_state.csv_hash = csv_hash
+
+        if _profile_data:
+            _raw2 = _profile_data.get("profile", {})
+            new_state.raw_profile = {
+                "filename":     _raw2.get("filename", ""),
+                "row_count":    _raw2.get("row_count", 0),
+                "column_count": _raw2.get("column_count", 0),
+                "columns":      _raw2.get("columns", []),
+                "column_types": _raw2.get("column_types", {}),
+                "correlations": _raw2.get("correlations"),
+                "memory_mb":    _raw2.get("memory_mb"),
+                "column_roles": _raw2.get("column_roles", {}),
+            }
+            new_state.semantic_map = _profile_data.get("classification", {})
+            new_state.dataset_type = new_state.semantic_map.get("dataset_type", "")
+            new_state.status = "profiled"
+
+        if _discovery_data.get("dag"):
+            new_state.dag = _discovery_data["dag"]
+            new_state.status = "discovered"
+
+        sessions[session_id] = new_state
+
+        return {
+            "session_id":       session_id,
+            "output_folder":    new_output_folder,
+            "filename":         new_state.csv_filename,
+            "format":           "csv",
+            "rows":             new_state.raw_profile.get("row_count", cached_entry.get("row_count", 0)),
+            "columns":          new_state.raw_profile.get("column_count", cached_entry.get("col_count", 0)),
+            "Gate":             "pass",
+            "warnings":         [],
+            "status":           new_state.status,
+            "profile_cached":   bool(_profile_data),
+            "dag_cached":       bool(_discovery_data.get("dag")),
+            "profile":          _profile_data if _profile_data else None,
+            "discovery":        _discovery_data if _discovery_data else None,
+        }
+
     def _write_upload():
         with open(saved_file_path, "wb") as f:
             f.write(content)
@@ -647,6 +839,7 @@ async def upload_csv(file: UploadFile = File(...)):
     state.csv_path = csv_path
     state.csv_filename = norm_result["original_filename"]
     state.output_folder = str(OUTPUT_DIR / output_folder)
+    state.csv_hash = csv_hash
     state.normalization = {
         "original_filename": norm_result["original_filename"],
         "original_format":   norm_result["original_format"],
@@ -674,6 +867,56 @@ async def profile_dataset(session_id: str):
         raise HTTPException(404, "Session not found")
 
     state = sessions[session_id]
+
+    # Return cached profile immediately if already computed this session
+    if state.raw_profile:
+        raw = state.raw_profile
+        return {
+            "session_id": session_id,
+            "status": "profiled",
+            "profile": {
+                "filename":     raw.get("filename"),
+                "row_count":    raw.get("row_count"),
+                "column_count": raw.get("column_count"),
+                "columns":      raw.get("columns"),
+                "column_types": raw.get("column_types", {}),
+                "correlations": raw.get("correlations"),
+                "memory_mb":    raw.get("memory_mb"),
+                "column_roles": raw.get("column_roles", {}),
+            },
+            "classification": state.semantic_map,
+            "cached": True,
+        }
+
+    # Also try loading from disk if it was persisted in a previous run
+    _profile_cache_path = Path(state.output_folder) / "_profile_cache.json"
+    if _profile_cache_path.exists():
+        try:
+            _cached = json.loads(_profile_cache_path.read_text(encoding="utf-8"))
+            state.raw_profile = _cached.get("raw_profile", {})
+            state.semantic_map = _cached.get("classification", {})
+            state.dataset_type = state.semantic_map.get("dataset_type", "")
+            state.status = "profiled"
+            raw = state.raw_profile
+            return {
+                "session_id": session_id,
+                "status": "profiled",
+                "profile": {
+                    "filename":     raw.get("filename"),
+                    "row_count":    raw.get("row_count"),
+                    "column_count": raw.get("column_count"),
+                    "columns":      raw.get("columns"),
+                    "column_types": raw.get("column_types", {}),
+                    "correlations": raw.get("correlations"),
+                    "memory_mb":    raw.get("memory_mb"),
+                    "column_roles": raw.get("column_roles", {}),
+                },
+                "classification": state.semantic_map,
+                "cached": True,
+            }
+        except Exception as _pce:
+            print(f"WARNING: Could not load profile cache from disk: {_pce}")
+
     state.status = "profiling"
 
     profiler_response = await run_agent_pipeline(
@@ -693,6 +936,16 @@ async def profile_dataset(session_id: str):
     state.semantic_map = profiler_data.get("classification", {})
     state.dataset_type = state.semantic_map.get("dataset_type", "")
     state.status = "profiled"
+
+    # Persist profile to disk so it survives server restarts
+    try:
+        _profile_cache_path.write_text(
+            json.dumps({"raw_profile": state.raw_profile, "classification": state.semantic_map}, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as _pce:
+        print(f"WARNING: Could not save profile cache to disk: {_pce}")
+
     _persist_session(state)
 
     from pipeline_types import create_message, Intent
@@ -902,6 +1155,8 @@ async def run_pipeline_background(
         )
         print(f"INFO: Result: {result.get('status')}")
         _persist_session(state)
+        if result.get("status") != "error":
+            _save_to_history(state)
     except Exception as e:
         print(f"ERROR: {str(e)}")
         traceback.print_exc()
@@ -1037,6 +1292,270 @@ async def _re_discover(session_id: str) -> None:
     except Exception as _e:
         print(f"ERROR: _re_discover failed for {session_id}: {_e}")
         state.status = "error"
+
+@app.get("/history")
+async def list_history():
+    """Return all completed analysis sessions, newest first."""
+    return _load_history()
+
+
+@app.get("/history/{session_id}/restore")
+async def restore_history_session(session_id: str):
+    """
+    Reconstruct the full UI state for a past analysis so the frontend
+    can restore chat messages, pipeline nodes, synthesis, and report.
+    """
+    # Look up in the history index
+    entry = next((e for e in _load_history() if e.get("session_id") == session_id), None)
+    if not entry:
+        raise HTTPException(404, "History entry not found")
+
+    output_folder = Path(entry.get("output_folder", ""))
+
+    # Load cached artefacts from the session's output folder
+    synthesis: dict = {}
+    plan: dict = {}
+    results: dict = {}
+
+    for fname, target in [
+        ("_synthesis_cache.json", "synthesis"),
+        ("_plan_cache.json", "plan"),
+        ("_results_cache.json", "results"),
+    ]:
+        p = output_folder / fname
+        if p.exists():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if target == "synthesis":
+                    synthesis = data
+                elif target == "plan":
+                    plan = data
+                elif target == "results":
+                    results = data
+            except Exception:
+                pass
+
+    # Load profile cache from disk
+    profile_payload: dict = {}
+    profile_cache_path = output_folder / "_profile_cache.json"
+    if profile_cache_path.exists():
+        try:
+            _pc = json.loads(profile_cache_path.read_text(encoding="utf-8"))
+            _raw = _pc.get("raw_profile", {})
+            _cls = _pc.get("classification", {})
+            profile_payload = {
+                "profile": {
+                    "filename":     _raw.get("filename", entry.get("csv_filename", "")),
+                    "row_count":    _raw.get("row_count", entry.get("row_count", 0)),
+                    "column_count": _raw.get("column_count", entry.get("col_count", 0)),
+                    "columns":      _raw.get("columns", []),
+                    "column_types": _raw.get("column_types", {}),
+                    "correlations": _raw.get("correlations"),
+                    "memory_mb":    _raw.get("memory_mb"),
+                    "column_roles": _raw.get("column_roles", {}),
+                },
+                "classification": _cls,
+                "dataset_type":   _cls.get("dataset_type", entry.get("dataset_type", "")),
+                "row_count":      _raw.get("row_count", entry.get("row_count", 0)),
+                "column_count":   _raw.get("column_count", entry.get("col_count", 0)),
+            }
+        except Exception as _e:
+            print(f"WARNING: restore could not load profile cache: {_e}")
+
+    # Fallback: no _profile_cache.json — build a minimal profile object from
+    # whatever data is available so ProfileCard can still render something.
+    if not profile_payload:
+        _row = entry.get("row_count", 0)
+        _col = entry.get("col_count", 0)
+        _dtype = entry.get("dataset_type", "tabular_generic")
+        _fname = entry.get("csv_filename", "")
+        # Try to get row/col count from synthesis cache if history entry has zeros
+        if (_row == 0 or _col == 0) and synthesis:
+            _synth_meta = synthesis.get("dataset_meta", {})
+            _row = _row or _synth_meta.get("row_count", 0)
+            _col = _col or _synth_meta.get("col_count", 0)
+        profile_payload = {
+            "profile": {
+                "filename":     _fname,
+                "row_count":    _row,
+                "column_count": _col,
+                "columns":      [],
+                "column_types": {},
+                "correlations": None,
+                "memory_mb":    None,
+                "column_roles": {},
+            },
+            "classification": {
+                "dataset_type":          _dtype,
+                "column_roles":          {},
+                "confidence":            "restored",
+                "recommended_analyses":  [],
+            },
+            "dataset_type":  _dtype,
+            "row_count":     _row,
+            "column_count":  _col,
+        }
+
+    # If session is still alive in memory, use that (richer)
+    live = sessions.get(session_id)
+    if live:
+        if live.raw_profile:
+            synthesis = live.synthesis or synthesis
+            plan = {"dag": live.dag} if live.dag else plan
+            results = live.results or results
+
+    # Re-hydrate session into memory so follow-up API calls (/chat, /report, etc.) work
+    if session_id not in sessions:
+        restored_state = SessionState(session_id)
+        restored_state.csv_filename = entry.get("csv_filename", "")
+        restored_state.output_folder = str(output_folder)
+        restored_state.status = "complete"
+        restored_state.dataset_type = entry.get("dataset_type", "")
+        restored_state.csv_hash = entry.get("csv_hash", "")
+
+        # Restore csv_path from history entry (recorded at upload time)
+        _stored_csv_path = entry.get("csv_path", "")
+        if _stored_csv_path and Path(_stored_csv_path).exists():
+            restored_state.csv_path = _stored_csv_path
+        else:
+            # Fallback: look for CSV in UPLOAD_DIR based on output folder name
+            _folder_name = Path(str(output_folder)).name
+            for _ext in (".csv", ".xlsx", ".xls", ".json", ".parquet"):
+                _candidate = UPLOAD_DIR / f"{_folder_name}{_ext}"
+                if _candidate.exists():
+                    restored_state.csv_path = str(_candidate)
+                    break
+
+        if profile_payload.get("profile"):
+            restored_state.raw_profile = {
+                "filename":     profile_payload["profile"].get("filename", ""),
+                "row_count":    profile_payload["profile"].get("row_count", 0),
+                "column_count": profile_payload["profile"].get("column_count", 0),
+                "columns":      profile_payload["profile"].get("columns", []),
+                "column_types": profile_payload["profile"].get("column_types", {}),
+                "correlations": profile_payload["profile"].get("correlations"),
+                "memory_mb":    profile_payload["profile"].get("memory_mb"),
+                "column_roles": profile_payload["profile"].get("column_roles", {}),
+            }
+            restored_state.semantic_map = profile_payload.get("classification", {})
+
+        restored_state.dag = plan.get("dag", [])
+        restored_state.results = results
+        restored_state.synthesis = synthesis
+        sessions[session_id] = restored_state
+
+    dag_nodes = plan.get("dag", [])
+
+    # Build nodes list for the pipeline store
+    nodes = []
+    for n in dag_nodes:
+        nid = n.get("id", "")
+        status = "complete" if nid in results and results[nid].get("status") != "error" else (
+            "failed" if nid in results else "pending"
+        )
+        nodes.append({
+            "id":            nid,
+            "name":          n.get("name", nid),
+            "type":          n.get("analysis_type", ""),
+            "status":        status,
+            "priority":      n.get("priority", ""),
+            "description":   n.get("description", ""),
+        })
+
+    # Build messages array to restore the chat
+    messages = []
+
+    def _msg(role, msg_type, payload):
+        return {"id": f"restore_{msg_type}_{len(messages)}", "role": role,
+                "type": msg_type, "payload": payload, "category": "pipeline",
+                "timestamp": entry.get("created_at", 0) * 1000}
+
+    # File card
+    messages.append(_msg("user", "file", {
+        "filename": entry.get("csv_filename", ""),
+        "rows":     entry.get("row_count", 0),
+        "columns":  entry.get("col_count", 0),
+    }))
+
+    # Profile card — use full cached profile so ProfileCard renders correctly
+    if profile_payload:
+        messages.append(_msg("ai", "profile", profile_payload))
+
+    # Discovery card
+    if dag_nodes:
+        messages.append(_msg("ai", "discovery", {
+            "dag":          dag_nodes,
+            "node_count":   len(dag_nodes),
+            "dataset_type": entry.get("dataset_type", ""),
+        }))
+
+    # Chart cards — one per completed result
+    for nid, result in results.items():
+        if result.get("status") == "error":
+            continue
+        chart_path = result.get("chart_file_path", "")
+        chart_url = ""
+        if chart_path:
+            # Convert absolute path to relative URL served by FastAPI
+            try:
+                chart_url = "/output/" + Path(chart_path).relative_to(OUTPUT_DIR).as_posix()
+            except Exception:
+                chart_url = ""
+        messages.append(_msg("ai", "chart", {
+            "id":             nid,
+            "analysis_type":  result.get("analysis_type", ""),
+            "top_finding":    result.get("top_finding", ""),
+            "severity":       result.get("severity", "info"),
+            "insight_summary": result.get("insight_summary", ""),
+            "hasChart":        bool(chart_url),
+            "chartUrl":        chart_url,
+            "data":            result.get("data", {}),
+        }))
+
+    # Synthesis cards
+    if synthesis:
+        exec_summary = synthesis.get("executive_summary", {})
+        if exec_summary:
+            messages.append(_msg("ai", "summary", {"executive_summary": exec_summary}))
+
+        insights = synthesis.get("detailed_insights", {}).get("insights", [])
+        if insights:
+            messages.append(_msg("ai", "insights", {"insights": insights}))
+
+        connections = synthesis.get("cross_metric_connections", {}).get("connections", [])
+        if connections:
+            messages.append(_msg("ai", "connections", {"connections": connections}))
+
+        critic = synthesis.get("_critic_review")
+        if critic:
+            messages.append(_msg("ai", "critic", {"review": critic}))
+
+    # Report card
+    report_path = output_folder / "report.html"
+    has_report = report_path.exists()
+    if has_report:
+        messages.append(_msg("ai", "report", {
+            "session_id": session_id,
+            "ready":      True,
+        }))
+
+    canvas_narrative = synthesis.get("conversational_report", "")
+
+    return {
+        "session_id":       session_id,
+        "csv_filename":     entry.get("csv_filename", ""),
+        "output_folder":    str(output_folder),
+        "phase":            "complete",
+        "nodes":            nodes,
+        "synthesis":        synthesis,
+        "has_report":       has_report,
+        "messages":         messages,
+        "canvas_narrative": canvas_narrative,
+        "dataset_type":     entry.get("dataset_type", ""),
+        "row_count":        entry.get("row_count", 0),
+        "col_count":        entry.get("col_count", 0),
+    }
+
 
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):

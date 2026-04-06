@@ -12,6 +12,7 @@ export const usePipelineStore = create((set) => ({
   canvasNarrative: null, // HTML string from synthesis conversational_report
   pipelineRunId: 0, // incremented each time a pipeline starts — triggers SSE reconnection
   sidebarCollapsed: false,
+  historyOpen: false,
 
   setSession: (sessionId, outputFolder) => set({
     sessionId, outputFolder,
@@ -53,6 +54,7 @@ export const usePipelineStore = create((set) => ({
   setSseConnected: (sseConnected) => set({ sseConnected }),
   setCanvasOpen: (canvasOpen) => set({ canvasOpen }),
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
+  setHistoryOpen: (historyOpen) => set({ historyOpen }),
   setCanvasNarrative: (canvasNarrative) => set({ canvasNarrative }),
   startPipelineRun: () => set((state) => ({
     pipelineRunId: state.pipelineRunId + 1,
@@ -72,5 +74,6 @@ export const usePipelineStore = create((set) => ({
     canvasOpen: false,
     canvasNarrative: null,
     sidebarCollapsed: false,
+    historyOpen: false,
   })
 }));

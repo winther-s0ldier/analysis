@@ -612,7 +612,7 @@ def tool_submit_synthesis(
                         pass
                 if not _rej_out:
                     try:
-                        from agent_servers.a2a_orchestrator import lookup_session as _a2a_lookup
+                        from agent_servers.a2a_client import lookup_session as _a2a_lookup
                         _rej_out = _a2a_lookup(session_id) or None
                     except Exception:
                         pass
@@ -724,7 +724,7 @@ def tool_submit_synthesis(
 
             if not _abs_out:
                 try:
-                    from agent_servers.a2a_orchestrator import lookup_session
+                    from agent_servers.a2a_client import lookup_session
                     _abs_out = lookup_session(session_id) or None
                 except Exception:
                     pass

@@ -2403,7 +2403,7 @@ def run_rfm_analysis(
             "segment_stats":   seg_stats.to_dict("records"),
         },
         top_finding=top_finding,
-        severity="medium" if at_risk_count > (len(rfm)*0.2) else "low",
+        severity="medium" if declining_count > (len(rfm)*0.2) else "low",
         confidence=0.92,
         chart_ready_data={
             "type": "rfm_scatter",

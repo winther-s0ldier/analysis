@@ -37,7 +37,7 @@ def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
 
         if not synthesis:
             try:
-                from agent_servers.a2a_orchestrator import lookup_session as _lookup
+                from agent_servers.a2a_client import lookup_session as _lookup
                 _abs_out = _lookup(session_id)
                 if _abs_out:
                     _cache = os.path.join(_abs_out, "_synthesis_cache.json")
@@ -68,7 +68,7 @@ def tool_get_synthesis_for_critique(session_id: str, tool_context=None) -> dict:
 
         if not fact_sheet:
             try:
-                from agent_servers.a2a_orchestrator import lookup_session as _lookup_r
+                from agent_servers.a2a_client import lookup_session as _lookup_r
                 _abs_out_r = _lookup_r(session_id)
                 if _abs_out_r:
                     _rcache = os.path.join(_abs_out_r, "_results_cache.json")
@@ -198,7 +198,7 @@ def tool_submit_critique(
     )
 
     try:
-        from agent_servers.a2a_orchestrator import lookup_session as _lookup
+        from agent_servers.a2a_client import lookup_session as _lookup
         import json as _json
         import os as _os
         _abs_out = _lookup(session_id)

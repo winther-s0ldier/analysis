@@ -87,6 +87,7 @@ export const useChatStore = create((set) => ({
 
   setThinking: (thinking) => set({ thinking }),
   clearMessages: () => set({ messages: [], thinking: false }),
+  restoreMessages: (msgs) => set({ messages: msgs, thinking: false }),
 
   // ── Pre-fill chat input ("Ask about this" on chart/insight cards) ──────────
   pendingMessage: '',

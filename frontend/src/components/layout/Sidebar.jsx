@@ -1,9 +1,10 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePipelineStore } from '../../store/pipelineStore';
+import { useChatStore } from '../../store/chatStore';
 import {
   PanelLeftClose, PanelLeft,
-  Database, Search, Activity, Cpu, FileText, Upload, BarChart2,
+  Database, Search, Activity, Cpu, FileText, Upload, BarChart2, Clock, Plus,
 } from 'lucide-react';
 import { cn } from '../ui/Badge';
 
@@ -31,7 +32,9 @@ function getStageStatus(stageId, currentPhase) {
 }
 
 export function Sidebar() {
-  const { phase, sidebarCollapsed: collapsed, setSidebarCollapsed } = usePipelineStore();
+  const { phase, sidebarCollapsed: collapsed, setSidebarCollapsed, historyOpen, setHistoryOpen, reset } = usePipelineStore();
+  const { clearMessages } = useChatStore();
+  const handleNewSession = () => { reset(); clearMessages(); };
   const setCollapsed = (v) => setSidebarCollapsed(v);
   const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
 
@@ -73,16 +76,28 @@ export function Sidebar() {
                 </span>
               </div>
 
-              <button
-                onClick={() => setCollapsed(true)}
-                className="w-7 h-7 flex items-center justify-center rounded-md transition-colors duration-200"
-                style={{ color: '#6B5F58' }}
-                onMouseEnter={e => e.currentTarget.style.color = '#A89890'}
-                onMouseLeave={e => e.currentTarget.style.color = '#6B5F58'}
-                title="Collapse sidebar"
-              >
-                <PanelLeftClose size={15} />
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={handleNewSession}
+                  className="w-7 h-7 flex items-center justify-center rounded-md transition-colors duration-200"
+                  style={{ color: '#6B5F58' }}
+                  onMouseEnter={e => { e.currentTarget.style.color = '#A5B4FC'; e.currentTarget.style.background = 'rgba(99,102,241,0.15)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.color = '#6B5F58'; e.currentTarget.style.background = 'transparent'; }}
+                  title="New session"
+                >
+                  <Plus size={15} />
+                </button>
+                <button
+                  onClick={() => setCollapsed(true)}
+                  className="w-7 h-7 flex items-center justify-center rounded-md transition-colors duration-200"
+                  style={{ color: '#6B5F58' }}
+                  onMouseEnter={e => e.currentTarget.style.color = '#A89890'}
+                  onMouseLeave={e => e.currentTarget.style.color = '#6B5F58'}
+                  title="Collapse sidebar"
+                >
+                  <PanelLeftClose size={15} />
+                </button>
+              </div>
             </div>
 
             {/* Divider */}
@@ -172,7 +187,34 @@ export function Sidebar() {
             </nav>
 
             {/* Divider */}
-            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '0 0 8px' }} />
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '8px 0' }} />
+
+            {/* History button */}
+            <div className="px-2 shrink-0">
+              <button
+                onClick={() => setHistoryOpen(!historyOpen)}
+                className="w-full flex items-center gap-2.5 px-3 py-2 rounded-lg transition-all duration-200"
+                style={{
+                  background: historyOpen ? 'rgba(99,102,241,0.18)' : 'transparent',
+                  border: historyOpen ? '1px solid rgba(99,102,241,0.35)' : '1px solid transparent',
+                  cursor: 'pointer',
+                }}
+                onMouseEnter={e => { if (!historyOpen) { e.currentTarget.style.background = 'rgba(255,255,255,0.05)'; e.currentTarget.style.borderColor = 'transparent'; } }}
+                onMouseLeave={e => { if (!historyOpen) { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.borderColor = 'transparent'; } }}
+                title="Analysis History"
+              >
+                <Clock size={15} style={{ color: historyOpen ? '#6366F1' : 'rgba(255,255,255,0.45)', flexShrink: 0 }} />
+                <span className="text-[12.5px] font-medium leading-none tracking-tight" style={{ color: historyOpen ? '#F9FAFB' : 'rgba(249,250,251,0.45)' }}>
+                  History
+                </span>
+                {historyOpen && (
+                  <span className="ml-auto w-1.5 h-1.5 rounded-full shrink-0" style={{ background: '#6366F1' }} />
+                )}
+              </button>
+            </div>
+
+            {/* Divider */}
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '8px 0 0' }} />
 
             {/* User Activity button — bottom of expanded sidebar */}
             <div
@@ -272,6 +314,33 @@ export function Sidebar() {
                 );
               })}
             </div>
+
+            {/* New session + History icons — collapsed rail */}
+            <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', width: '100%', marginBottom: 4 }} />
+            <button
+              onClick={handleNewSession}
+              className="w-8 h-8 flex items-center justify-center rounded-lg mb-1 transition-colors duration-200"
+              style={{ color: 'rgba(255,255,255,0.35)', background: 'transparent', border: 'none', cursor: 'pointer' }}
+              onMouseEnter={e => { e.currentTarget.style.color = '#A5B4FC'; e.currentTarget.style.background = 'rgba(99,102,241,0.15)'; }}
+              onMouseLeave={e => { e.currentTarget.style.color = 'rgba(255,255,255,0.35)'; e.currentTarget.style.background = 'transparent'; }}
+              title="New session"
+            >
+              <Plus size={15} />
+            </button>
+            <button
+              onClick={() => setHistoryOpen(!historyOpen)}
+              className="w-8 h-8 flex items-center justify-center rounded-lg mb-1 transition-colors duration-200 relative"
+              style={{
+                color: historyOpen ? '#6366F1' : 'rgba(255,255,255,0.35)',
+                background: historyOpen ? 'rgba(99,102,241,0.18)' : 'transparent',
+                border: 'none', cursor: 'pointer',
+              }}
+              onMouseEnter={e => { if (!historyOpen) { e.currentTarget.style.color = '#A5B4FC'; e.currentTarget.style.background = 'rgba(99,102,241,0.1)'; } }}
+              onMouseLeave={e => { if (!historyOpen) { e.currentTarget.style.color = 'rgba(255,255,255,0.35)'; e.currentTarget.style.background = 'transparent'; } }}
+              title="Analysis History"
+            >
+              <Clock size={15} />
+            </button>
 
             {/* User Activity icon — bottom of collapsed rail */}
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', width: '100%', marginBottom: 8 }} />

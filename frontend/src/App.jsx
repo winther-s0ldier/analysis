@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useCallback, useState, Component } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
+import { HistoryPanel } from './components/layout/HistoryPanel';
 import { TopProgressBar } from './components/layout/TopProgressBar';
 import { ProgressRing } from './components/layout/ProgressRing';
 import { ProcessingStatus } from './components/layout/ProcessingStatus';
@@ -288,6 +289,7 @@ function App() {
 
       <TopProgressBar />
       <Sidebar />
+      <HistoryPanel />
       <main
         ref={mainRef}
         className="flex-1 flex overflow-hidden bg-bg-page relative font-sans"

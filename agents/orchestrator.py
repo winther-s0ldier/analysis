@@ -49,6 +49,14 @@ except ImportError:
 
 _USE_A2A_MULTISERVER = os.getenv("USE_A2A_MULTISERVER", "true").lower() != "false"
 
+async def _a2a_with_fallback(a2a_coro, fallback_coro, agent_name, session_id):
+    try:
+        return await a2a_coro
+    except Exception as e:
+        print(f"WARNING: [{session_id}] A2A {agent_name} failed: {e}, falling back to in-process")
+        logging.warning(f"[{session_id}] A2A {agent_name} failed: {e}, falling back to in-process")
+        return await fallback_coro
+
 _pipeline_store: dict = {}
 
 _pipeline_event_hooks: dict = {}
@@ -314,7 +322,7 @@ async def run_full_pipeline(
         from main import run_agent_pipeline, extract_json
 
         if _USE_A2A_MULTISERVER:
-            from agent_servers.a2a_orchestrator import register_session as _reg_session
+            from agent_servers.a2a_client import register_session as _reg_session
             _reg_session(session_id, output_folder)
 
         if getattr(state, "raw_profile", None):
@@ -334,7 +342,7 @@ async def run_full_pipeline(
             )
 
             if _USE_A2A_MULTISERVER:
-                from agent_servers.a2a_orchestrator import (
+                from agent_servers.a2a_client import (
                     call_profiler as _a2a_profiler,
                 )
                 print(f"INFO: [{session_id}] Calling profiler via A2A HTTP")
@@ -451,7 +459,7 @@ async def run_full_pipeline(
 
             from agents.discovery import get_analysis_plan
             if _USE_A2A_MULTISERVER:
-                from agent_servers.a2a_orchestrator import call_discovery as _a2a_discovery
+                from agent_servers.a2a_client import call_discovery as _a2a_discovery
                 print(f"INFO: [{session_id}] Calling discovery via A2A HTTP")
                 discovery_response = await _a2a_discovery(
                     session_id=session_id,
@@ -606,7 +614,7 @@ async def run_full_pipeline(
         _post_dag_error = None
         try:
             if _USE_A2A_MULTISERVER:
-                from agent_servers.a2a_orchestrator import (
+                from agent_servers.a2a_client import (
                     call_synthesis as _a2a_synthesis,
                     call_critic as _a2a_critic,
                     call_dag_builder as _a2a_dag_builder,
@@ -1038,7 +1046,14 @@ async def _execute_single_node(
             effective_csv = enriched
 
     if column_roles:
-        column_roles = _validate_column_roles_against_csv(column_roles, effective_csv)
+        # Build column list from cached profile to avoid re-reading the CSV header per node.
+        _actual_cols = None
+        if state is not None and getattr(state, "raw_profile", None):
+            _ct = state.raw_profile.get("column_types", {})
+            _all = _ct.get("numeric", []) + _ct.get("categorical", []) + _ct.get("datetime", [])
+            if _all:
+                _actual_cols = _all
+        column_roles = _validate_column_roles_against_csv(column_roles, effective_csv, actual_cols=_actual_cols)
 
         node = {**node, "column_roles": column_roles}
 
@@ -1120,11 +1135,19 @@ async def _execute_single_node(
             "Return ONLY the code block. Use the rules in your system instructions."
         )
 
-        response = await run_agent_pipeline(
-            f"{session_id}_{analysis_id}",
-            prompt,
-            agent_getter="coder",
-        )
+        if _USE_A2A_MULTISERVER:
+            from agent_servers.a2a_client import call_coder as _a2a_coder
+            response = await _a2a_with_fallback(
+                _a2a_coder(session_id, prompt),
+                run_agent_pipeline(f"{session_id}_{analysis_id}", prompt, agent_getter="coder"),
+                "coder", session_id,
+            )
+        else:
+            response = await run_agent_pipeline(
+                f"{session_id}_{analysis_id}",
+                prompt,
+                agent_getter="coder",
+            )
 
         code_match = re.search(r"```python\s*(.*?)\s*```", response, re.DOTALL)
         code = code_match.group(1) if code_match else response.strip()
@@ -1440,15 +1463,18 @@ def _attempt_column_role_correction(node: dict, error_str: str) -> dict:
     corrected["column_roles"] = corrected_roles
     return corrected
 
-def _validate_column_roles_against_csv(column_roles: dict, csv_path: str) -> dict:
+def _validate_column_roles_against_csv(
+    column_roles: dict, csv_path: str, actual_cols: list = None
+) -> dict:
     if not column_roles or not csv_path:
         return column_roles
 
-    try:
-        import pandas as _pd
-        actual_cols = list(_pd.read_csv(csv_path, nrows=0).columns)
-    except Exception:
-        return column_roles
+    if actual_cols is None:
+        try:
+            import pandas as _pd
+            actual_cols = list(_pd.read_csv(csv_path, nrows=0).columns)
+        except Exception:
+            return column_roles
 
     if not actual_cols:
         return column_roles

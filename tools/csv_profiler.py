@@ -1,14 +1,37 @@
+import os
 import pandas as pd
 from typing import Any
 
-def profile_csv(csv_path: str) -> dict:
+# Module-level DataFrame cache: csv_path -> (mtime, DataFrame)
+# Avoids re-reading the same file multiple times within a session.
+_df_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+
+
+def _load_df(csv_path: str) -> pd.DataFrame:
+    """Return a cached DataFrame for csv_path, re-reading only if the file changed."""
+    try:
+        mtime = os.path.getmtime(csv_path)
+    except OSError:
+        mtime = 0.0
+    cached = _df_cache.get(csv_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except UnicodeDecodeError:
-        try:
-            df = pd.read_csv(csv_path, low_memory=False, encoding="latin-1")
-        except Exception as e:
-            return {"error": f"Failed to read CSV (encoding fallback failed): {str(e)}"}
+        df = pd.read_csv(csv_path, low_memory=False, encoding="latin-1")
+    _df_cache[csv_path] = (mtime, df)
+    return df
+
+
+def clear_df_cache(csv_path: str) -> None:
+    """Remove a cached DataFrame entry (call on session expiry to free memory)."""
+    _df_cache.pop(csv_path, None)
+
+
+def profile_csv(csv_path: str) -> dict:
+    try:
+        df = _load_df(csv_path)
     except Exception as e:
         return {"error": f"Failed to read CSV: {str(e)}"}
 

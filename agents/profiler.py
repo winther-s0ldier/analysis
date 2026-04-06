@@ -43,7 +43,7 @@ def tool_profile_and_classify(
             _reversed = {v: k for k, v in existing_roles.items() if v}
             for col_name, role in _custom_roles.items():
 
-                existing_roles[role] = col_name
+                existing_roles[col_name] = role
             raw_profile["column_roles"] = existing_roles
             print(f"[PolicyEngine] Applied custom_column_roles overrides: {_custom_roles}")
     except Exception as _pe:

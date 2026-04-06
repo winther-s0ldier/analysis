@@ -56,13 +56,30 @@ function formatDate(dateStr) {
 }
 
 export function ProfileCard({ data }) {
-  if (!data || !data.profile) return (
-    <div className="w-full flex items-center gap-2.5 px-4 py-3 rounded-xl border text-[13px]"
-      style={{ background: '#FFF7ED', borderColor: '#FED7AA', color: '#92400E' }}>
-      <span>⚠</span>
-      <span>Dataset profile unavailable — the profiling step may have failed.</span>
-    </div>
-  );
+  if (!data || !data.profile) {
+    // Last-resort: render a minimal card from whatever top-level fields exist
+    const fallbackType = data?.dataset_type || data?.classification?.dataset_type || '';
+    const fallbackRows = data?.row_count ?? 0;
+    const fallbackCols = data?.column_count ?? 0;
+    const fallbackFile = data?.filename || '';
+    if (fallbackType || fallbackRows || fallbackCols) {
+      const typeLabel = DATASET_TYPE_LABEL[fallbackType] || (fallbackType || 'Dataset').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      return (
+        <div className="w-full rounded-xl border overflow-hidden shadow-sm" style={{ background: '#FAFAF9', borderColor: '#E5E1DC' }}>
+          <div className="flex items-center gap-2.5 px-4 py-3 border-b" style={{ background: '#F5F2EE', borderColor: '#E5E1DC' }}>
+            <span className="text-[13px] font-semibold" style={{ color: '#1C1612' }}>Dataset Profile</span>
+            <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: 'rgba(99,102,241,0.1)', color: '#6366F1' }}>{typeLabel}</span>
+          </div>
+          <div className="flex gap-3 px-4 py-3 flex-wrap">
+            {fallbackFile && <StatChip label="File" value={fallbackFile} />}
+            {fallbackRows > 0 && <StatChip label="Rows" value={fallbackRows.toLocaleString()} />}
+            {fallbackCols > 0 && <StatChip label="Columns" value={fallbackCols} />}
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }
   const { profile, classification } = data;
 
   const ct = profile.column_types || {};

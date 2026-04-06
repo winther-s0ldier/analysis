@@ -67,7 +67,7 @@ async def check_agent_available(name: str, timeout: float = 3.0) -> bool:
         return False
 
 async def check_all_agents_available(timeout: float = 3.0) -> dict:
-    agents_to_check = ["profiler", "discovery", "synthesis", "critic", "dag_builder"]
+    agents_to_check = ["profiler", "discovery", "coder", "synthesis", "critic", "dag_builder"]
     results = await asyncio.gather(
         *[check_agent_available(a, timeout) for a in agents_to_check],
         return_exceptions=True
@@ -215,3 +215,6 @@ async def call_dag_builder(session_id: str, output_folder: str) -> str:
         "Call tool_build_report(session_id, output_folder) now."
     )
     return await _call_agent("dag_builder", prompt, timeout=120.0)
+
+async def call_coder(session_id: str, prompt: str) -> str:
+    return await _call_agent("coder", prompt, timeout=180.0)

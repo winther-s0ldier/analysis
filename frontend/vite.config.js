@@ -24,6 +24,7 @@ export default defineConfig({
       '/add-metric': 'http://127.0.0.1:8000',
       '/chart': 'http://127.0.0.1:8000',
       '/user-activity': 'http://127.0.0.1:8000',
+      '/history': 'http://127.0.0.1:8000',
     }
   }
 })

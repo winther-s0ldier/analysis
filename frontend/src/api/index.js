@@ -80,3 +80,15 @@ export const sendChatMessage = async (sessionId, message) => {
   if (!res.ok) throw new Error('Chat failed');
   return res.json();
 };
+
+export const getHistory = async () => {
+  const res = await fetch(`${API_BASE}/history`);
+  if (!res.ok) throw new Error('Failed to fetch history');
+  return res.json();
+};
+
+export const restoreSession = async (sessionId) => {
+  const res = await fetch(`${API_BASE}/history/${sessionId}/restore`);
+  if (!res.ok) throw new Error('Failed to restore session');
+  return res.json();
+};

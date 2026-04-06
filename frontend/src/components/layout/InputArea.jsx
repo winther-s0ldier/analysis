@@ -16,7 +16,7 @@ function formatSize(bytes) {
 }
 
 export function InputArea() {
-  const { sessionId, setSession, setPhase, setNodes } = usePipelineStore();
+  const { sessionId, setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen } = usePipelineStore();
   const { addMessage, insertAfterMessage, addOrUpdateChart, clearMessages, setThinking, pendingMessage, setPendingMessage } = useChatStore();
   const [file, setFile] = useState(null);
   const [textValue, setTextValue] = useState('');
@@ -56,23 +56,40 @@ export function InputArea() {
         toast.info(`Uploading ${currentFile.name}...`);
         setPhase('uploading');
         const uploadData = await uploadFile(currentFile);
+
         setSession(uploadData.session_id, uploadData.output_folder || uploadData.session_id);
 
-        setPhase('profiling');
-        const profileData = await profileDataset(uploadData.session_id);
+        // Profile step — use inline cached data if available, otherwise call /profile
+        let profileData;
+        if (uploadData.profile_cached && uploadData.profile) {
+          toast.success('Identical dataset — loading cached profile');
+          profileData = uploadData.profile;
+        } else {
+          setPhase('profiling');
+          profileData = await profileDataset(uploadData.session_id);
+          toast.success('Profiling complete');
+        }
         addMessage('ai', 'profile', profileData);
-        toast.success('Profiling complete');
 
-        setPhase('discovering');
-        const discoverData = await discoverMetrics(uploadData.session_id);
-        addMessage('ai', 'discovery', discoverData.discovery);
-        if (discoverData.discovery?.dag) {
-          setNodes(discoverData.discovery.dag.map(n => ({ id: n.id, type: n.analysis_type, status: 'pending' })));
+        // Discovery step — use inline cached DAG if available, otherwise call /discover
+        let discoveryPayload;
+        if (uploadData.dag_cached && uploadData.discovery) {
+          toast.success('Loaded cached analysis plan');
+          discoveryPayload = uploadData.discovery;
+        } else {
+          setPhase('discovering');
+          const discoverData = await discoverMetrics(uploadData.session_id);
+          discoveryPayload = discoverData.discovery;
+          toast.success('Analysis plan ready');
+        }
+        addMessage('ai', 'discovery', discoveryPayload);
+        if (discoveryPayload?.dag) {
+          setNodes(discoveryPayload.dag.map(n => ({ id: n.id, type: n.analysis_type, status: 'pending' })));
         }
 
         // Pause here — let user review plan, add custom metrics, then click Run
         addMessage('ai', 'run_analysis', { sessionId: uploadData.session_id });
-        toast.success('Analysis plan ready — review and run');
+        toast.success('Review the plan and click Run when ready');
       } catch (err) {
         toast.error(`Error: ${err.message}`);
         addMessage('ai', 'text', `Sorry, something went wrong: ${err.message}`);
