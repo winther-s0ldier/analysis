@@ -51,5 +51,5 @@ jobs:
             sleep 8
             sudo supervisorctl -c /etc/supervisor/supervisord.conf restart adk
 
-            echo "✅ Deploy complete"
+            echo "Deploy complete"
             sudo supervisorctl -c /etc/supervisor/supervisord.conf status
