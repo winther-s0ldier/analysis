@@ -197,6 +197,12 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
         _avg_conf = sum(_node_confs) / len(_node_confs) if _node_confs else 0.85
         _reliability_pct = int(_avg_conf * 100)
 
+        for _aid, _res in state.results.items():
+            if not isinstance(_res, dict): continue
+            _atype = _res.get("analysis_type", "unknown")
+            _nid   = _atype_to_id.get(_atype, _aid)
+            _fact_sheet[_nid] = _efs(_nid, _aid, _res)
+
         _fact_sheet["metadata"] = {
             "aggregate_data_reliability": f"{_reliability_pct}%",
             "reliability_assessment_context": "Calculated across all analysis nodes. 100% is near-total certainty."
