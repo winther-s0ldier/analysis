@@ -42,14 +42,14 @@ jobs:
             cd ..
 
             # Update supervisord config and reload ALL processes
-            sudo cp supervisord.conf /etc/supervisor/conf.d/adhopsun.conf
-            sudo supervisorctl reread
-            sudo supervisorctl update
+            sudo cp supervisor_agents.conf /etc/supervisor/conf.d/adhopsun.conf
+            sudo supervisorctl -c /etc/supervisor/supervisord.conf reread
+            sudo supervisorctl -c /etc/supervisor/supervisord.conf update
 
             # Restart everything: agents first, then main backend
-            sudo supervisorctl restart all-agents:*
+            sudo supervisorctl -c /etc/supervisor/supervisord.conf restart all-agents:*
             sleep 8
-            sudo supervisorctl restart adk
+            sudo supervisorctl -c /etc/supervisor/supervisord.conf restart adk
 
             echo "✅ Deploy complete"
-            sudo supervisorctl status
+            sudo supervisorctl -c /etc/supervisor/supervisord.conf status
