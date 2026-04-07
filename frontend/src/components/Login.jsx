@@ -26,8 +26,8 @@ export function Login({ onLogin }) {
         border: '1px solid #E8E2D9',
       }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', marginBottom: 28 }}>
-          <img src="/adhopsun.jpeg" alt="ADHOPSUN" style={{ width: 56, height: 56, borderRadius: 12, objectFit: 'cover', marginBottom: 14 }} />
-          <div style={{ fontSize: 18, fontWeight: 700, color: '#1A1208', letterSpacing: '-0.01em' }}>ADHOPSUN</div>
+          <img src="/adhopsun.jpeg" alt="ADOPSHUN" style={{ width: 56, height: 56, borderRadius: 12, objectFit: 'cover', marginBottom: 14 }} />
+          <div style={{ fontSize: 18, fontWeight: 700, color: '#1A1208', letterSpacing: '-0.01em' }}>ADOPSHUN</div>
           <div style={{ fontSize: 13, color: '#9C9590', marginTop: 4 }}>Sign in to continue</div>
         </div>
 

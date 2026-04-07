@@ -201,7 +201,7 @@ function App() {
           if (synthesis.conversational_report) addMessage('ai', 'narrative', synthesis.conversational_report);
           if (synthesis._critic_review) addMessage('ai', 'critic', synthesis._critic_review);
         })
-        .catch(() => {});
+        .catch(() => { });
     }
   }, [phase, sessionId, addMessage]);
 

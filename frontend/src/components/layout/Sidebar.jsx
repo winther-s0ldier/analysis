@@ -9,12 +9,12 @@ import {
 import { cn } from '../ui/Badge';
 
 const STAGES = [
-  { id: 1, key: 'uploading',      label: 'Upload',     Icon: Upload   },
-  { id: 2, key: 'profiling',      label: 'Profile',    Icon: Database },
-  { id: 3, key: 'discovering',    label: 'Discover',   Icon: Search   },
-  { id: 4, key: 'analyzing',      label: 'Analyze',    Icon: Activity },
-  { id: 5, key: 'synthesizing',   label: 'Synthesize', Icon: Cpu      },
-  { id: 6, key: 'building_report',label: 'Report',     Icon: FileText },
+  { id: 1, key: 'uploading', label: 'Upload', Icon: Upload },
+  { id: 2, key: 'profiling', label: 'Profile', Icon: Database },
+  { id: 3, key: 'discovering', label: 'Discover', Icon: Search },
+  { id: 4, key: 'analyzing', label: 'Analyze', Icon: Activity },
+  { id: 5, key: 'synthesizing', label: 'Synthesize', Icon: Cpu },
+  { id: 6, key: 'building_report', label: 'Report', Icon: FileText },
 ];
 
 const PHASE_ORDER = [
@@ -68,11 +68,11 @@ export function Sidebar() {
               <div className="flex items-center gap-2.5">
                 <img
                   src="/adhopsun.jpeg"
-                  alt="ADHOPSUN"
+                  alt="ADOPSHUN"
                   className="w-7 h-7 rounded-lg shrink-0 object-cover"
                 />
                 <span className="text-[13px] font-bold tracking-tight" style={{ color: '#F0EBE3' }}>
-                  ADHOPSUN
+                  ADOPSHUN
                 </span>
               </div>
 
@@ -107,10 +107,10 @@ export function Sidebar() {
             <nav className="flex-1 px-2 overflow-y-auto space-y-0.5">
               {STAGES.map((s) => {
                 const status = getStageStatus(s.id, phase);
-                const isActive   = status === 'active';
+                const isActive = status === 'active';
                 const isComplete = status === 'complete';
-                const isError    = status === 'error';
-                const isPending  = status === 'pending';
+                const isError = status === 'error';
+                const isPending = status === 'pending';
 
                 return (
                   <div
@@ -140,10 +140,10 @@ export function Sidebar() {
                     <div
                       className="w-[18px] h-[18px] flex items-center justify-center shrink-0"
                       style={{
-                        color: isActive   ? '#6366F1'
-                             : isComplete ? '#10B981'
-                             : isError    ? '#EF4444'
-                             : 'rgba(255,255,255,0.22)',
+                        color: isActive ? '#6366F1'
+                          : isComplete ? '#10B981'
+                            : isError ? '#EF4444'
+                              : 'rgba(255,255,255,0.22)',
                       }}
                     >
                       <s.Icon size={15} strokeWidth={isActive ? 2.5 : 2} />
@@ -153,10 +153,10 @@ export function Sidebar() {
                     <span
                       className="text-[12.5px] font-medium leading-none tracking-tight transition-all duration-300"
                       style={{
-                        color: isActive   ? '#F9FAFB'
-                             : isComplete ? 'rgba(249,250,251,0.65)'
-                             : isError    ? '#EF4444'
-                             : 'rgba(249,250,251,0.28)',
+                        color: isActive ? '#F9FAFB'
+                          : isComplete ? 'rgba(249,250,251,0.65)'
+                            : isError ? '#EF4444'
+                              : 'rgba(249,250,251,0.28)',
                       }}
                     >
                       {s.label}
@@ -292,9 +292,9 @@ export function Sidebar() {
             <div className="flex flex-col gap-1 px-1.5 w-full flex-1">
               {STAGES.map((s) => {
                 const status = getStageStatus(s.id, phase);
-                const isActive   = status === 'active';
+                const isActive = status === 'active';
                 const isComplete = status === 'complete';
-                const isError    = status === 'error';
+                const isError = status === 'error';
 
                 return (
                   <div
@@ -302,10 +302,10 @@ export function Sidebar() {
                     className="flex items-center justify-center w-full h-8 rounded-md transition-colors duration-200"
                     style={{
                       backgroundColor: isActive ? '#161922' : 'transparent',
-                      color: isActive   ? '#6366F1'
-                           : isComplete ? '#10B981'
-                           : isError    ? '#EF4444'
-                           : 'rgba(255,255,255,0.22)',
+                      color: isActive ? '#6366F1'
+                        : isComplete ? '#10B981'
+                          : isError ? '#EF4444'
+                            : 'rgba(255,255,255,0.22)',
                     }}
                     title={s.label}
                   >
