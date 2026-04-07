@@ -194,8 +194,8 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
         }
         _node_confs = [float(_res.get("confidence", 0) or 0) for _res in state.results.values()
                        if isinstance(_res, dict) and float(_res.get("confidence", 0) or 0) > 0.05]
-        _avg_conf = sum(_node_confs) / len(_node_confs) if _node_confs else 0.85
-        _reliability_pct = int(_avg_conf * 100)
+        _avg_conf = sum(_node_confs) / len(_node_confs) if _node_confs else 0.75
+        _reliability_pct = int(min(99, _avg_conf * 100))
 
         for _aid, _res in state.results.items():
             if not isinstance(_res, dict): continue

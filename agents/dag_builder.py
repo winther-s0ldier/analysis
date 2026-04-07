@@ -321,7 +321,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         _avg_node_conf = sum(_node_confs) / len(_node_confs)
         _conf_pct = int(min(99, (_avg_node_conf * 0.70 + _cr_conf * 0.30) * 100))
     else:
-        _conf_pct = int(_cr_conf * 100)
+        _conf_pct = int(min(99, _cr_conf * 75)) # Defend against 100% if empty data
 
     st = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
     strategies_list = st if isinstance(st, list) else (st.get("strategies", []) if isinstance(st, dict) else [])
