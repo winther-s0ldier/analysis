@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 try:
     from dotenv import load_dotenv as _load_dotenv
-    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
+    _load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=True)
 except ImportError:
     pass
 

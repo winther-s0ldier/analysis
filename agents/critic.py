@@ -207,6 +207,22 @@ def tool_submit_critique(
             with open(_cache, "w", encoding="utf-8") as _cf:
                 _json.dump(_critic_store[session_id], _cf)
             print(f"INFO: [A2A] critic cache written to {_cache}")
+            # Write per-agent critic trace for RM audit
+            try:
+                import time as _t
+                _crit_trace = {
+                    "agent": "critic",
+                    "completed_at": _t.time(),
+                    "verdict": "approved" if approved else "rejected",
+                    "confidence_adjustment": confidence_adjustment,
+                    "challenge_count": len(challenges),
+                    "challenges": challenges,
+                    "overall_verdict": overall_verdict,
+                }
+                with open(_os.path.join(_abs_out, "_agent_critic.json"), "w", encoding="utf-8") as _ctf:
+                    _json.dump(_crit_trace, _ctf, indent=2)
+            except Exception as _cte:
+                print(f"WARNING: Could not write critic agent trace: {_cte}")
     except Exception as _ce:
         pass
 

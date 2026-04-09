@@ -399,12 +399,91 @@ def _load_history() -> list:
     return []
 
 
-def _save_to_history(state: "SessionState") -> None:
+def _generate_session_title(state: "SessionState") -> str:
+    """Ask Gemini to generate a concise 5-7 word descriptive title for this session."""
+    try:
+        insights = (state.synthesis or {}).get("detailed_insights", {}).get("insights", [])
+        top_insights = ", ".join(i.get("title", "") for i in insights[:3] if i.get("title"))
+        _rp = state.raw_profile or {}
+        prompt = (
+            f"Dataset filename: {state.csv_filename}, "
+            f"type: {state.dataset_type}, "
+            f"{_rp.get('row_count', 0):,} rows. "
+            f"Top findings: {top_insights or 'N/A'}. "
+            "Write a concise 5-7 word session title that captures what was analysed. "
+            "Include month/year if detectable from the filename. "
+            "Reply with ONLY the title text, no quotes, no punctuation at end."
+        )
+        import google.generativeai as _genai
+        from tools.model_config import get_model as _get_model
+        _model = _genai.GenerativeModel(_get_model("synthesis"))
+        _resp = _model.generate_content(prompt)
+        _title = (_resp.text or "").strip()[:80]
+        return _title if _title else Path(state.csv_filename).stem.replace("_", " ").replace("-", " ").title()
+    except Exception as _te:
+        print(f"WARNING: Could not generate session title: {_te}")
+        return Path(state.csv_filename).stem.replace("_", " ").replace("-", " ").title()
+
+
+def _write_session_snapshot(state: "SessionState", title: str) -> None:
+    """Write master _session.json snapshot for robust single-file restore."""
+    try:
+        _rp = state.raw_profile or {}
+        _ct = _rp.get("column_types", {})
+        col_count = len(
+            (_ct.get("numeric", []) or []) +
+            (_ct.get("categorical", []) or []) +
+            (_ct.get("datetime", []) or [])
+        )
+        custom_node_ids = [
+            nid for nid, r in state.results.items()
+            if r.get("_was_custom", False)
+        ]
+        snapshot = {
+            "version":          "1.0",
+            "session_id":       state.session_id,
+            "title":            title,
+            "csv_filename":     state.csv_filename,
+            "dataset_type":     state.dataset_type,
+            "completed_at":     time.time(),
+            "row_count":        _rp.get("row_count", 0),
+            "col_count":        col_count,
+            "dag":              state.dag,
+            "node_count":       len(state.dag),
+            "completed_nodes":  [
+                nid for nid, r in state.results.items()
+                if r.get("status") != "error"
+            ],
+            "failed_nodes":     list(state.failed_nodes),
+            "has_report":       os.path.exists(os.path.join(state.output_folder, "report.html")),
+            "has_conversation": len(state.conversation_history) > 0,
+            "conversation_turns": len(state.conversation_history),
+            "agent_traces": {
+                "profiler":   "_agent_profiler.json",
+                "discovery":  "_agent_discovery.json",
+                "synthesis":  "_agent_synthesis.json",
+                "critic":     "_agent_critic.json",
+                "coder_nodes": {nid: f"_agent_coder_{nid}.json" for nid in custom_node_ids},
+            },
+            "cache_files": {
+                "plan":         "_plan_cache.json",
+                "results":      "_results_cache.json",
+                "synthesis":    "_synthesis_cache.json",
+                "profile":      "_profile_cache.json",
+                "conversation": "_conversation_cache.json",
+            },
+        }
+        _snap_path = Path(state.output_folder) / "_session.json"
+        _snap_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        print(f"INFO: [History] _session.json written for {state.session_id}")
+    except Exception as _se:
+        print(f"WARNING: Could not write _session.json: {_se}")
+
+
+def _save_to_history(state: "SessionState", title: str = "") -> None:
     """Append or update an entry in the persistent history index."""
-    import time as _time
     try:
         entries = _load_history()
-        # Update existing entry if session already recorded
         entry = next((e for e in entries if e.get("session_id") == state.session_id), None)
         top_priority = ""
         node_count = len(state.dag)
@@ -416,23 +495,37 @@ def _save_to_history(state: "SessionState") -> None:
         _rp = state.raw_profile if state.raw_profile else {}
         row_count = _rp.get("row_count", 0)
         _ct = _rp.get("column_types", {})
-        col_count = len((_ct.get("numeric", []) or []) + (_ct.get("categorical", []) or []) + (_ct.get("datetime", []) or []))
-
+        col_count = len(
+            (_ct.get("numeric", []) or []) +
+            (_ct.get("categorical", []) or []) +
+            (_ct.get("datetime", []) or [])
+        )
+        top_insights = [
+            i.get("title", "") for i in
+            (state.synthesis or {}).get("detailed_insights", {}).get("insights", [])[:3]
+            if i.get("title")
+        ]
         new_entry = {
-            "session_id":   state.session_id,
-            "csv_filename": state.csv_filename,
-            "csv_hash":     state.csv_hash,
-            "csv_path":     state.csv_path,
-            "created_at":   state.created_at,
-            "completed_at": _time.time(),
-            "dataset_type": state.dataset_type,
-            "row_count":    row_count,
-            "col_count":    col_count,
-            "node_count":   node_count,
-            "top_priority": top_priority,
-            "has_report":   os.path.exists(os.path.join(state.output_folder, "report.html")),
-            "output_folder": state.output_folder,
-            "status":       "complete",
+            "session_id":         state.session_id,
+            "title":              title or Path(state.csv_filename).stem.replace("_", " ").title(),
+            "csv_filename":       state.csv_filename,
+            "csv_hash":           state.csv_hash,
+            "csv_path":           state.csv_path,
+            "created_at":         state.created_at,
+            "completed_at":       time.time(),
+            "dataset_type":       state.dataset_type,
+            "row_count":          row_count,
+            "col_count":          col_count,
+            "node_count":         node_count,
+            "top_priority":       top_priority,
+            "top_insights":       top_insights,
+            "has_report":         os.path.exists(os.path.join(state.output_folder, "report.html")),
+            "has_conversation":   len(state.conversation_history) > 0,
+            "conversation_turns": len(state.conversation_history),
+            "completed_node_count": len([r for r in state.results.values() if r.get("status") != "error"]),
+            "failed_node_count":  len(state.failed_nodes),
+            "output_folder":      state.output_folder,
+            "status":             "complete",
         }
         if entry:
             entries = [new_entry if e.get("session_id") == state.session_id else e for e in entries]
@@ -1149,17 +1242,21 @@ async def run_pipeline_background(
     _sse_events[session_id] = []
     try:
         print(f"INFO: Pipeline starting for {session_id}")
+        comp_ctx = _get_comparison_context(session_id)
         result = await run_full_pipeline(
             session_id=session_id,
             csv_path=csv_path,
             output_folder=output_folder,
             approved_metrics=approved,
             state=state,
+            comparison_context=comp_ctx,
         )
         print(f"INFO: Result: {result.get('status')}")
         _persist_session(state)
         if result.get("status") != "error":
-            _save_to_history(state)
+            _session_title = _generate_session_title(state)
+            _write_session_snapshot(state, _session_title)
+            _save_to_history(state, title=_session_title)
     except Exception as e:
         print(f"ERROR: {str(e)}")
         traceback.print_exc()
@@ -1302,6 +1399,44 @@ async def list_history():
     return _load_history()
 
 
+def _get_comparison_context(session_id: str) -> str:
+    """Helper to gather summaries from previous related sessions for the Synthesis Agent."""
+    state = sessions.get(session_id)
+    if not state: return ""
+
+    index = _load_history()
+    current_entry = next((e for e in index if e.get("session_id") == session_id), None)
+    if not current_entry: return ""
+
+    # Find top 3 related sessions (same CSV hash or same dataset type)
+    related = [
+        e for e in index
+        if e.get("session_id") != session_id
+        and e.get("status") == "complete"
+        and (e.get("csv_hash") == current_entry.get("csv_hash") or e.get("dataset_type") == current_entry.get("dataset_type"))
+    ][:3]
+
+    if not related: return ""
+
+    context_blocks = []
+    for r in related:
+        out = Path(r.get("output_folder", ""))
+        sync_p = out / "_synthesis_cache.json"
+        if sync_p.exists():
+            try:
+                data = json.loads(sync_p.read_text(encoding="utf-8"))
+                summ = data.get("executive_summary", {}).get("overall_health", "No summary available.")
+                context_blocks.append(
+                    f"PREVIOUS SESSION ({r.get('title')}, {r.get('completed_at')}):\n"
+                    f"Summary: {summ}\n"
+                    f"{'NOTE: This session used the EXACT SAME dataset hash.' if r.get('csv_hash') == current_entry.get('csv_hash') else ''}\n"
+                )
+            except Exception: pass
+
+    if not context_blocks: return ""
+    return "\n---\nHISTORICAL CONTEXT (for Comparison):\n" + "\n".join(context_blocks) + "\n---\n"
+
+
 @app.get("/history/{session_id}/restore")
 async def restore_history_session(session_id: str):
     """
@@ -1353,11 +1488,16 @@ async def restore_history_session(session_id: str):
                     "column_count": _raw.get("column_count", entry.get("col_count", 0)),
                     "columns":      _raw.get("columns", []),
                     "column_types": _raw.get("column_types", {}),
-                    "correlations": _raw.get("correlations"),
+                    "correlations": _raw.get("correlations", []),
                     "memory_mb":    _raw.get("memory_mb"),
                     "column_roles": _raw.get("column_roles", {}),
                 },
-                "classification": _cls,
+                "classification": {
+                    "dataset_type": _cls.get("dataset_type", entry.get("dataset_type", "")),
+                    "reasoning":    _cls.get("reasoning", ""),
+                    "confidence":   _cls.get("confidence", 1.0),
+                    "column_roles": _cls.get("column_roles", {}),
+                },
                 "dataset_type":   _cls.get("dataset_type", entry.get("dataset_type", "")),
                 "row_count":      _raw.get("row_count", entry.get("row_count", 0)),
                 "column_count":   _raw.get("column_count", entry.get("col_count", 0)),
@@ -1500,63 +1640,150 @@ async def restore_history_session(session_id: str):
         chart_url = ""
         if chart_path:
             # Convert absolute path to relative URL served by FastAPI
+            # Use .resolve() on both so absolute vs relative never causes a mismatch
             try:
-                chart_url = "/output/" + Path(chart_path).relative_to(OUTPUT_DIR).as_posix()
+                chart_url = "/output/" + Path(chart_path).resolve().relative_to(OUTPUT_DIR.resolve()).as_posix()
             except Exception:
-                chart_url = ""
+                # Last-resort: just use the filename
+                chart_url = "/output/" + Path(output_folder).name + "/" + Path(chart_path).name if chart_path else ""
+        _data = result.get("data", {})
+        _narrative = _data.get("narrative", {}) if isinstance(_data, dict) else {}
+        _insight_sum = result.get("insight_summary", {}) if isinstance(result.get("insight_summary"), dict) else {}
+
         messages.append(_msg("ai", "chart", {
             "id":             nid,
             "analysis_type":  result.get("analysis_type", ""),
-            "top_finding":    result.get("top_finding", ""),
+            "finding":        result.get("top_finding", ""),
             "severity":       result.get("severity", "info"),
-            "insight_summary": result.get("insight_summary", ""),
+            "confidence":     result.get("confidence"),
             "hasChart":        bool(chart_url),
             "chartUrl":        chart_url,
-            "data":            result.get("data", {}),
+            # Flatten narrative and summary into top-level props for ChartCard.jsx
+            "decisionMakerTakeaway": _insight_sum.get("decision_maker_takeaway", ""),
+            "keyFinding":            _insight_sum.get("key_finding", ""),
+            "topValues":             _insight_sum.get("top_values", ""),
+            "anomalies":              _insight_sum.get("anomalies", ""),
+            "whatItMeans":           _narrative.get("what_it_means", ""),
+            "recommendation":        _insight_sum.get("recommendation", ""),
+            "proposedFix":           _narrative.get("proposed_fix", ""),
+            "data":                  _data,
         }))
 
-    # Synthesis cards
-    if synthesis:
-        exec_summary = synthesis.get("executive_summary", {})
-        if exec_summary:
-            messages.append(_msg("ai", "summary", {"executive_summary": exec_summary}))
+    # Synthesis Summary card - (Deep Insights removed from chat restore to reduce clutter, 
+    # they are better viewed in the full Report as per user preference).
+    # Synthesis Summary card - (Suppressed in chat to reduce clutter as per user feedback; 
+    # synthesis content is better viewed in the full interactive report).
+    # if synthesis:
+    #     ...
 
-        insights = synthesis.get("detailed_insights", {}).get("insights", [])
-        if insights:
-            messages.append(_msg("ai", "insights", {"insights": insights}))
+    # Report card - (Suppressed in chat; report navigation is now handled via the report artifact)
+    # report_path = output_folder / "report.html"
+    # has_report = report_path.exists()
+    # if has_report:
+    #     messages.append(_msg("ai", "report", {
+    #         "session_id": session_id,
+    #         "ready":      True,
+    #     }))
 
-        connections = synthesis.get("cross_metric_connections", {}).get("connections", [])
-        if connections:
-            messages.append(_msg("ai", "connections", {"connections": connections}))
+    # Conversation Q&A — restore with timestamps and date separators
+    _conv_path = output_folder / "_conversation_cache.json"
+    conversation_history = []
+    if _conv_path.exists():
+        try:
+            conversation_history = json.loads(_conv_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if not conversation_history and live and live.conversation_history:
+        conversation_history = live.conversation_history
 
-        critic = synthesis.get("_critic_review")
-        if critic:
-            messages.append(_msg("ai", "critic", {"review": critic}))
+    if conversation_history:
+        _last_date_str = ""
+        _completed_ts = entry.get("completed_at", 0)
+        for _i, _turn in enumerate(conversation_history):
+            # Support both (q, a) and (q, a, ts) formats
+            _q = _turn[0] if len(_turn) > 0 else ""
+            _a = _turn[1] if len(_turn) > 1 else ""
+            
+            # Defensive check: if _q or _a are objects (poisoned data), extract the text
+            if isinstance(_q, dict): _q = _q.get("text", str(_q))
+            if isinstance(_a, dict): _a = _a.get("text", str(_a))
 
-    # Report card
-    report_path = output_folder / "report.html"
-    has_report = report_path.exists()
-    if has_report:
-        messages.append(_msg("ai", "report", {
-            "session_id": session_id,
-            "ready":      True,
-        }))
+            _ts = _turn[2] if len(_turn) > 2 else (_completed_ts + _i)
+            from datetime import datetime as _dt
+            _dt_obj = _dt.fromtimestamp(_ts)
+            # On Windows strftime does not support %-d (leading zero strip).
+            # We use a more robust way to format the date.
+            try:
+                _date_str = _dt_obj.strftime("%B %d, %Y").replace(" 0", " ")
+            except Exception:
+                _date_str = str(_dt_obj.date()) if _dt_obj else ""
+            _time_str = _dt_obj.strftime("%I:%M %p").lstrip("0")
+            # Emit date separator only when date changes
+            if _date_str != _last_date_str:
+                messages.append({
+                    "id": f"restore_date_{_i}",
+                    "role": "system",
+                    "type": "date_separator",
+                    "payload": {"date": _date_str},
+                    "category": "conversation",
+                    "timestamp": _ts * 1000,
+                })
+                _last_date_str = _date_str
+            messages.append({
+                "id": f"restore_conv_{_i}_q",
+                "role": "user",
+                "type": "text",
+                "payload": _q,
+                "category": "conversation",
+                "timestamp": _ts * 1000,
+            })
+            messages.append({
+                "id": f"restore_conv_{_i}_a",
+                "role": "ai",
+                "type": "text",
+                "payload": _a,
+                "category": "conversation",
+                "timestamp": (_ts + 0.5) * 1000,
+            })
+
+    # Restore conversation into session memory so follow-up /chat works
+    if session_id in sessions and conversation_history:
+        sessions[session_id].conversation_history = conversation_history
 
     canvas_narrative = synthesis.get("conversational_report", "")
 
+    # Cross-session context: find related sessions (same dataset_type) for the sidebar
+    _related = [
+        {
+            "session_id":   e["session_id"],
+            "title":        e.get("title", e.get("csv_filename", "")),
+            "completed_at": e.get("completed_at", 0),
+            "top_priority": e.get("top_priority", ""),
+            "row_count":    e.get("row_count", 0),
+        }
+        for e in _load_history()
+        if e.get("session_id") != session_id
+        and e.get("dataset_type") == entry.get("dataset_type", "")
+        and e.get("status") == "complete"
+    ][:5]
+
     return {
-        "session_id":       session_id,
-        "csv_filename":     entry.get("csv_filename", ""),
-        "output_folder":    str(output_folder),
-        "phase":            "complete",
-        "nodes":            nodes,
-        "synthesis":        synthesis,
-        "has_report":       has_report,
-        "messages":         messages,
-        "canvas_narrative": canvas_narrative,
-        "dataset_type":     entry.get("dataset_type", ""),
-        "row_count":        entry.get("row_count", 0),
-        "col_count":        entry.get("col_count", 0),
+        "session_id":         session_id,
+        "title":              entry.get("title", entry.get("csv_filename", "")),
+        "csv_filename":       entry.get("csv_filename", ""),
+        "csv_available":      bool(sessions.get(session_id) and getattr(sessions[session_id], "csv_path", "") and Path(getattr(sessions[session_id], "csv_path", "")).exists()),
+        "output_folder":      str(output_folder),
+        "phase":              "complete",
+        "nodes":              nodes,
+        "synthesis":          synthesis,
+        "has_report":         has_report,
+        "messages":           messages,
+        "canvas_narrative":   canvas_narrative,
+        "dataset_type":       entry.get("dataset_type", ""),
+        "row_count":          entry.get("row_count", 0),
+        "col_count":          entry.get("col_count", 0),
+        "conversation_turns": len(conversation_history),
+        "related_sessions":   _related,
     }
 
 
@@ -1692,7 +1919,8 @@ async def rerun_synthesis(session_id: str, background_tasks: BackgroundTasks, bo
             pipe_state = get_pipeline_state(session_id)
             effective_state = pipe_state or state
             dag = getattr(state, "dag", []) or []
-            prompt, images = build_synthesis_prompt(session_id, effective_state, dag, output_folder=getattr(state, "output_folder", None))
+            comp_ctx = _get_comparison_context(session_id)
+            prompt, images = build_synthesis_prompt(session_id, effective_state, dag, output_folder=getattr(state, "output_folder", None), comparison_context=comp_ctx)
             if user_instructions:
                 prompt = prompt + f"\n\nUSER INSTRUCTIONS FOR THIS SYNTHESIS:\n{user_instructions}\n"
 
@@ -1898,6 +2126,7 @@ async def _run_chat_analysis(session_id: str, state, message: str) -> dict:
             narrative = result.get("data", {}).get("narrative", {}) if isinstance(result.get("data"), dict) else {}
             ins_sum   = result.get("insight_summary", {}) or {}
 
+            _save_to_history(state, title=getattr(state, "title", ""))
             return {
                 "session_id":  session_id,
                 "response": (
@@ -2078,13 +2307,94 @@ async def chat(session_id: str, request: Request):
 
     if state.conversation_history:
         history_lines = []
-        for _q, _a in state.conversation_history[-5:]:
+        for _turn in state.conversation_history[-5:]:
+            # Support both (q, a) legacy and (q, a, ts) new format
+            _q = _turn[0] if len(_turn) > 0 else ""
+            _a = _turn[1] if len(_turn) > 1 else ""
             history_lines.append(f"User: {_q}\nAssistant: {_a}")
         context_parts.append(
             "PRIOR CONVERSATION (most recent first)\n" + "\n\n".join(history_lines)
         )
 
     separator = "\n" + "=" * 60 + "\n"
+
+    # Cross-session context: inject full synthesis from related sessions (same dataset_type)
+    _current_dtype = getattr(state, "dataset_type", "")
+    _related_blocks = []
+    for _hist_entry in _load_history():
+        if (
+            _hist_entry.get("session_id") == session_id
+            or _hist_entry.get("dataset_type") != _current_dtype
+            or _hist_entry.get("status") != "complete"
+        ):
+            continue
+        _rel_out = _hist_entry.get("output_folder", "")
+        if not _rel_out:
+            continue
+        _syn_path = Path(_rel_out) / "_synthesis_cache.json"
+        if not _syn_path.exists():
+            continue
+        try:
+            _rel_syn = json.loads(_syn_path.read_text(encoding="utf-8"))
+            _rel_title = _hist_entry.get("title", _hist_entry.get("csv_filename", "??"))
+            from datetime import datetime as _dtm
+            _rel_date = _dtm.fromtimestamp(_hist_entry.get("completed_at", 0)).strftime("%Y-%m-%d")
+            _rel_rows = _hist_entry.get("row_count", 0)
+
+            _rel_exec = _rel_syn.get("executive_summary", {})
+            _rel_health = _rel_exec.get("overall_health", "")
+            _rel_priorities = _rel_exec.get("top_priorities", [])
+
+            _rel_insights_raw = _rel_syn.get("detailed_insights", {})
+            if isinstance(_rel_insights_raw, dict):
+                _rel_insights = _rel_insights_raw.get("insights", [])
+            else:
+                _rel_insights = _rel_insights_raw or []
+
+            _rel_connections_raw = _rel_syn.get("cross_metric_connections", {})
+            if isinstance(_rel_connections_raw, dict):
+                _rel_connections = _rel_connections_raw.get("connections", [])
+            else:
+                _rel_connections = _rel_connections_raw or []
+
+            _rel_personas = _rel_syn.get("user_personas", {}).get("personas", [])
+            _rel_interventions = _rel_syn.get("intervention_strategies", {}).get("strategies", [])
+
+            _block_lines = [
+                f"SESSION: {_rel_title}  |  Date: {_rel_date}  |  Rows: {_rel_rows:,}",
+                f"Overall Health: {_rel_health}",
+            ]
+            if _rel_priorities:
+                _block_lines.append("Top Priorities: " + " | ".join(str(p) for p in _rel_priorities[:3]))
+            for _ins in _rel_insights[:6]:
+                _block_lines.append(
+                    f"  [{_ins.get('node_id','?')}] {_ins.get('title','')} — "
+                    f"{_ins.get('ai_summary','')[:200]}"
+                )
+            for _conn in _rel_connections[:3]:
+                _block_lines.append(
+                    f"  Connection: {_conn.get('finding_a','')} ↔ {_conn.get('finding_b','')}"
+                )
+            for _per in _rel_personas[:3]:
+                _block_lines.append(f"  Persona: {_per.get('name','')} — {_per.get('description','')[:120]}")
+            for _inv in _rel_interventions[:3]:
+                _block_lines.append(f"  Intervention: {_inv.get('title','')} — {_inv.get('description','')[:120]}")
+            _rel_conv = str(_rel_syn.get("conversational_report", ""))[:600]
+            if _rel_conv:
+                _block_lines.append(f"Narrative (excerpt): {_rel_conv}")
+
+            _related_blocks.append("\n".join(_block_lines))
+        except Exception as _rse:
+            print(f"WARNING: Could not load related session synthesis ({_hist_entry.get('session_id')}): {_rse}")
+        if len(_related_blocks) >= 3:
+            break
+
+    if _related_blocks:
+        context_parts.append(
+            "RELATED PREVIOUS SESSIONS (same data type — use for comparisons)\n"
+            + ("\n" + "-" * 40 + "\n").join(_related_blocks)
+        )
+
     full_context = separator.join(context_parts)
     prompt = f"{full_context}\n\n{'=' * 60}\nUSER QUESTION: {message}"
 
@@ -2096,7 +2406,19 @@ async def chat(session_id: str, request: Request):
     )
 
     if response:
-        state.conversation_history.append((message, response))
+        state.conversation_history.append((message, response, time.time()))
+        # Persist conversation to disk so it survives restarts and restores
+        _conv_path = Path(state.output_folder) / "_conversation_cache.json"
+        try:
+            _conv_path.write_text(
+                json.dumps(state.conversation_history, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as _ce:
+            print(f"WARNING: Could not write conversation cache: {_ce}")
+        
+        # Sync with master history index so the session jumps to top of sidebar
+        _save_to_history(state, title="") 
 
     return {"session_id": session_id, "response": response}
 

@@ -168,6 +168,22 @@ export function ChatMessage({ message }) {
       );
     case 'skeleton':
       return <SkeletonChartCard analysisType={message.payload?.analysisType} />;
+    case 'date_separator':
+      return (
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 10,
+          padding: '16px 0 8px', userSelect: 'none',
+        }}>
+          <div style={{ flex: 1, height: 1, background: 'rgba(0,0,0,0.08)' }} />
+          <span style={{
+            fontSize: 11, fontWeight: 600, color: 'rgba(0,0,0,0.35)',
+            letterSpacing: '0.04em', whiteSpace: 'nowrap',
+          }}>
+            {message.payload?.date || ''}
+          </span>
+          <div style={{ flex: 1, height: 1, background: 'rgba(0,0,0,0.08)' }} />
+        </div>
+      );
     default:
        return null;
   }

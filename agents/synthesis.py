@@ -734,6 +734,31 @@ def tool_submit_synthesis(
                 with open(_tmp, "w", encoding="utf-8") as _f:
                     json.dump(synthesis, _f)
                 print(f"INFO: synthesis cache written to {_tmp}")
+                # Write per-agent synthesis trace for RM audit
+                try:
+                    import time as _t
+                    _syn_trace = {
+                        "agent": "synthesis",
+                        "completed_at": _t.time(),
+                        "input": {
+                            "analyses_included": list(current_fact_sheet.keys()),
+                            "node_count": len(current_fact_sheet),
+                        },
+                        "output": {
+                            "executive_summary_length": len(str(synthesis.get("executive_summary", {}))),
+                            "insight_count": len(_insights),
+                            "persona_count": len(synthesis.get("user_personas", {}).get("personas", [])),
+                            "intervention_count": len(synthesis.get("intervention_strategies", {}).get("strategies", [])),
+                            "connection_count": len(_connections),
+                            "report_chars": len(_conv),
+                            "qc_passed": True,
+                            "citation_count": validation.get("citation_count", 0),
+                        },
+                    }
+                    with open(_os.path.join(_abs_out, "_agent_synthesis.json"), "w", encoding="utf-8") as _sf:
+                        json.dump(_syn_trace, _sf, indent=2)
+                except Exception as _ste:
+                    print(f"WARNING: Could not write synthesis agent trace: {_ste}")
             else:
                 print(f"WARNING: synthesis cache not written — output_folder unknown for {session_id}")
         except Exception as _ce:
@@ -743,18 +768,18 @@ def tool_submit_synthesis(
                     _int = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
                     _per = synthesis.get("key_segments", synthesis.get("personas", {}))
                     _cmc = synthesis.get("cross_metric_connections", {})
-                    msg = create_message(
-                        sender="synthesis_agent",
-                        recipient="orchestrator",
-                        intent=Intent.SYNTHESIS_COMPLETE,
-                        payload={
-                            "critical_count": _int.get("critical_count", 0) if isinstance(_int, dict) else 0,
-                            "segment_count": _per.get("segment_count", _per.get("persona_count", 0)) if isinstance(_per, dict) else len(synthesis.get("key_segments", synthesis.get("personas", []))),
-                            "connection_count": _cmc.get("connection_count", 0) if isinstance(_cmc, dict) else len(synthesis.get("cross_metric_connections", [])),
-                        },
-                        session_id=session_id,
-                    )
-                    state.post_message(msg)
+#                    msg = create_message(
+#                        sender="synthesis_agent",
+#                        recipient="orchestrator",
+#                        intent=Intent.SYNTHESIS_COMPLETE,
+#                        payload={
+#                            "critical_count": _int.get("critical_count", 0) if isinstance(_int, dict) else 0,
+#                            "segment_count": _per.get("segment_count", _per.get("persona_count", 0)) if isinstance(_per, dict) else len(synthesis.get("key_segments", synthesis.get("personas", []))),
+#                            "connection_count": _cmc.get("connection_count", 0) if isinstance(_cmc, dict) else len(synthesis.get("cross_metric_connections", [])),
+#                        },
+#                        session_id=session_id,
+#                    )
+#                    state.post_message(msg)
                 except Exception:
                     pass
 

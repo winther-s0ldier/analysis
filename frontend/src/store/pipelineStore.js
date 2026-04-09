@@ -13,11 +13,44 @@ export const usePipelineStore = create((set) => ({
   pipelineRunId: 0, // incremented each time a pipeline starts — triggers SSE reconnection
   sidebarCollapsed: false,
   historyOpen: false,
+  activePipelineSessionId: null, // The ID of the currently running analysis (persists through history browsing)
+
+  liveSessionSnapshot: null, // Captures {sessionId, outputFolder, phase, nodes, hasReport, canvasNarrative, canvasOpen, messages}
 
   setSession: (sessionId, outputFolder) => set({
     sessionId, outputFolder,
     phase: 'idle', nodes: [], customMetricNodes: [], hasReport: false,
     canvasOpen: false, canvasNarrative: null,
+  }),
+
+  // Captures current state as the "Active" one — called when starting a pipeline
+  captureLiveSession: (messages) => set((state) => ({
+    liveSessionSnapshot: {
+      sessionId:       state.sessionId,
+      outputFolder:    state.outputFolder,
+      phase:           state.phase,
+      nodes:           state.nodes,
+      hasReport:       state.hasReport,
+      canvasNarrative: state.canvasNarrative,
+      canvasOpen:      state.canvasOpen,
+      messages:        messages || [],
+    }
+  })),
+
+  // Non-destructive restoration of the live session
+  restoreLiveSession: () => set((state) => {
+    if (!state.liveSessionSnapshot) return state;
+    const snap = state.liveSessionSnapshot;
+    return {
+      sessionId:       snap.sessionId,
+      outputFolder:    snap.outputFolder,
+      phase:           snap.phase,
+      nodes:           snap.nodes,
+      hasReport:       snap.hasReport,
+      canvasNarrative: snap.canvasNarrative,
+      canvasOpen:      snap.canvasOpen,
+      historyOpen:     false,
+    };
   }),
   setPhase: (phase) => set({ phase }),
 
@@ -58,6 +91,7 @@ export const usePipelineStore = create((set) => ({
   setCanvasNarrative: (canvasNarrative) => set({ canvasNarrative }),
   startPipelineRun: () => set((state) => ({
     pipelineRunId: state.pipelineRunId + 1,
+    activePipelineSessionId: state.sessionId, // Mark this session as the "Active" one
     hasReport: false,
     canvasOpen: false,
     canvasNarrative: null,
@@ -66,6 +100,8 @@ export const usePipelineStore = create((set) => ({
   reset: () => set({
     sessionId: null,
     outputFolder: null,
+    activePipelineSessionId: null, // Clear active tracker
+    liveSessionSnapshot: null,     // Clear session snapshot
     phase: 'idle',
     nodes: [],
     customMetricNodes: [],

@@ -101,14 +101,14 @@ export function useSSEStream(sessionId) {
         : _rawConns?.connections ?? [];
       if (connections.length) addMessage('ai', 'connections', connections);
 
-      if (synthesis.executive_summary) addMessage('ai', 'summary', synthesis.executive_summary);
+      // if (synthesis.executive_summary) addMessage('ai', 'summary', synthesis.executive_summary);
 
       if (synthesis.conversational_report && !canvasOpenedByChunkRef.current) {
         addMessage('ai', 'narrative', synthesis.conversational_report);
         setCanvasNarrative(synthesis.conversational_report);
       }
 
-      if (synthesis._critic_review) addMessage('ai', 'critic', synthesis._critic_review);
+      // if (synthesis._critic_review) addMessage('ai', 'critic', synthesis._critic_review);
     };
 
     evtSource.onmessage = (e) => {
@@ -227,7 +227,7 @@ export function useSSEStream(sessionId) {
         case 'report_ready':
           setHasReport(true);
           setPhase('building_report');
-          addMessage('ai', 'report', { sessionId });
+          // addMessage('ai', 'report', { sessionId });
           addMessage('ai', 'text', '✓ Full report ready — open the side panel to view.');
           break;
 

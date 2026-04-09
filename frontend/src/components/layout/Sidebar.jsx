@@ -32,9 +32,19 @@ function getStageStatus(stageId, currentPhase) {
 }
 
 export function Sidebar() {
-  const { phase, sidebarCollapsed: collapsed, setSidebarCollapsed, historyOpen, setHistoryOpen, reset } = usePipelineStore();
-  const { clearMessages } = useChatStore();
+  const { sessionId, activePipelineSessionId, restoreLiveSession, phase, sidebarCollapsed: collapsed, setSidebarCollapsed, historyOpen, setHistoryOpen, reset, hasReport, setCanvasOpen } = usePipelineStore();
+  const { restoreMessages, messages, clearMessages } = useChatStore();
+  
+  const isViewingHistory = activePipelineSessionId && activePipelineSessionId !== sessionId;
+
   const handleNewSession = () => { reset(); clearMessages(); };
+  const handleReturnToLive = () => {
+    restoreLiveSession();
+    // Re-hydration of messages handled by restoreLiveSession combined with local state
+    // But we need to make sure chatStore is updated
+    const liveMessages = usePipelineStore.getState().liveSessionSnapshot?.messages || [];
+    restoreMessages(liveMessages);
+  };
   const setCollapsed = (v) => setSidebarCollapsed(v);
   const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
 
@@ -100,6 +110,32 @@ export function Sidebar() {
               </div>
             </div>
 
+            {/* Back to Live Session banner — only shows when viewing history while a live analysis runs */}
+            {isViewingHistory && (
+              <div className="px-3 pb-2 animate-in fade-in slide-in-from-top-2 duration-300">
+                <button
+                  onClick={handleReturnToLive}
+                  className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl text-[11.5px] font-bold transition-all duration-300"
+                  style={{
+                    background: 'linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)',
+                    boxShadow: '0 4px 12px rgba(99, 102, 241, 0.3)',
+                    color: 'white',
+                    border: 'none',
+                    cursor: 'pointer',
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-1px)'; e.currentTarget.style.boxShadow = '0 6px 16px rgba(99, 102, 241, 0.4)'; }}
+                  onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.boxShadow = '0 4px 12px rgba(99, 102, 241, 0.3)'; }}
+                >
+                  <motion.div
+                    animate={{ scale: [1, 1.2, 1] }}
+                    transition={{ duration: 2, repeat: Infinity }}
+                    style={{ width: 6, height: 6, borderRadius: '50%', background: '#10B981' }}
+                  />
+                  RETURN TO LIVE SESSION
+                </button>
+              </div>
+            )}
+
             {/* Divider */}
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', marginBottom: 8 }} />
 
@@ -115,8 +151,14 @@ export function Sidebar() {
                 return (
                   <div
                     key={s.id}
+                    onClick={() => {
+                      if (s.key === 'building_report' && (isComplete || isActive) && hasReport) {
+                        setCanvasOpen(true);
+                      }
+                    }}
                     className={cn(
-                      'relative flex items-center gap-2.5 px-3 py-2 rounded-lg cursor-default transition-all duration-300',
+                      'relative flex items-center gap-2.5 px-3 py-2 rounded-lg transition-all duration-300',
+                      s.key === 'building_report' && hasReport ? 'cursor-pointer' : 'cursor-default'
                     )}
                     style={{
                       backgroundColor: isActive ? '#4E3522' : 'transparent',
@@ -185,6 +227,7 @@ export function Sidebar() {
                 );
               })}
             </nav>
+
 
             {/* Divider */}
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '8px 0' }} />

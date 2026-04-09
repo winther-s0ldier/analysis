@@ -60,6 +60,34 @@ def tool_profile_and_classify(
         },
     }
 
+    # Write per-agent trace file for RM audit / history restore
+    try:
+        import time as _t
+        from agent_servers.a2a_client import lookup_session as _lookup
+        _out = _lookup(session_id)
+        if _out:
+            import pathlib
+            _trace = {
+                "agent": "profiler",
+                "completed_at": _t.time(),
+                "input": {
+                    "csv_filename": raw_profile.get("filename", ""),
+                    "row_count": raw_profile.get("row_count", 0),
+                    "column_count": raw_profile.get("column_count", 0),
+                },
+                "output": {
+                    "dataset_type": raw_profile.get("dataset_type", ""),
+                    "column_roles": raw_profile.get("column_roles", {}),
+                    "confidence": raw_profile.get("confidence", 0.0),
+                    "recommended_analyses": raw_profile.get("recommended_analyses", []),
+                },
+            }
+            pathlib.Path(_out, "_agent_profiler.json").write_text(
+                json.dumps(_trace, indent=2), encoding="utf-8"
+            )
+    except Exception as _pe:
+        print(f"WARNING: [Profiler] Could not write agent trace: {_pe}")
+
     return {
         "raw_profile": raw_profile
     }

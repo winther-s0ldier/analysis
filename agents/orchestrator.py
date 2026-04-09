@@ -174,7 +174,7 @@ def get_post_dag_agent():
     )
     return _post_dag_agent_instance
 
-def build_synthesis_prompt(session_id: str, state, dag: list = None, output_folder: str = None) -> tuple:
+def build_synthesis_prompt(session_id: str, state, dag: list = None, output_folder: str = None, comparison_context: str = "") -> tuple:
     dag = dag or getattr(state, "dag", []) or []
 
     def _clean(obj):
@@ -278,16 +278,19 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
         f"{_dag_graph}\n"
         f"\n== PRE-EXTRACTED FACT SHEET (Cite ONLY these numbers) ==\n"
         f"{_fact_json}\n\n"
+        + (f"== HISTORICAL CONTEXT (Comparison) ==\n{comparison_context}\n\n" if comparison_context else "") +
         f"INSTRUCTIONS (Management Consulting Standard - McKinsey/BCG/JP Morgan Style):\n"
         f"1. Call tool_aggregate_results(session_id) to get column_roles context.\n"
         f"2. Apply the PYRAMID PRINCIPLE: Identify the 'Bottom Line Up Front' (BLUF) — the 1 core message the CEO needs to see.\n"
         f"3. Frame the Executive Summary using SCQA: Situation (baseline), Complication (the problem), Question (the risk), Answer (the win).\n"
-        f"4. Use ACTION TITLES: All section headers MUST be complete sentences that state a finding (e.g., 'A1: 70% Bounce rate is a technical, not traffic, bottleneck' instead of 'Session analysis').\n"
-        f"5. Strategic Opportunity Loss: For every major failure, attempt to calculate the 'estimated revenue leakage' or 'wasted user potential' using the fact sheet counts.\n"
-        f"6. Build the synthesis JSON. conversational_report MUST contain '# Strategic Executive Summary', '# Key Strategic Findings', '# Prioritized Action Roadmap', '# Data Confidence Assessment'.\n"
-        f"7. In '# Data Confidence Assessment', EXPLAIN why the 'aggregate_data_reliability' is "
+        f"4. **DRIFT ANALYSIS (if Historical Context exists)**: Add a concluding section titled '# Comparative Strategic Insights' to the conversational_report. "
+        f"Contrast current findings with prior sessions. If the data is identical (same CSV), highlight novel findings from new nodes or confirm stability of metrics.\n"
+        f"5. Use ACTION TITLES: All section headers MUST be complete sentences that state a finding (e.g., 'A1: 70% Bounce rate is a technical, not traffic, bottleneck' instead of 'Session analysis').\n"
+        f"6. Strategic Opportunity Loss: For every major failure, attempt to calculate the 'estimated revenue leakage' or 'wasted user potential' using the fact sheet counts.\n"
+        f"7. Build the synthesis JSON. conversational_report MUST contain '# Strategic Executive Summary', '# Key Strategic Findings', '# Prioritized Action Roadmap', '# Data Confidence Assessment', and '# Comparative Strategic Insights' (if applicable).\n"
+        f"8. In '# Data Confidence Assessment', EXPLAIN why the 'aggregate_data_reliability' is "
         f"{_reliability_pct}% based on noisy/strong nodes.\n"
-        f"8. Call tool_submit_synthesis(session_id='{session_id}', synthesis_json_str=..., output_folder='{output_folder}') immediately after completion."
+        f"9. Call tool_submit_synthesis(session_id='{session_id}', synthesis_json_str=..., output_folder='{output_folder}') immediately after completion."
     )
 
     images = []
@@ -308,6 +311,7 @@ async def run_full_pipeline(
     approved_metrics: list = None,
     custom_requests: list = None,
     state=None,
+    comparison_context: str = "",
 ) -> dict:
     if state is None:
         try:
@@ -586,7 +590,7 @@ async def run_full_pipeline(
             except Exception as _rce:
                 print(f"WARNING: [A2A] results cache write failed: {_rce}")
 
-        synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag, output_folder=output_folder)
+        synthesis_prompt, image_paths = build_synthesis_prompt(session_id, state, dag, output_folder=output_folder, comparison_context=comparison_context)
 
         _mode = "A2A HTTP" if _USE_A2A_MULTISERVER else "SequentialAgent (ADK-native)"
         print(f"INFO: [{session_id}] Stages 4-6  - Synthesis -> Critic -> Report ({_mode})")
@@ -788,15 +792,15 @@ async def run_full_pipeline(
         except Exception as _rs_err:
             print(f"[DataGate] register_schema non-fatal: {_rs_err}")
 
-        _post_message(
-            state, "orchestrator", "frontend",
-            Intent.REPORT_READY, session_id,
-            {
-                "report_path":   report_path,
-                "total_results": len(state.results),
-                "status":        "complete",
-            }
-        )
+#        _post_message(
+#            state, "orchestrator", "frontend",
+#            Intent.REPORT_READY, session_id,
+#            {
+#                "report_path":   report_path,
+#                "total_results": len(state.results),
+#                "status":        "complete",
+#            }
+#        )
 
         return {
             "status":         "complete",

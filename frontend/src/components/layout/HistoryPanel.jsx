@@ -37,54 +37,38 @@ function DatasetBadge({ type }) {
 }
 
 export function HistoryPanel() {
-  const { historyOpen, setHistoryOpen, setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen, reset } = usePipelineStore();
-  const { restoreMessages, clearMessages } = useChatStore();
+  const { historyOpen, setHistoryOpen, setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen, reset, captureLiveSession, restoreLiveSession, liveSessionSnapshot } = usePipelineStore();
+  const { restoreMessages, messages, clearMessages } = useChatStore();
 
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(false);
   const [restoring, setRestoring] = useState(null);
   const [error, setError] = useState('');
 
-  // Snapshot of the session that was active when the panel was opened
-  const prevSessionSnapshot = useRef(null);
-
   // Capture current session state the moment the panel opens
   useEffect(() => {
     if (!historyOpen) return;
-    const ps = usePipelineStore.getState();
-    const cs = useChatStore.getState();
-    prevSessionSnapshot.current = {
-      sessionId:       ps.sessionId,
-      outputFolder:    ps.outputFolder,
-      phase:           ps.phase,
-      nodes:           ps.nodes,
-      hasReport:       ps.hasReport,
-      canvasNarrative: ps.canvasNarrative,
-      canvasOpen:      ps.canvasOpen,
-      messages:        cs.messages,
-    };
+    
+    // Capture the state of whatever is currently in view (live or restored)
+    // so we can "go back" to it.
+    captureLiveSession(messages);
+    
     setLoading(true);
     setError('');
     getHistory()
       .then(data => setEntries(Array.isArray(data) ? data : []))
       .catch(() => setError('Could not load history.'))
       .finally(() => setLoading(false));
-  }, [historyOpen]);
+  }, [historyOpen, captureLiveSession, messages]);
 
   // Restore the snapshot that was active before the panel opened
   const handleBack = useCallback(() => {
-    const snap = prevSessionSnapshot.current;
-    if (snap && snap.sessionId) {
-      setSession(snap.sessionId, snap.outputFolder);
-      setPhase(snap.phase);
-      setNodes(snap.nodes || []);
-      setHasReport(snap.hasReport || false);
-      setCanvasNarrative(snap.canvasNarrative || null);
-      setCanvasOpen(snap.canvasOpen || false);
-      restoreMessages(snap.messages || []);
+    if (liveSessionSnapshot) {
+      restoreLiveSession();
+      restoreMessages(liveSessionSnapshot.messages || []);
     }
     setHistoryOpen(false);
-  }, [setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen, restoreMessages, setHistoryOpen]);
+  }, [restoreLiveSession, restoreMessages, liveSessionSnapshot, setHistoryOpen]);
 
   const handleNewAnalysis = useCallback(() => {
     reset();
@@ -239,14 +223,14 @@ export function HistoryPanel() {
                     onMouseEnter={e => { if (!isRestoring) e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
                     onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
                   >
-                    {/* Row 1: filename + time */}
+                    {/* Row 1: title + time */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, width: '100%' }}>
                       <span style={{
                         color: '#F0EBE3', fontSize: 12.5, fontWeight: 600,
                         flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         letterSpacing: '-0.01em',
                       }}>
-                        {entry.csv_filename || 'Unknown file'}
+                        {entry.title || entry.csv_filename || 'Unknown file'}
                       </span>
                       {isRestoring
                         ? <RotateCcw size={12} style={{ color: '#6366F1', flexShrink: 0, animation: 'spin 1s linear infinite' }} />
@@ -254,13 +238,22 @@ export function HistoryPanel() {
                       }
                     </div>
 
-                    {/* Row 2: badge + stats */}
+                    {/* Row 2: badge + stats + conversation turns */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                       <DatasetBadge type={entry.dataset_type} />
                       <span style={{ color: 'rgba(255,255,255,0.3)', fontSize: 11 }}>
                         {entry.row_count ? `${entry.row_count.toLocaleString()} rows` : ''}
                         {entry.node_count ? ` · ${entry.node_count} analyses` : ''}
                       </span>
+                      {entry.conversation_turns > 0 && (
+                        <span style={{
+                          fontSize: 10, fontWeight: 600, padding: '1px 5px', borderRadius: 4,
+                          background: 'rgba(16,185,129,0.15)', color: '#6EE7B7',
+                          border: '1px solid rgba(16,185,129,0.25)', flexShrink: 0,
+                        }}>
+                          {entry.conversation_turns} Q&amp;A
+                        </span>
+                      )}
                     </div>
 
                     {/* Row 3: top priority */}

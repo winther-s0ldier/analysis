@@ -289,6 +289,34 @@ def tool_submit_analysis_plan(
         }
         _plan_store[session_id] = plan
 
+        # Write per-agent discovery trace for RM audit
+        try:
+            import time as _t
+            from agent_servers.a2a_client import lookup_session as _lookup_disc
+            _disc_out = _lookup_disc(session_id)
+            if _disc_out:
+                import pathlib
+                _custom_nodes = [n["analysis_type"] for n in final_dag if not LIBRARY_REGISTRY.get(n.get("analysis_type", ""))]
+                _disc_trace = {
+                    "agent": "discovery",
+                    "completed_at": _t.time(),
+                    "input": {
+                        "dataset_type": parsed.get("dataset_type", "") if isinstance(parsed, dict) else "",
+                        "node_count_planned": len(final_dag),
+                    },
+                    "output": {
+                        "node_count": len(final_dag),
+                        "analysis_types": [n.get("analysis_type") for n in final_dag],
+                        "custom_types": _custom_nodes,
+                        "dag": final_dag,
+                    },
+                }
+                pathlib.Path(_disc_out, "_agent_discovery.json").write_text(
+                    json.dumps(_disc_trace, indent=2), encoding="utf-8"
+                )
+        except Exception as _dpe:
+            print(f"WARNING: [Discovery] Could not write agent trace: {_dpe}")
+
         try:
             from agent_servers.a2a_client import lookup_session as _lookup_s
             _abs_out = _lookup_s(session_id)

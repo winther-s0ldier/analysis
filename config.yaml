@@ -2,9 +2,9 @@ pipeline:
   max_parallel_nodes: 5        # orchestrator.py DAG semaphore
   sse_poll_interval: 0.4       # main.py SSE generator sleep
   synthesis_delay: 2.0         # orchestrator.py pre-synthesis pause
-  session_ttl: 86400           # main.py session TTL (seconds)
+  session_ttl: 31536000          # main.py session TTL (1 Year, seconds)
   sse_sleep_spacing: 0.45      # orchestrator.py staggered SSE push sleep
-  session_restore_interval: 3600   # main.py in-memory session eviction loop sleep (seconds)
+  session_restore_interval: 86400   # main.py in-memory session eviction loop sleep (24 hours)
   rate_limit_default_delay: 20     # main.py fallback base delay when API rate-limits (seconds)
 
 retry:
