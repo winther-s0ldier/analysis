@@ -1677,8 +1677,8 @@ async def restore_history_session(session_id: str):
     #     ...
 
     # Report card - (Suppressed in chat; report navigation is now handled via the report artifact)
-    # report_path = output_folder / "report.html"
-    # has_report = report_path.exists()
+    report_path = output_folder / "report.html"
+    has_report = report_path.exists()
     # if has_report:
     #     messages.append(_msg("ai", "report", {
     #         "session_id": session_id,

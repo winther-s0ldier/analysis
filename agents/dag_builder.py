@@ -912,6 +912,37 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             f'{body}</section>'
         )
 
+    # Pre-compute hero band to avoid triple-nested f-strings (Python 3.10 incompatible)
+    if _conf_pct:
+        _quality_div = (
+            '<div style="width:1px;height:120px;background:#E2E8F0;"></div>'
+            '<div style="width:200px;flex-shrink:0;">'
+            '<div style="font-size:10px;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:8px;">Data Quality</div>'
+            f'<div style="font-size:24px;font-weight:800;color:{crit_col};">{_conf_pct}%</div>'
+            '<div style="font-size:11px;color:#64748B;line-height:1.4;">Reliability index for current session.</div>'
+            '</div>'
+        )
+    else:
+        _quality_div = ""
+
+    if hero_title or hero_summary:
+        _hero_band_html = (
+            '<div class="hero-band" style="background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:40px 48px;">'
+            '<div style="max-width:1036px;margin:0 auto;display:flex;gap:40px;align-items:flex-start;">'
+            '<div style="flex:1;">'
+            '<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;'
+            'color:#10B981;margin-bottom:12px;">Strategic Priority</div>'
+            f'<div style="font-size:24px;font-weight:800;color:#0F172A;line-height:1.2;margin-bottom:16px;'
+            f'letter-spacing:-0.02em;">{hero_title}</div>'
+            f'<p style="font-size:15px;color:#475569;line-height:1.7;margin:0;max-width:700px;">{hero_summary}</p>'
+            '</div>'
+            f'{_quality_div}'
+            '</div>'
+            '</div>'
+        )
+    else:
+        _hero_band_html = ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1018,22 +1049,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
   </div>
 </div>
 
-{f'''<div class="hero-band" style="background:#F8FAFC;border-bottom:1px solid #E2E8F0;padding:40px 48px;">
-  <div style="max-width:1036px;margin:0 auto;display:flex;gap:40px;align-items:flex-start;">
-    <div style="flex:1;">
-      <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;
-                  color:#10B981;margin-bottom:12px;">Strategic Priority</div>
-      <div style="font-size:24px;font-weight:800;color:#0F172A;line-height:1.2;margin-bottom:16px;
-                  letter-spacing:-0.02em;">{hero_title}</div>
-      <p style="font-size:15px;color:#475569;line-height:1.7;margin:0;max-width:700px;">{hero_summary}</p>
-    </div>
-    {f'<div style="width:1px;height:120px;background:#E2E8F0;"></div><div style="width:200px;flex-shrink:0;">'
-     f'<div style="font-size:10px;font-weight:700;color:#94A3B8;text-transform:uppercase;margin-bottom:8px;">Data Quality</div>'
-     f'<div style="font-size:24px;font-weight:800;color:{crit_col};">{_conf_pct}%</div>'
-     f'<div style="font-size:11px;color:#64748B;line-height:1.4;">Reliability index for current session.</div>'
-     f'</div>' if _conf_pct else ''}
-  </div>
-</div>''' if hero_title or hero_summary else ''}
+{_hero_band_html}
 
 <div class="body-wrap">
 
