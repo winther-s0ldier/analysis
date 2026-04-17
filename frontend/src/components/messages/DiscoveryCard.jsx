@@ -35,11 +35,11 @@ function NodeRow({ node, index = 0 }) {
   const rawName = node.name || node.analysis_type || '';
   const displayName = rawName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 
-  const idBg     = isComplete ? 'rgba(16,185,129,0.1)'  : isFailed ? 'rgba(239,68,68,0.1)'  : isRunning ? 'rgba(99,102,241,0.1)'  : '#F3F4F6';
-  const idColor  = isComplete ? '#10B981'                : isFailed ? '#EF4444'               : isRunning ? '#6366F1'               : '#9CA3AF';
-  const idBorder = isComplete ? 'rgba(16,185,129,0.3)'  : isFailed ? 'rgba(239,68,68,0.3)'   : isRunning ? 'rgba(99,102,241,0.3)'  : '#E5E7EB';
+  const idBg     = isComplete ? 'rgba(16,185,129,0.1)'  : isFailed ? 'rgba(239,68,68,0.1)'  : isRunning ? 'rgba(251,113,133,0.1)'  : '#F3F4F6';
+  const idColor  = isComplete ? '#10B981'                : isFailed ? '#EF4444'               : isRunning ? '#FB7185'               : '#9CA3AF';
+  const idBorder = isComplete ? 'rgba(16,185,129,0.3)'  : isFailed ? 'rgba(239,68,68,0.3)'   : isRunning ? 'rgba(251,113,133,0.3)'  : '#E5E7EB';
 
-  const rowBg = isComplete ? 'rgba(16,185,129,0.06)' : isFailed ? 'rgba(239,68,68,0.06)' : isRunning ? 'rgba(99,102,241,0.06)' : 'transparent';
+  const rowBg = isComplete ? 'rgba(16,185,129,0.06)' : isFailed ? 'rgba(239,68,68,0.06)' : isRunning ? 'rgba(251,113,133,0.06)' : 'transparent';
 
   return (
     <div
@@ -99,9 +99,9 @@ export function DiscoveryCard({ data }) {
             <span
               className="inline-flex items-center px-2 py-0.5 rounded-full text-[10.5px] font-semibold border"
               style={{
-                background: 'rgba(99,102,241,0.08)',
-                color: '#6366F1',
-                borderColor: 'rgba(99,102,241,0.2)',
+                background: 'rgba(251,113,133,0.08)',
+                color: '#FB7185',
+                borderColor: 'rgba(251,113,133,0.2)',
               }}
             >
               {dag.length} nodes

@@ -13,7 +13,7 @@ export function Badge({ children, variant = 'default', className }) {
     warning: 'bg-status-warning-dim border-[rgba(245,158,11,0.2)] text-status-warning',
     error:   'bg-status-error-dim border-[rgba(239,68,68,0.2)] text-status-error',
     info:    'bg-status-info-dim border-[rgba(59,130,246,0.2)] text-status-info',
-    accent: 'bg-accent-dim border-[rgba(99,102,241,0.2)] text-accent',
+    accent: 'bg-accent-dim border-[rgba(251,113,133,0.2)] text-accent',
   };
 
   return (

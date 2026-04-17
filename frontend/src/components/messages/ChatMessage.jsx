@@ -79,8 +79,8 @@ export function ChatMessage({ message }) {
           <div style={{ display:'flex', flexDirection:'column', gap:5, maxWidth:'85%' }}>
             <div style={{
               fontSize:12, color:'#4B5563', fontStyle:'italic',
-              borderLeft:'3px solid #6366F1', paddingLeft:10, lineHeight:1.5,
-              background:'rgba(99,102,241,0.06)', borderRadius:'0 6px 6px 0',
+              borderLeft:'3px solid #FB7185', paddingLeft:10, lineHeight:1.5,
+              background:'rgba(251,113,133,0.06)', borderRadius:'0 6px 6px 0',
               padding:'6px 10px',
             }}>
               "{message.payload.selectedText.length > 200

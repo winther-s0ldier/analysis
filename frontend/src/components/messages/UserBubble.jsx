@@ -27,8 +27,8 @@ export function UserBubble({ message }) {
           <div
             className="w-9 h-9 rounded-xl flex items-center justify-center shrink-0"
             style={{
-              background: 'rgba(99,102,241,0.1)',
-              color: '#6366F1',
+              background: 'rgba(251,113,133,0.1)',
+              color: '#FB7185',
             }}
           >
             <FileBarChart size={18} strokeWidth={2} />

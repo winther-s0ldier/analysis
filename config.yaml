@@ -14,10 +14,17 @@ retry:
   node_timeout: 120.0          # orchestrator.py single-node execution timeout
 
 agents:
-  ports:
-    synthesis: 8004
-    critic: 8005
-    dag_builder: 8006
+  # Single source of truth for A2A server bind + client connect.
+  # server_base.py reads `port` for uvicorn bind; a2a_client.py reads `url` for outgoing calls.
+  # `url` is the bootstrap endpoint used to fetch /.well-known/agent-card.json;
+  # on first contact the client caches the AgentCard's own `url` field and uses that going forward.
+  servers:
+    profiler:    { port: 8001, url: "http://localhost:8001" }
+    discovery:   { port: 8002, url: "http://localhost:8002" }
+    coder:       { port: 8003, url: "http://localhost:8003" }
+    synthesis:   { port: 8004, url: "http://localhost:8004" }
+    critic:      { port: 8005, url: "http://localhost:8005" }
+    dag_builder: { port: 8006, url: "http://localhost:8006" }
   max_turns:
     discovery: 12         # main.py /discover endpoint
     critic: 8             # main.py rerun-synthesis critic call

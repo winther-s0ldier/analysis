@@ -92,8 +92,8 @@ export function TerminalCard({ totalNodes = 0 }) {
             <motion.div
               className="h-full rounded-full"
               style={{
-                background: isDone ? '#10B981' : '#6366F1',
-                boxShadow: isDone ? '0 0 6px rgba(16,185,129,0.4)' : '0 0 6px rgba(99,102,241,0.4)',
+                background: isDone ? '#10B981' : '#FB7185',
+                boxShadow: isDone ? '0 0 6px rgba(16,185,129,0.4)' : '0 0 6px rgba(251,113,133,0.4)',
               }}
               initial={{ width: 0 }}
               animate={{ width: `${progressPct}%` }}
@@ -105,7 +105,7 @@ export function TerminalCard({ totalNodes = 0 }) {
           </span>
           <span
             className="text-[11px] font-mono font-semibold tabular-nums"
-            style={{ color: isDone ? '#10B981' : '#6366F1' }}
+            style={{ color: isDone ? '#10B981' : '#FB7185' }}
           >
             {progressPct}%
           </span>

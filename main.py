@@ -77,11 +77,11 @@ async def lifespan(app: FastAPI):
         _server_script = str(Path(__file__).parent / "agent_servers" / "server_base.py")
         _log_dir = Path(__file__).parent / "logs"
         _log_dir.mkdir(exist_ok=True)
-        _agent_ports = get_config()["agents"]["ports"]
+        _agent_servers_cfg = get_config()["agents"]["servers"]
         for _agent_name, _port in [
-            ("synthesis", _agent_ports["synthesis"]),
-            ("critic", _agent_ports["critic"]),
-            ("dag_builder", _agent_ports["dag_builder"]),
+            ("synthesis",   _agent_servers_cfg["synthesis"]["port"]),
+            ("critic",      _agent_servers_cfg["critic"]["port"]),
+            ("dag_builder", _agent_servers_cfg["dag_builder"]["port"]),
         ]:
             try:
                 _log_out = open(_log_dir / f"{_agent_name}.log", "a", encoding="utf-8")

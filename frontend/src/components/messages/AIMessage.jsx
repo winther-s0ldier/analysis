@@ -25,8 +25,8 @@ export function AIMessage({ children }) {
       <div
         className="w-7 h-7 rounded-full flex items-center justify-center shrink-0 mt-0.5"
         style={{
-          background: 'linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)',
-          boxShadow: '0 2px 8px rgba(99,102,241,0.3)',
+          background: 'linear-gradient(135deg, #FB7185 0%, #FB923C 100%)',
+          boxShadow: '0 2px 8px rgba(251,113,133,0.3)',
         }}
       >
         <GridIcon size={14} color="#fff" />
@@ -87,7 +87,7 @@ function MarkdownText({ text }) {
                   <li key={li} className="flex items-start gap-2">
                     <span
                       className="shrink-0 w-1.5 h-1.5 rounded-full mt-[6px]"
-                      style={{ background: '#6366F1', opacity: 0.6 }}
+                      style={{ background: '#FB7185', opacity: 0.6 }}
                     />
                     <span><InlineMarkdown text={content} /></span>
                   </li>
@@ -109,7 +109,7 @@ function MarkdownText({ text }) {
                   <span key={li} className="flex items-start gap-2 mt-1">
                     <span
                       className="shrink-0 w-1.5 h-1.5 rounded-full mt-[6px]"
-                      style={{ background: '#6366F1', opacity: 0.6 }}
+                      style={{ background: '#FB7185', opacity: 0.6 }}
                     />
                     <span><InlineMarkdown text={content} /></span>
                   </span>

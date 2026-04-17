@@ -22,7 +22,7 @@ function StatChip({ label, value }) {
 function TypePill({ label, count, color }) {
   if (!count) return null;
   const colorMap = {
-    numeric:     { bg: 'rgba(99,102,241,0.08)',  text: '#6366F1', border: 'rgba(99,102,241,0.18)' },
+    numeric:     { bg: 'rgba(251,113,133,0.08)',  text: '#FB7185', border: 'rgba(251,113,133,0.18)' },
     categorical: { bg: 'rgba(16,185,129,0.08)',  text: '#059669', border: 'rgba(16,185,129,0.18)' },
     datetime:    { bg: 'rgba(245,158,11,0.08)',  text: '#D97706', border: 'rgba(245,158,11,0.18)' },
   };
@@ -39,7 +39,7 @@ function TypePill({ label, count, color }) {
 
 const ROLE_LABEL = { entity_col: 'Entity', time_col: 'Time', event_col: 'Event', outcome_col: 'Outcome', funnel_col: 'Funnel' };
 const ROLE_COLOR = {
-  entity_col:  { bg: 'rgba(99,102,241,0.07)',  text: '#6366F1', border: 'rgba(99,102,241,0.15)' },
+  entity_col:  { bg: 'rgba(251,113,133,0.07)',  text: '#FB7185', border: 'rgba(251,113,133,0.15)' },
   time_col:    { bg: 'rgba(245,158,11,0.07)',  text: '#D97706', border: 'rgba(245,158,11,0.15)' },
   event_col:   { bg: 'rgba(16,185,129,0.07)',  text: '#059669', border: 'rgba(16,185,129,0.15)' },
   outcome_col: { bg: 'rgba(59,130,246,0.07)',  text: '#2563EB', border: 'rgba(59,130,246,0.15)' },
@@ -65,10 +65,10 @@ export function ProfileCard({ data }) {
     if (fallbackType || fallbackRows || fallbackCols) {
       const typeLabel = DATASET_TYPE_LABEL[fallbackType] || (fallbackType || 'Dataset').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
       return (
-        <div className="w-full rounded-xl border overflow-hidden shadow-sm" style={{ background: '#FAFAF9', borderColor: '#E5E1DC' }}>
-          <div className="flex items-center gap-2.5 px-4 py-3 border-b" style={{ background: '#F5F2EE', borderColor: '#E5E1DC' }}>
-            <span className="text-[13px] font-semibold" style={{ color: '#1C1612' }}>Dataset Profile</span>
-            <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: 'rgba(99,102,241,0.1)', color: '#6366F1' }}>{typeLabel}</span>
+        <div className="w-full rounded-xl border overflow-hidden shadow-sm" style={{ background: '#F8FAFC', borderColor: '#E2E8F0' }}>
+          <div className="flex items-center gap-2.5 px-4 py-3 border-b" style={{ background: '#F8FAFC', borderColor: '#E2E8F0' }}>
+            <span className="text-[13px] font-semibold" style={{ color: '#0F172A' }}>Dataset Profile</span>
+            <span className="ml-auto text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: 'rgba(251,113,133,0.1)', color: '#FB7185' }}>{typeLabel}</span>
           </div>
           <div className="flex gap-3 px-4 py-3 flex-wrap">
             {fallbackFile && <StatChip label="File" value={fallbackFile} />}
@@ -116,7 +116,7 @@ export function ProfileCard({ data }) {
       <div className="flex items-center gap-2.5 px-4 pt-4 pb-3 border-b" style={{ borderColor: '#F3F4F6' }}>
         <span
           className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-bold border"
-          style={{ background: 'rgba(99,102,241,0.08)', color: '#6366F1', borderColor: 'rgba(99,102,241,0.2)' }}
+          style={{ background: 'rgba(251,113,133,0.08)', color: '#FB7185', borderColor: 'rgba(251,113,133,0.2)' }}
         >
           {typeLabel}
         </span>

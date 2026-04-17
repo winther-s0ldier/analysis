@@ -120,7 +120,7 @@ export function RunAnalysisCard({ sessionId }) {
               disabled={validating}
               className="flex-1 px-3 py-2 text-[13px] rounded-lg border outline-none transition-all"
               style={{ background: '#F9FAFB', borderColor: '#E5E7EB', color: '#111827' }}
-              onFocus={e => { e.target.style.borderColor = 'rgba(99,102,241,0.5)'; e.target.style.boxShadow = '0 0 0 3px rgba(99,102,241,0.08)'; }}
+              onFocus={e => { e.target.style.borderColor = 'rgba(251,113,133,0.5)'; e.target.style.boxShadow = '0 0 0 3px rgba(251,113,133,0.08)'; }}
               onBlur={e => { e.target.style.borderColor = '#E5E7EB'; e.target.style.boxShadow = 'none'; }}
             />
             <button
@@ -185,17 +185,17 @@ export function RunAnalysisCard({ sessionId }) {
                   initial={{ opacity: 0, scale: 0.97 }}
                   animate={{ opacity: 1, scale: 1 }}
                   className="flex items-start gap-2 px-3 py-2 rounded-xl border"
-                  style={{ background: 'rgba(99,102,241,0.04)', borderColor: 'rgba(99,102,241,0.2)' }}
+                  style={{ background: 'rgba(251,113,133,0.04)', borderColor: 'rgba(251,113,133,0.2)' }}
                 >
-                  <CheckCircle size={13} strokeWidth={2.5} className="shrink-0 mt-0.5" style={{ color: '#6366F1' }} />
+                  <CheckCircle size={13} strokeWidth={2.5} className="shrink-0 mt-0.5" style={{ color: '#FB7185' }} />
                   <div className="flex-1 min-w-0">
-                    <div className="text-[12.5px] font-semibold" style={{ color: '#6366F1' }}>{m.name}</div>
+                    <div className="text-[12.5px] font-semibold" style={{ color: '#FB7185' }}>{m.name}</div>
                     {m.description && (
                       <div className="text-[11.5px] mt-0.5 leading-relaxed" style={{ color: '#6B7280' }}>{m.description}</div>
                     )}
                   </div>
                   <button onClick={() => removeMetric(m.id)} className="shrink-0 opacity-40 hover:opacity-80 transition-opacity mt-0.5">
-                    <X size={12} strokeWidth={2.5} style={{ color: '#6366F1' }} />
+                    <X size={12} strokeWidth={2.5} style={{ color: '#FB7185' }} />
                   </button>
                 </motion.div>
               ))}
@@ -210,11 +210,11 @@ export function RunAnalysisCard({ sessionId }) {
             disabled={running}
             className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-[13.5px] font-semibold text-white transition-all w-full justify-center"
             style={{
-              background: running ? '#9CA3AF' : '#6366F1',
-              boxShadow: running ? 'none' : '0 2px 8px rgba(99,102,241,0.3)',
+              background: running ? '#9CA3AF' : '#FB7185',
+              boxShadow: running ? 'none' : '0 2px 8px rgba(251,113,133,0.3)',
             }}
-            onMouseEnter={e => { if (!running) e.currentTarget.style.background = '#4F46E5'; }}
-            onMouseLeave={e => { if (!running) e.currentTarget.style.background = '#6366F1'; }}
+            onMouseEnter={e => { if (!running) e.currentTarget.style.background = '#F43F5E'; }}
+            onMouseLeave={e => { if (!running) e.currentTarget.style.background = '#FB7185'; }}
           >
             <Play size={15} strokeWidth={2.5} className={running ? 'animate-pulse' : ''} />
             {running ? 'Starting…' : 'Run Analysis'}

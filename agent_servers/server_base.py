@@ -39,14 +39,15 @@ AGENT_MAP = {
     "dag_builder": ("agents.dag_builder", "get_dag_builder_agent"),
 }
 
-DEFAULT_PORTS = {
-    "profiler":    8001,
-    "discovery":   8002,
-    "coder":       8003,
-    "synthesis":   8004,
-    "critic":      8005,
-    "dag_builder": 8006,
-}
+def _load_server_config(agent_name: str) -> dict:
+    from tools.config_loader import get_config
+    servers = get_config().get("agents", {}).get("servers", {})
+    if agent_name not in servers:
+        raise KeyError(
+            f"config.yaml: agents.servers.{agent_name} missing — "
+            f"add it with `port:` and `url:` keys."
+        )
+    return servers[agent_name]
 
 def main():
     parser = argparse.ArgumentParser(
@@ -58,7 +59,7 @@ def main():
     )
     parser.add_argument(
         "--port", type=int, default=None,
-        help="Port to listen on (defaults: profiler=8001, discovery=8002, ...)"
+        help="Port to listen on (defaults from config.yaml agents.servers.<name>.port)"
     )
     parser.add_argument(
         "--host", default="0.0.0.0",
@@ -66,7 +67,9 @@ def main():
     )
     args = parser.parse_args()
 
-    port = args.port or DEFAULT_PORTS[args.agent]
+    cfg = _load_server_config(args.agent)
+    port = args.port or int(cfg["port"])
+    advertised_host = "localhost" if args.host in ("0.0.0.0", "") else args.host
     module_path, factory_name = AGENT_MAP[args.agent]
 
     print(f"INFO: Loading {args.agent} agent from {module_path}.{factory_name}...")
@@ -81,7 +84,9 @@ def main():
         print("ERROR: google.adk.a2a not available — install google-adk >= 1.0.0")
         sys.exit(1)
 
-    app = _to_a2a(agent)
+    from agent_servers.agent_cards import build_agent_card
+    card = build_agent_card(args.agent, host=advertised_host, port=port)
+    app = _to_a2a(agent, agent_card=card)
     app.add_middleware(_BearerAuthMiddleware)
 
     import uvicorn
