@@ -3,7 +3,7 @@ import { BookOpen, ExternalLink } from 'lucide-react';
 import { usePipelineStore } from '../../store/pipelineStore';
 
 export function ReportEmbedCard({ sessionId }) {
-  const { setCanvasOpen } = usePipelineStore();
+  const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
 
   return (
     <button

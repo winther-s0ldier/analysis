@@ -13,7 +13,7 @@ const terminalOverrides = `
 `;
 
 export function TerminalCard({ totalNodes = 0 }) {
-  const { nodes } = usePipelineStore();
+  const nodes = usePipelineStore((s) => s.sessions[s.currentSessionId]?.nodes ?? []);
 
   const completedNodes = nodes.filter(n => n.status === 'complete' || n.status === 'failed').length;
   const total = Math.max(totalNodes, nodes.length) || 1;

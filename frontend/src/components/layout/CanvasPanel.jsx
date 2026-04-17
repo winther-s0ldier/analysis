@@ -351,8 +351,15 @@ function _renderNarrative(raw) {
 // onAsk: (selectedText, question) => void  — provided by App.jsx so answers
 // always appear in the left chat column regardless of which panel triggered them.
 export function CanvasPanel({ onAsk }) {
-  const { canvasOpen, setCanvasOpen, canvasNarrative, hasReport, sessionId, phase } = usePipelineStore();
-  const { addMessage, setThinking } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const currentSession = usePipelineStore((s) => s.sessions[s.currentSessionId]);
+  const canvasOpen = currentSession?.canvasOpen ?? false;
+  const canvasNarrative = currentSession?.canvasNarrative ?? null;
+  const hasReport = currentSession?.hasReport ?? false;
+  const phase = currentSession?.phase ?? 'idle';
+  const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const setThinking = useChatStore((s) => s.setThinking);
   const contentRef = useRef(null);
   const narrativeRef = useRef(null);
   const iframeRef = useRef(null);

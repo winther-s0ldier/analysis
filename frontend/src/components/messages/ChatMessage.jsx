@@ -65,7 +65,7 @@ function SkeletonChartCard({ analysisType }) {
 }
 
 export function ChatMessage({ message }) {
-  const { canvasOpen } = usePipelineStore();
+  const canvasOpen = usePipelineStore((s) => s.sessions[s.currentSessionId]?.canvasOpen ?? false);
 
   if (message.role === 'user') {
     if (message.type === 'canvas_question') {

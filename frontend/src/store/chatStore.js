@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { usePipelineStore } from './pipelineStore';
 
 // Message types that belong to the pipeline results block (charts, profile, plan, etc.)
 // Everything else (text, canvas_question) is a conversation message shown below.
@@ -18,102 +19,230 @@ function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
 
+// Default per-session chat state
+const DEFAULT_CHAT = { messages: [], thinking: false };
+const EMPTY_CHAT = { ...DEFAULT_CHAT };
+
+// Helper: resolve sessionId — explicit arg or fall back to pipelineStore.currentSessionId
+function resolveSid(explicitSid) {
+  return explicitSid || usePipelineStore.getState().currentSessionId;
+}
+
+// Helper: immutably update a single session's chat state
+function updateChat(state, sid, patch) {
+  const chat = state.sessions[sid];
+  if (!chat) return {};
+  return {
+    sessions: {
+      ...state.sessions,
+      [sid]: { ...chat, ...(typeof patch === 'function' ? patch(chat) : patch) },
+    },
+  };
+}
+
+// Helper: ensure a session slot exists
+function ensureSession(sessions, sid) {
+  if (sessions[sid]) return sessions;
+  return { ...sessions, [sid]: { ...DEFAULT_CHAT } };
+}
+
 export const useChatStore = create((set) => ({
-  messages: [], // { id, role, type, payload, category, timestamp }
-  thinking: false, // true while Ask AI / chat is awaiting a backend response
+  // ── Per-session chat state ───────────────────────────────────────────────
+  sessions: {},
 
-  addMessage: (role, type, payload) => {
-    const id = genId();
-    set((state) => ({
-      messages: [...state.messages, { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() }]
-    }));
-    return id;
-  },
+  // ── Global (not per-session) ─────────────────────────────────────────────
+  pendingMessage: '',
 
-  insertAfterMessage: (afterId, role, type, payload) => {
+  // ── Message operations (sessionId optional — defaults to current) ────────
+
+  addMessage: (roleOrSid, typeOrRole, payloadOrType, maybePayload) => {
+    // Support both old signature (role, type, payload) and new (sessionId, role, type, payload)
+    let sid, role, type, payload;
+    if (maybePayload !== undefined) {
+      // New 4-arg: (sessionId, role, type, payload)
+      sid = roleOrSid;
+      role = typeOrRole;
+      type = payloadOrType;
+      payload = maybePayload;
+    } else {
+      // Old 3-arg: (role, type, payload) — use current session
+      sid = resolveSid();
+      role = roleOrSid;
+      type = typeOrRole;
+      payload = payloadOrType;
+    }
+    if (!sid) return undefined;
     const id = genId();
     set((state) => {
-      const idx = state.messages.findIndex(m => m.id === afterId);
-      const newMsg = { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() };
-      if (idx === -1) return { messages: [...state.messages, newMsg] };
-      const msgs = [...state.messages];
-      msgs.splice(idx + 1, 0, newMsg);
-      return { messages: msgs };
+      const sessions = ensureSession(state.sessions, sid);
+      const chat = sessions[sid];
+      return {
+        sessions: {
+          ...sessions,
+          [sid]: {
+            ...chat,
+            messages: [...chat.messages, { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() }],
+          },
+        },
+      };
     });
     return id;
   },
 
-  // Update payload fields of an existing chart message (matched by payload.id).
-  // Used to upgrade hasChart=false cards when a retry produces a chart.
-  updateChartMessage: (analysisId, updates) => set((state) => ({
-    messages: state.messages.map(msg =>
-      msg.type === 'chart' && msg.payload?.id === analysisId
-        ? { ...msg, payload: { ...msg.payload, ...updates } }
-        : msg
-    ),
-  })),
+  insertAfterMessage: (afterId, role, type, payload, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return undefined;
+    const id = genId();
+    set((state) => {
+      const sessions = ensureSession(state.sessions, sid);
+      const chat = sessions[sid];
+      const idx = chat.messages.findIndex(m => m.id === afterId);
+      const newMsg = { id, role, type, payload, category: msgCategory(type), timestamp: Date.now() };
+      const msgs = idx === -1 ? [...chat.messages, newMsg] : [...chat.messages.slice(0, idx + 1), newMsg, ...chat.messages.slice(idx + 1)];
+      return { sessions: { ...sessions, [sid]: { ...chat, messages: msgs } } };
+    });
+    return id;
+  },
 
-  // Add a chart message only if one with this ID doesn't already exist.
-  // If it exists, update it instead. Prevents duplicate chart cards when
-  // both SSE and HTTP response deliver the same analysis result.
-  addOrUpdateChart: (chartPayload) => set((state) => {
-    const exists = state.messages.some(
-      msg => msg.type === 'chart' && msg.payload?.id === chartPayload.id
-    );
-    if (exists) {
-      return {
-        messages: state.messages.map(msg =>
-          msg.type === 'chart' && msg.payload?.id === chartPayload.id
-            ? { ...msg, payload: { ...msg.payload, ...chartPayload } }
+  updateChartMessage: (analysisId, updates, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      if (!state.sessions[sid]) return {};
+      return updateChat(state, sid, (chat) => ({
+        messages: chat.messages.map(msg =>
+          msg.type === 'chart' && msg.payload?.id === analysisId
+            ? { ...msg, payload: { ...msg.payload, ...updates } }
             : msg
         ),
+      }));
+    });
+  },
+
+  addOrUpdateChart: (chartPayload, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      const sessions = ensureSession(state.sessions, sid);
+      const chat = sessions[sid];
+      const exists = chat.messages.some(
+        msg => msg.type === 'chart' && msg.payload?.id === chartPayload.id
+      );
+      if (exists) {
+        return {
+          sessions: {
+            ...sessions,
+            [sid]: {
+              ...chat,
+              messages: chat.messages.map(msg =>
+                msg.type === 'chart' && msg.payload?.id === chartPayload.id
+                  ? { ...msg, payload: { ...msg.payload, ...chartPayload } }
+                  : msg
+              ),
+            },
+          },
+        };
+      }
+      const filtered = chat.messages.filter(
+        m => !(m.type === 'skeleton' && m.payload?.nodeId === chartPayload.id)
+      );
+      return {
+        sessions: {
+          ...sessions,
+          [sid]: {
+            ...chat,
+            messages: [...filtered, {
+              id: genId(), role: 'ai', type: 'chart', category: 'pipeline',
+              payload: chartPayload, timestamp: Date.now(),
+            }],
+          },
+        },
       };
-    }
-    // Also remove any skeleton for this node when a real chart arrives
-    const filtered = state.messages.filter(
-      m => !(m.type === 'skeleton' && m.payload?.nodeId === chartPayload.id)
-    );
-    return {
-      messages: [...filtered, {
-        id: genId(),
-        role: 'ai',
-        type: 'chart',
-        category: 'pipeline',
-        payload: chartPayload,
-        timestamp: Date.now(),
-      }],
-    };
+    });
+  },
+
+  setThinking: (thinking, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      const sessions = ensureSession(state.sessions, sid);
+      return updateChat({ sessions }, sid, { thinking });
+    });
+  },
+
+  clearMessages: (explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      const sessions = ensureSession(state.sessions, sid);
+      return { sessions: { ...sessions, [sid]: { ...DEFAULT_CHAT } } };
+    });
+  },
+
+  restoreMessages: (msgs, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => ({
+      sessions: {
+        ...state.sessions,
+        [sid]: { messages: msgs, thinking: false },
+      },
+    }));
+  },
+
+  // Atomically rename a session key (temp → real) after an upload resolves.
+  migrateSession: (fromId, toId) => set((state) => {
+    const chat = state.sessions[fromId];
+    if (!chat) return {};
+    const { [fromId]: _, ...rest } = state.sessions;
+    return { sessions: { ...rest, [toId]: chat } };
   }),
 
-  setThinking: (thinking) => set({ thinking }),
-  clearMessages: () => set({ messages: [], thinking: false }),
-  restoreMessages: (msgs) => set({ messages: msgs, thinking: false }),
-
-  // ── Pre-fill chat input ("Ask about this" on chart/insight cards) ──────────
-  pendingMessage: '',
+  // ── Pre-fill chat input ──────────────────────────────────────────────────
   setPendingMessage: (text) => set({ pendingMessage: text }),
 
-  // ── Skeleton placeholders — shown on node_started, removed on node_complete ─
-  addSkeleton: (nodeId, analysisType) => set((state) => {
-    const already = state.messages.some(
-      m => m.type === 'skeleton' && m.payload?.nodeId === nodeId
-    );
-    if (already) return {};
-    return {
-      messages: [...state.messages, {
-        id: `skeleton_${nodeId}`,
-        role: 'ai',
-        type: 'skeleton',
-        category: 'pipeline',
-        payload: { nodeId, analysisType },
-        timestamp: Date.now(),
-      }],
-    };
-  }),
+  // ── Skeleton placeholders ────────────────────────────────────────────────
 
-  removeSkeleton: (nodeId) => set((state) => ({
-    messages: state.messages.filter(
-      m => !(m.type === 'skeleton' && m.payload?.nodeId === nodeId)
-    ),
-  })),
+  addSkeleton: (nodeId, analysisType, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      const sessions = ensureSession(state.sessions, sid);
+      const chat = sessions[sid];
+      if (chat.messages.some(m => m.type === 'skeleton' && m.payload?.nodeId === nodeId)) return {};
+      return {
+        sessions: {
+          ...sessions,
+          [sid]: {
+            ...chat,
+            messages: [...chat.messages, {
+              id: `skeleton_${nodeId}`, role: 'ai', type: 'skeleton', category: 'pipeline',
+              payload: { nodeId, analysisType }, timestamp: Date.now(),
+            }],
+          },
+        },
+      };
+    });
+  },
+
+  removeSkeleton: (nodeId, explicitSid) => {
+    const sid = resolveSid(explicitSid);
+    if (!sid) return;
+    set((state) => {
+      if (!state.sessions[sid]) return {};
+      return updateChat(state, sid, (chat) => ({
+        messages: chat.messages.filter(
+          m => !(m.type === 'skeleton' && m.payload?.nodeId === nodeId)
+        ),
+      }));
+    });
+  },
 }));
+
+// ── Selectors ────────────────────────────────────────────────────────────────
+
+/** Returns the chat state for the currently viewed session. */
+export const selectCurrentChat = (state) => {
+  const sid = usePipelineStore.getState().currentSessionId;
+  return state.sessions[sid] || EMPTY_CHAT;
+};

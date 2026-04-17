@@ -37,66 +37,65 @@ function DatasetBadge({ type }) {
 }
 
 export function HistoryPanel() {
-  const { historyOpen, setHistoryOpen, setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen, reset, captureLiveSession, restoreLiveSession, liveSessionSnapshot } = usePipelineStore();
-  const { restoreMessages, messages, clearMessages } = useChatStore();
+  const historyOpen = usePipelineStore((s) => s.historyOpen);
+  const setHistoryOpen = usePipelineStore((s) => s.setHistoryOpen);
+  const lastStartedPipelineSessionId = usePipelineStore((s) => s.lastStartedPipelineSessionId);
+  const restoreSessionState = usePipelineStore((s) => s.restoreSessionState);
+  const reset = usePipelineStore((s) => s.reset);
 
   const [entries, setEntries] = useState([]);
   const [loading, setLoading] = useState(false);
   const [restoring, setRestoring] = useState(null);
   const [error, setError] = useState('');
 
-  // Capture current session state the moment the panel opens
+  // Fetch history entries when panel opens.
   useEffect(() => {
     if (!historyOpen) return;
-    
-    // Capture the state of whatever is currently in view (live or restored)
-    // so we can "go back" to it.
-    captureLiveSession(messages);
-    
     setLoading(true);
     setError('');
     getHistory()
       .then(data => setEntries(Array.isArray(data) ? data : []))
       .catch(() => setError('Could not load history.'))
       .finally(() => setLoading(false));
-  }, [historyOpen, captureLiveSession, messages]);
+  }, [historyOpen]);
 
-  // Restore the snapshot that was active before the panel opened
+  // Back to the live pipeline session — just switch currentSessionId.
+  // No snapshots needed: each session's state lives in its own Map slot.
   const handleBack = useCallback(() => {
-    if (liveSessionSnapshot) {
-      restoreLiveSession();
-      restoreMessages(liveSessionSnapshot.messages || []);
+    if (lastStartedPipelineSessionId) {
+      usePipelineStore.getState().switchSession(lastStartedPipelineSessionId);
     }
     setHistoryOpen(false);
-  }, [restoreLiveSession, restoreMessages, liveSessionSnapshot, setHistoryOpen]);
+  }, [lastStartedPipelineSessionId, setHistoryOpen]);
 
   const handleNewAnalysis = useCallback(() => {
     reset();
-    clearMessages();
+    useChatStore.getState().clearMessages();
     setHistoryOpen(false);
-  }, [reset, clearMessages, setHistoryOpen]);
+  }, [reset, setHistoryOpen]);
 
   const handleRestore = useCallback(async (sessionId) => {
     setRestoring(sessionId);
     setError('');
     try {
       const data = await restoreSession(sessionId);
-      setSession(data.session_id, data.output_folder);
-      setPhase(data.phase || 'complete');
-      setNodes(data.nodes || []);
-      setHasReport(data.has_report || false);
-      if (data.canvas_narrative) {
-        setCanvasNarrative(data.canvas_narrative);
-        setCanvasOpen(true);
-      }
-      restoreMessages(data.messages || []);
+      // Populate the session slot and switch to it
+      restoreSessionState(data.session_id, {
+        output_folder: data.output_folder,
+        phase: data.phase || 'complete',
+        nodes: data.nodes || [],
+        has_report: data.has_report || false,
+        canvas_narrative: data.canvas_narrative || null,
+      });
+      // Restore messages into the chat store for this session
+      useChatStore.getState().restoreMessages(data.messages || [], data.session_id);
       setHistoryOpen(false);
     } catch (e) {
       setError('Failed to restore session.');
     } finally {
       setRestoring(null);
     }
-  }, [setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen, restoreMessages, setHistoryOpen]);
+  }, [restoreSessionState, setHistoryOpen]);
 
   return (
     <AnimatePresence>
@@ -147,16 +146,21 @@ export function HistoryPanel() {
               <button
                 onClick={handleBack}
                 style={{
-                  display: 'flex', alignItems: 'center', gap: 6,
-                  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.1)',
-                  borderRadius: 8, padding: '5px 10px', cursor: 'pointer',
-                  color: '#F0EBE3', fontSize: 12, fontWeight: 600, width: 'fit-content',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7,
+                  width: '100%',
+                  background: 'linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)',
+                  border: 'none',
+                  borderRadius: 10, padding: '10px 14px', cursor: 'pointer',
+                  color: '#fff', fontSize: 13, fontWeight: 700,
+                  boxShadow: '0 2px 8px rgba(99,102,241,0.4)',
+                  letterSpacing: '-0.01em',
+                  transition: 'opacity 0.15s, transform 0.1s',
                 }}
-                onMouseEnter={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.12)'; }}
-                onMouseLeave={e => { e.currentTarget.style.background = 'rgba(255,255,255,0.06)'; }}
+                onMouseEnter={e => { e.currentTarget.style.opacity = '0.88'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                onMouseLeave={e => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.transform = 'translateY(0)'; }}
               >
-                <ArrowLeft size={13} />
-                Back to session
+                <ArrowLeft size={14} />
+                Back to Session
               </button>
 
               {/* Title + New button row */}

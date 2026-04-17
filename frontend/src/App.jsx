@@ -16,7 +16,7 @@ import { useSSEStream } from './hooks/useSSEStream';
 import { Toaster } from 'sonner';
 import { useAutoAnimate } from '@formkit/auto-animate/react';
 import { motion } from 'framer-motion';
-import { Menu, FileText, MessageSquare } from 'lucide-react';
+import { Menu, FileText, MessageSquare, BookOpen, ChevronRight } from 'lucide-react';
 
 // ── Resizable Split Handle ─────────────────────────────────────────────────
 function ResizeHandle({ onDrag, onDragEnd }) {
@@ -77,8 +77,21 @@ function ResizeHandle({ onDrag, onDragEnd }) {
 
 function App() {
   const { wrapperRef, contentRef } = useLenis();
-  const { sessionId, phase, hasReport, canvasOpen, sidebarCollapsed, setSidebarCollapsed } = usePipelineStore();
-  const { messages, addMessage, insertAfterMessage, thinking, setThinking } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const currentSession = usePipelineStore((s) => s.sessions[s.currentSessionId]);
+  const phase = currentSession?.phase ?? 'idle';
+  const hasReport = currentSession?.hasReport ?? false;
+  const canvasOpen = currentSession?.canvasOpen ?? false;
+  const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
+  const sidebarCollapsed = usePipelineStore((s) => s.sidebarCollapsed);
+  const setSidebarCollapsed = usePipelineStore((s) => s.setSidebarCollapsed);
+
+  const currentChat = useChatStore((s) => s.sessions[sessionId]);
+  const messages = currentChat?.messages ?? [];
+  const thinking = currentChat?.thinking ?? false;
+  const addMessage = useChatStore((s) => s.addMessage);
+  const insertAfterMessage = useChatStore((s) => s.insertAfterMessage);
+  const setThinking = useChatStore((s) => s.setThinking);
   const messagesEndRef = useRef(null);
   const [pipelineParent] = useAutoAnimate();
   const [conversationParent] = useAutoAnimate();
@@ -358,6 +371,57 @@ function App() {
                       <div ref={pipelineParent} className="flex flex-col gap-[18px]">
                         {pipelineMessages.map(msg => <ChatMessage key={msg.id} message={msg} />)}
                       </div>
+                    )}
+
+                    {/* ── "View Report" bar — shown when report exists but canvas is closed ── */}
+                    {hasReport && !canvasOpen && (
+                      <button
+                        onClick={() => setCanvasOpen(true)}
+                        className="w-full group"
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 10,
+                          padding: '12px 16px',
+                          background: 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(99,102,241,0.02))',
+                          border: '1px solid rgba(99,102,241,0.18)',
+                          borderRadius: 14,
+                          cursor: 'pointer',
+                          transition: 'all 0.2s ease',
+                        }}
+                        onMouseEnter={e => {
+                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(99,102,241,0.1), rgba(99,102,241,0.04))';
+                          e.currentTarget.style.borderColor = 'rgba(99,102,241,0.3)';
+                          e.currentTarget.style.boxShadow = '0 2px 8px rgba(99,102,241,0.1)';
+                        }}
+                        onMouseLeave={e => {
+                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(99,102,241,0.02))';
+                          e.currentTarget.style.borderColor = 'rgba(99,102,241,0.18)';
+                          e.currentTarget.style.boxShadow = 'none';
+                        }}
+                      >
+                        <div style={{
+                          width: 32, height: 32, borderRadius: 10,
+                          background: 'rgba(99,102,241,0.1)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          flexShrink: 0,
+                        }}>
+                          <BookOpen size={16} style={{ color: '#6366F1' }} />
+                        </div>
+                        <div style={{ flex: 1, textAlign: 'left' }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: '#111827', letterSpacing: '-0.01em' }}>
+                            View Full Report
+                          </div>
+                          <div style={{ fontSize: 11.5, color: '#6B7280', marginTop: 1 }}>
+                            Open the analysis report panel
+                          </div>
+                        </div>
+                        <ChevronRight
+                          size={16}
+                          style={{ color: '#9CA3AF', transition: 'transform 0.2s ease, color 0.2s ease' }}
+                          className="group-hover:translate-x-0.5 group-hover:text-indigo-500"
+                        />
+                      </button>
                     )}
 
                     {/* ── Separator — only when both zones have content ── */}

@@ -7,8 +7,12 @@ import { analyzeMetrics, validateMetric } from '../../api';
 import { toast } from 'sonner';
 
 export function RunAnalysisCard({ sessionId }) {
-  const { setPhase, customMetricNodes, addCustomMetricNode, removeCustomMetricNode, startPipelineRun } = usePipelineStore();
-  const { addMessage } = useChatStore();
+  const setPhase = usePipelineStore((s) => s.setPhase);
+  const customMetricNodes = usePipelineStore((s) => s.sessions[s.currentSessionId]?.customMetricNodes ?? []);
+  const addCustomMetricNode = usePipelineStore((s) => s.addCustomMetricNode);
+  const removeCustomMetricNode = usePipelineStore((s) => s.removeCustomMetricNode);
+  const startPipelineRun = usePipelineStore((s) => s.startPipelineRun);
+  const addMessage = useChatStore((s) => s.addMessage);
   const [inputVal, setInputVal] = useState('');
   const [validating, setValidating] = useState(false);
   // rejection: null | { reason: string, missing: string[] }

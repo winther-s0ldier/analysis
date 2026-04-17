@@ -7,8 +7,10 @@ import { useChatStore } from '../../store/chatStore';
 export function RerunSynthesisCard() {
   const [val, setVal] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const { sessionId, setPhase, startPipelineRun } = usePipelineStore();
-  const { addMessage } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const setPhase = usePipelineStore((s) => s.setPhase);
+  const startPipelineRun = usePipelineStore((s) => s.startPipelineRun);
+  const addMessage = useChatStore((s) => s.addMessage);
 
   const handleRerun = async () => {
     if (!sessionId || submitting) return;

@@ -73,9 +73,11 @@ def tool_build_report(
             if os.path.exists(_cache_path):
                 with open(_cache_path, "r", encoding="utf-8") as _cf:
                     _file_synth = json.load(_cf)
-                if _file_synth:
+                if _file_synth and _file_synth.get("_qc_passed") is not False:
                     synthesis = _file_synth
                     print(f"INFO: dag_builder recovered synthesis from file cache for {session_id}")
+                elif _file_synth:
+                    print(f"WARNING: dag_builder skipped file cache — synthesis QC failed (_qc_passed=False) for {session_id}")
         except Exception as _cache_err:
             print(f"WARNING: dag_builder failed to read _synthesis_cache.json: {_cache_err}")
 

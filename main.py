@@ -1289,6 +1289,10 @@ async def analyze(
             detail=f"Analysis already in progress (status: {state.status}). Wait for it to complete."
         )
 
+    # Mark as analyzing immediately to close the TOCTOU window between
+    # the status guard above and the background task actually starting.
+    state.status = "analyzing"
+
     metrics = req_body.approved_metrics or req_body.custom_metrics or None
     output_folder_path = state.output_folder
 
@@ -1859,7 +1863,9 @@ async def sse_stream(session_id: str, request: Request):
             state = sessions.get(session_id)
             if state and state.status in ("complete", "error") and last_index >= len(events):
                 yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': state.status}})}\n\n".encode("utf-8")
-                _sse_events.pop(session_id, None)
+                # Do NOT pop _sse_events here — a reconnecting client needs the
+                # full event history via its last_index cursor.  Stale session
+                # cleanup (_cleanup_stale_sessions) handles eviction instead.
                 break
 
             _keepalive_counter += 1
@@ -1869,7 +1875,6 @@ async def sse_stream(session_id: str, request: Request):
             _elapsed += _poll_interval
         else:
             yield f"data: {json.dumps({'type': 'stream_end', 'data': {'status': 'error', 'error': 'SSE stream timed out after 30 minutes'}})}\n\n".encode("utf-8")
-            _sse_events.pop(session_id, None)
 
     return StreamingResponse(
         event_generator(),

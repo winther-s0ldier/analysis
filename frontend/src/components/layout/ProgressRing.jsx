@@ -13,7 +13,9 @@ import {
 } from 'lucide-react';
 
 export function ProgressRing() {
-  const { phase, nodes } = usePipelineStore();
+  const currentSession = usePipelineStore((s) => s.sessions[s.currentSessionId]);
+  const phase = currentSession?.phase ?? 'idle';
+  const nodes = currentSession?.nodes ?? [];
   const [hidden, setHidden] = useState(false);
   const completed = nodes.filter(n => n.status === 'complete' || n.status === 'failed').length;
   const total = nodes.length || 1;

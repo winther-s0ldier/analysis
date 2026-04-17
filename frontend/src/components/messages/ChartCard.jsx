@@ -82,8 +82,8 @@ function ConfidenceBar({ confidence }) {
 
 // ── ChartCard ─────────────────────────────────────────────────────────────────
 export function ChartCard({ id, analysisType, finding, hasChart = true, severity, confidence, decisionMakerTakeaway, keyFinding, topValues, anomalies, whatItMeans, recommendation, proposedFix }) {
-  const { sessionId } = usePipelineStore();
-  const { setPendingMessage } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const setPendingMessage = useChatStore((s) => s.setPendingMessage);
   const [loaded, setLoaded] = useState(false);
   const [iframeError, setIframeError] = useState(false);
   const [iframeHeight, setIframeHeight] = useState(MIN_HEIGHT);

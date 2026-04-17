@@ -619,12 +619,27 @@ def tool_submit_synthesis(
                 if _rej_out:
                     _os_rej.makedirs(_rej_out, exist_ok=True)
                     _fallback = _os_rej.path.join(_rej_out, "_synthesis_cache.json")
-                    _syn_copy = dict(synthesis)
-                    _syn_copy["_qc_passed"] = False
-                    _syn_copy["_qc_failures"] = _quality_failures
-                    with open(_fallback, "w", encoding="utf-8") as _ff:
-                        json.dump(_syn_copy, _ff)
-                    print(f"[Synthesis QA] Fallback cache written despite rejection: {_fallback}")
+                    # Do NOT overwrite a passing synthesis with a rejected one.
+                    # A concurrent or subsequent call may have already written
+                    # a _qc_passed=True version — preserve it.
+                    _skip_fallback = False
+                    if _os_rej.path.exists(_fallback):
+                        try:
+                            with open(_fallback, "r", encoding="utf-8") as _check:
+                                _existing = json.load(_check)
+                            if _existing.get("_qc_passed"):
+                                _skip_fallback = True
+                        except Exception:
+                            pass
+                    if not _skip_fallback:
+                        _syn_copy = dict(synthesis)
+                        _syn_copy["_qc_passed"] = False
+                        _syn_copy["_qc_failures"] = _quality_failures
+                        with open(_fallback, "w", encoding="utf-8") as _ff:
+                            json.dump(_syn_copy, _ff)
+                        print(f"[Synthesis QA] Fallback cache written despite rejection: {_fallback}")
+                    else:
+                        print(f"[Synthesis QA] Skipped fallback write — passing synthesis already cached: {_fallback}")
             except Exception as _fbe:
                 print(f"[Synthesis QA] Fallback cache write failed: {_fbe}")
 

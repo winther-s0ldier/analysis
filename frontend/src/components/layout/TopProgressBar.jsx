@@ -15,7 +15,9 @@ const STAGE_PCT = {
 };
 
 export function TopProgressBar() {
-  const { phase, nodes } = usePipelineStore();
+  const currentSession = usePipelineStore((s) => s.sessions[s.currentSessionId]);
+  const phase = currentSession?.phase ?? 'idle';
+  const nodes = currentSession?.nodes ?? [];
   const [pct, setPct] = useState(0);
 
   useEffect(() => {

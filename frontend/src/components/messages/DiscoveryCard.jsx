@@ -24,7 +24,7 @@ function PriorityBadge({ priority }) {
 }
 
 function NodeRow({ node, index = 0 }) {
-  const { nodes } = usePipelineStore();
+  const nodes = usePipelineStore((s) => s.sessions[s.currentSessionId]?.nodes ?? []);
   const liveNode = nodes.find(n => n.id === node.id);
   const status = liveNode?.status || 'pending';
 
@@ -83,7 +83,7 @@ function NodeRow({ node, index = 0 }) {
 }
 
 export function DiscoveryCard({ data }) {
-  const { customMetricNodes } = usePipelineStore();
+  const customMetricNodes = usePipelineStore((s) => s.sessions[s.currentSessionId]?.customMetricNodes ?? []);
   // Merge AI-discovered nodes with any user-added custom metric nodes
   const dag = [...(data?.dag || []), ...customMetricNodes];
 

@@ -1,115 +1,193 @@
 import { create } from 'zustand';
 
-export const usePipelineStore = create((set) => ({
-  sessionId: null,
+const DEFAULT_SESSION = {
   outputFolder: null,
-  phase: 'idle', // 'idle' | 'uploading' | 'profiling' | 'discovering' | 'analyzing' | 'synthesizing' | 'building_report' | 'complete' | 'error'
+  phase: 'idle',
   nodes: [],
-  customMetricNodes: [], // user-validated custom analyses added before pipeline runs
+  customMetricNodes: [],
   hasReport: false,
   sseConnected: false,
   canvasOpen: false,
-  canvasNarrative: null, // HTML string from synthesis conversational_report
-  pipelineRunId: 0, // incremented each time a pipeline starts — triggers SSE reconnection
+  canvasNarrative: null,
+  pipelineRunId: 0,
+};
+
+// Stable empty-session reference — prevents spurious re-renders when no session is active.
+const EMPTY_SESSION = { ...DEFAULT_SESSION };
+
+// Helper: immutably update a single session entry.
+function updateSession(state, sid, patch) {
+  const session = state.sessions[sid];
+  if (!session) return {};
+  return {
+    sessions: {
+      ...state.sessions,
+      [sid]: { ...session, ...(typeof patch === 'function' ? patch(session) : patch) },
+    },
+  };
+}
+
+export const usePipelineStore = create((set, get) => ({
+  // ── Which session the user is currently viewing ──────────────────────────
+  currentSessionId: null,
+
+  // ── Per-session state keyed by sessionId ─────────────────────────────────
+  sessions: {},
+
+  // ── UI-global (not per-session) ──────────────────────────────────────────
   sidebarCollapsed: false,
   historyOpen: false,
-  activePipelineSessionId: null, // The ID of the currently running analysis (persists through history browsing)
+  lastStartedPipelineSessionId: null, // persists across navigation
 
-  liveSessionSnapshot: null, // Captures {sessionId, outputFolder, phase, nodes, hasReport, canvasNarrative, canvasOpen, messages}
+  // ── Session management ───────────────────────────────────────────────────
 
-  setSession: (sessionId, outputFolder) => set({
-    sessionId, outputFolder,
-    phase: 'idle', nodes: [], customMetricNodes: [], hasReport: false,
-    canvasOpen: false, canvasNarrative: null,
-  }),
-
-  // Captures current state as the "Active" one — called when starting a pipeline
-  captureLiveSession: (messages) => set((state) => ({
-    liveSessionSnapshot: {
-      sessionId:       state.sessionId,
-      outputFolder:    state.outputFolder,
-      phase:           state.phase,
-      nodes:           state.nodes,
-      hasReport:       state.hasReport,
-      canvasNarrative: state.canvasNarrative,
-      canvasOpen:      state.canvasOpen,
-      messages:        messages || [],
-    }
+  // Create-or-reset: always start with a fresh session slot.
+  // Only InputArea calls this (for new uploads). HistoryPanel uses restoreSessionState().
+  setSession: (sessionId, outputFolder) => set((state) => ({
+    currentSessionId: sessionId,
+    sessions: {
+      ...state.sessions,
+      [sessionId]: { ...DEFAULT_SESSION, outputFolder },
+    },
   })),
 
-  // Non-destructive restoration of the live session
-  restoreLiveSession: () => set((state) => {
-    if (!state.liveSessionSnapshot) return state;
-    const snap = state.liveSessionSnapshot;
+  // Atomically rename a session key (temp → real) after an upload resolves.
+  // Preserves all accumulated state (messages, phase, nodes) and updates outputFolder.
+  migrateSession: (fromId, toId, outputFolder) => set((state) => {
+    const session = state.sessions[fromId];
+    if (!session) return {};
+    const { [fromId]: _, ...rest } = state.sessions;
     return {
-      sessionId:       snap.sessionId,
-      outputFolder:    snap.outputFolder,
-      phase:           snap.phase,
-      nodes:           snap.nodes,
-      hasReport:       snap.hasReport,
-      canvasNarrative: snap.canvasNarrative,
-      canvasOpen:      snap.canvasOpen,
-      historyOpen:     false,
-    };
-  }),
-  setPhase: (phase) => set({ phase }),
-
-  setNodes: (nodes) => set({ nodes }),
-  updateNodeStatus: (nodeId, status, error = null) => set((state) => {
-    const exists = state.nodes.some(n => n.id === nodeId);
-    if (exists) {
-      return {
-        nodes: state.nodes.map(n =>
-          n.id === nodeId ? { ...n, status, ...(error && { error }) } : n
-        ),
-      };
-    }
-    // Node wasn't pre-populated by setNodes (e.g. setNodes wasn't called yet,
-    // or this node was filtered out).  Add it now so the terminal shows it.
-    return {
-      nodes: [...state.nodes, { id: nodeId, status, ...(error && { error }) }],
+      currentSessionId: state.currentSessionId === fromId ? toId : state.currentSessionId,
+      sessions: {
+        ...rest,
+        [toId]: { ...session, outputFolder: outputFolder ?? session.outputFolder },
+      },
     };
   }),
 
-  // Custom metric nodes: added by user at RunAnalysisCard before pipeline starts.
-  // Each entry is the full node spec {id, name, analysis_type, description, column_roles, priority}.
-  // Also appended to nodes[] so DiscoveryCard NodeRow picks up live status via SSE.
-  addCustomMetricNode: (node) => set((state) => ({
-    customMetricNodes: [...state.customMetricNodes, node],
-    nodes: [...state.nodes, { id: node.id, type: node.analysis_type, name: node.name, status: 'pending' }],
-  })),
-  removeCustomMetricNode: (id) => set((state) => ({
-    customMetricNodes: state.customMetricNodes.filter(n => n.id !== id),
-    nodes: state.nodes.filter(n => n.id !== id),
+  // Switch view to an existing session without modifying its data.
+  switchSession: (sessionId) => set({ currentSessionId: sessionId }),
+
+  // Populate a session slot with full restored data (history restore, page reload).
+  restoreSessionState: (sessionId, data) => set((state) => ({
+    currentSessionId: sessionId,
+    sessions: {
+      ...state.sessions,
+      [sessionId]: {
+        ...(state.sessions[sessionId] || { ...DEFAULT_SESSION }),
+        outputFolder: data.outputFolder ?? data.output_folder ?? null,
+        phase: data.phase || 'complete',
+        nodes: data.nodes || [],
+        hasReport: data.hasReport ?? data.has_report ?? false,
+        canvasNarrative: data.canvasNarrative ?? data.canvas_narrative ?? null,
+        canvasOpen: !!(data.canvasNarrative ?? data.canvas_narrative),
+      },
+    },
   })),
 
-  setHasReport: (hasReport) => set({ hasReport }),
-  setSseConnected: (sseConnected) => set({ sseConnected }),
-  setCanvasOpen: (canvasOpen) => set({ canvasOpen }),
+  // ── Per-session setters (targetSessionId defaults to currentSessionId) ───
+
+  setPhase: (phase, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { phase }) : {};
+  }),
+
+  setNodes: (nodes, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { nodes }) : {};
+  }),
+
+  updateNodeStatus: (nodeId, status, error = null, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    if (!sid || !state.sessions[sid]) return {};
+    const session = state.sessions[sid];
+    const exists = session.nodes.some(n => n.id === nodeId);
+    const nodes = exists
+      ? session.nodes.map(n => n.id === nodeId ? { ...n, status, ...(error && { error }) } : n)
+      : [...session.nodes, { id: nodeId, status, ...(error && { error }) }];
+    return updateSession(state, sid, { nodes });
+  }),
+
+  addCustomMetricNode: (node) => set((state) => {
+    const sid = state.currentSessionId;
+    if (!sid || !state.sessions[sid]) return {};
+    const session = state.sessions[sid];
+    return updateSession(state, sid, {
+      customMetricNodes: [...session.customMetricNodes, node],
+      nodes: [...session.nodes, { id: node.id, type: node.analysis_type, name: node.name, status: 'pending' }],
+    });
+  }),
+
+  removeCustomMetricNode: (id) => set((state) => {
+    const sid = state.currentSessionId;
+    if (!sid || !state.sessions[sid]) return {};
+    const session = state.sessions[sid];
+    return updateSession(state, sid, {
+      customMetricNodes: session.customMetricNodes.filter(n => n.id !== id),
+      nodes: session.nodes.filter(n => n.id !== id),
+    });
+  }),
+
+  setHasReport: (hasReport, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { hasReport }) : {};
+  }),
+
+  setSseConnected: (sseConnected, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { sseConnected }) : {};
+  }),
+
+  setCanvasOpen: (canvasOpen, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { canvasOpen }) : {};
+  }),
+
+  setCanvasNarrative: (canvasNarrative, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { canvasNarrative }) : {};
+  }),
+
+  // ── UI-global setters ────────────────────────────────────────────────────
+
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
   setHistoryOpen: (historyOpen) => set({ historyOpen }),
-  setCanvasNarrative: (canvasNarrative) => set({ canvasNarrative }),
-  startPipelineRun: () => set((state) => ({
-    pipelineRunId: state.pipelineRunId + 1,
-    activePipelineSessionId: state.sessionId, // Mark this session as the "Active" one
-    hasReport: false,
-    canvasOpen: false,
-    canvasNarrative: null,
-  })),
+
+  // ── Pipeline run lifecycle ───────────────────────────────────────────────
+
+  startPipelineRun: (targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    if (!sid || !state.sessions[sid]) return {};
+    const session = state.sessions[sid];
+    return {
+      lastStartedPipelineSessionId: sid,
+      sessions: {
+        ...state.sessions,
+        [sid]: {
+          ...session,
+          pipelineRunId: session.pipelineRunId + 1,
+          hasReport: false,
+          canvasOpen: false,
+          canvasNarrative: null,
+        },
+      },
+    };
+  }),
+
+  // ── Full reset (new analysis) ────────────────────────────────────────────
 
   reset: () => set({
-    sessionId: null,
-    outputFolder: null,
-    activePipelineSessionId: null, // Clear active tracker
-    liveSessionSnapshot: null,     // Clear session snapshot
-    phase: 'idle',
-    nodes: [],
-    customMetricNodes: [],
-    hasReport: false,
-    sseConnected: false,
-    canvasOpen: false,
-    canvasNarrative: null,
+    currentSessionId: null,
+    sessions: {},
+    lastStartedPipelineSessionId: null,
     sidebarCollapsed: false,
     historyOpen: false,
-  })
+  }),
 }));
+
+// ── Selectors ────────────────────────────────────────────────────────────────
+
+/** Returns the per-session state object for the currently viewed session. */
+export const selectCurrentSession = (state) =>
+  state.sessions[state.currentSessionId] || EMPTY_SESSION;

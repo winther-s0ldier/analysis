@@ -35,7 +35,7 @@ const STATUS_MESSAGES = {
 };
 
 export function ProcessingStatus() {
-  const { phase } = usePipelineStore();
+  const phase = usePipelineStore((s) => s.sessions[s.currentSessionId]?.phase ?? 'idle');
   const [msgIndex, setMsgIndex] = useState(0);
 
   const messages = STATUS_MESSAGES[phase] || [];

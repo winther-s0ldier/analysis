@@ -6,8 +6,8 @@ import { useChatStore } from '../../store/chatStore';
 const COLUMN_ROLES = ['entity_col', 'time_col', 'event_col', 'value_col', 'outcome_col'];
 
 export function ClarificationCard({ message, ambiguousNodes = [], columns = [] }) {
-  const { sessionId } = usePipelineStore();
-  const { addMessage } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const addMessage = useChatStore((s) => s.addMessage);
   const [selections, setSelections] = useState({});
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);

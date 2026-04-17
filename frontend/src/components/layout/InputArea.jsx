@@ -5,6 +5,7 @@ import { useChatStore } from '../../store/chatStore';
 import { useAutoResize } from '../../hooks/useAutoResize';
 import { useAutoAnimate } from '@formkit/auto-animate/react';
 import { uploadFile, profileDataset, discoverMetrics, analyzeMetrics, sendChatMessage } from '../../api';
+import { closeConnection, resetSessionTracking } from '../../services/sseManager';
 import { toast } from 'sonner';
 import { cn } from '../ui/Badge';
 
@@ -16,8 +17,21 @@ function formatSize(bytes) {
 }
 
 export function InputArea() {
-  const { sessionId, setSession, setPhase, setNodes, setHasReport, setCanvasNarrative, setCanvasOpen } = usePipelineStore();
-  const { addMessage, insertAfterMessage, addOrUpdateChart, clearMessages, setThinking, pendingMessage, setPendingMessage } = useChatStore();
+  const sessionId = usePipelineStore((s) => s.currentSessionId);
+  const setSession = usePipelineStore((s) => s.setSession);
+  const setPhase = usePipelineStore((s) => s.setPhase);
+  const setNodes = usePipelineStore((s) => s.setNodes);
+  const setHasReport = usePipelineStore((s) => s.setHasReport);
+  const setCanvasNarrative = usePipelineStore((s) => s.setCanvasNarrative);
+  const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
+  const migrateSession = usePipelineStore((s) => s.migrateSession);
+  const addMessage = useChatStore((s) => s.addMessage);
+  const insertAfterMessage = useChatStore((s) => s.insertAfterMessage);
+  const addOrUpdateChart = useChatStore((s) => s.addOrUpdateChart);
+  const migrateChatSession = useChatStore((s) => s.migrateSession);
+  const setThinking = useChatStore((s) => s.setThinking);
+  const pendingMessage = useChatStore((s) => s.pendingMessage);
+  const setPendingMessage = useChatStore((s) => s.setPendingMessage);
   const [file, setFile] = useState(null);
   const [textValue, setTextValue] = useState('');
   const [isHovering, setIsHovering] = useState(false);
@@ -45,19 +59,28 @@ export function InputArea() {
       const currentFile = file;
       setFile(null);
 
-      // Clear any messages from a previous session before starting a fresh upload flow.
-      // Must happen BEFORE adding the new file chip so we don't wipe our own messages.
-      clearMessages();
-
+      // Show the file chip + text IMMEDIATELY in a temporary session so the
+      // user isn't staring at a blank screen during the upload.
+      const tempId = `__uploading_${Date.now()}`;
+      setSession(tempId, null);
+      setPhase('uploading');
       if (currentText) addMessage('user', 'text', currentText);
       addMessage('user', 'file', { name: currentFile.name, size: formatSize(currentFile.size) });
 
       try {
         toast.info(`Uploading ${currentFile.name}...`);
-        setPhase('uploading');
         const uploadData = await uploadFile(currentFile);
 
-        setSession(uploadData.session_id, uploadData.output_folder || uploadData.session_id);
+        // Atomically rename temp → real session in both stores.
+        // This preserves the file chip + text the user already sees,
+        // wipes any stale data for the real session ID, and sets outputFolder.
+        const realId = uploadData.session_id;
+        const realFolder = uploadData.output_folder || realId;
+        // Kill any zombie SSE/polling for the real session ID before migrating
+        closeConnection(realId);
+        resetSessionTracking(realId);
+        migrateSession(tempId, realId, realFolder);
+        migrateChatSession(tempId, realId);
 
         // Profile step — use inline cached data if available, otherwise call /profile
         let profileData;

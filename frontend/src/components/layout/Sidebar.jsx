@@ -32,18 +32,28 @@ function getStageStatus(stageId, currentPhase) {
 }
 
 export function Sidebar() {
-  const { sessionId, activePipelineSessionId, restoreLiveSession, phase, sidebarCollapsed: collapsed, setSidebarCollapsed, historyOpen, setHistoryOpen, reset, hasReport, setCanvasOpen } = usePipelineStore();
-  const { restoreMessages, messages, clearMessages } = useChatStore();
-  
-  const isViewingHistory = activePipelineSessionId && activePipelineSessionId !== sessionId;
+  const currentSessionId = usePipelineStore((s) => s.currentSessionId);
+  const lastStartedPipelineSessionId = usePipelineStore((s) => s.lastStartedPipelineSessionId);
+  const currentSession = usePipelineStore((s) => s.sessions[s.currentSessionId]);
+  const phase = currentSession?.phase ?? 'idle';
+  const hasReport = currentSession?.hasReport ?? false;
+  const collapsed = usePipelineStore((s) => s.sidebarCollapsed);
+  const setSidebarCollapsed = usePipelineStore((s) => s.setSidebarCollapsed);
+  const historyOpen = usePipelineStore((s) => s.historyOpen);
+  const setHistoryOpen = usePipelineStore((s) => s.setHistoryOpen);
+  const reset = usePipelineStore((s) => s.reset);
+  const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
 
-  const handleNewSession = () => { reset(); clearMessages(); };
+  // Determine if user is viewing a different session while a pipeline runs
+  const livePipelinePhase = usePipelineStore(
+    (s) => s.sessions[s.lastStartedPipelineSessionId]?.phase
+  );
+  const isLiveRunning = livePipelinePhase && !['idle', 'complete', 'error'].includes(livePipelinePhase);
+  const isViewingHistory = isLiveRunning && currentSessionId !== lastStartedPipelineSessionId;
+
+  const handleNewSession = () => { reset(); useChatStore.getState().clearMessages(); };
   const handleReturnToLive = () => {
-    restoreLiveSession();
-    // Re-hydration of messages handled by restoreLiveSession combined with local state
-    // But we need to make sure chatStore is updated
-    const liveMessages = usePipelineStore.getState().liveSessionSnapshot?.messages || [];
-    restoreMessages(liveMessages);
+    usePipelineStore.getState().switchSession(lastStartedPipelineSessionId);
   };
   const setCollapsed = (v) => setSidebarCollapsed(v);
   const isMobile = typeof window !== 'undefined' && window.innerWidth <= 768;
@@ -360,6 +370,26 @@ export function Sidebar() {
 
             {/* New session + History icons — collapsed rail */}
             <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', width: '100%', marginBottom: 4 }} />
+            {isViewingHistory && (
+              <button
+                onClick={handleReturnToLive}
+                className="w-8 h-8 flex items-center justify-center rounded-lg mb-1 transition-all duration-200 relative"
+                style={{
+                  background: 'linear-gradient(135deg, #6366F1 0%, #4F46E5 100%)',
+                  border: 'none', cursor: 'pointer',
+                  boxShadow: '0 2px 8px rgba(99,102,241,0.4)',
+                }}
+                onMouseEnter={e => { e.currentTarget.style.opacity = '0.85'; e.currentTarget.style.transform = 'translateY(-1px)'; }}
+                onMouseLeave={e => { e.currentTarget.style.opacity = '1'; e.currentTarget.style.transform = 'translateY(0)'; }}
+                title="Return to live session"
+              >
+                <motion.div
+                  animate={{ scale: [1, 1.2, 1] }}
+                  transition={{ duration: 2, repeat: Infinity }}
+                  style={{ width: 6, height: 6, borderRadius: '50%', background: '#10B981' }}
+                />
+              </button>
+            )}
             <button
               onClick={handleNewSession}
               className="w-8 h-8 flex items-center justify-center rounded-lg mb-1 transition-colors duration-200"
