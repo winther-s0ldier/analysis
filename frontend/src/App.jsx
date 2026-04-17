@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useCallback, useState, Component } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
-import { HistoryPanel } from './components/layout/HistoryPanel';
 import { TopProgressBar } from './components/layout/TopProgressBar';
 import { ProgressRing } from './components/layout/ProgressRing';
 import { ProcessingStatus } from './components/layout/ProcessingStatus';
@@ -55,8 +54,8 @@ function ResizeHandle({ onDrag, onDragEnd }) {
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        borderLeft: '1px solid #DDD7CC',
-        background: hovered || dragging ? 'rgba(99,102,241,0.04)' : 'transparent',
+        borderLeft: '1px solid #E2E8F0',
+        background: hovered || dragging ? 'rgba(251,113,133,0.06)' : 'transparent',
         transition: dragging ? 'none' : 'background 0.2s ease',
       }}
     >
@@ -89,6 +88,8 @@ function App() {
   const currentChat = useChatStore((s) => s.sessions[sessionId]);
   const messages = currentChat?.messages ?? [];
   const thinking = currentChat?.thinking ?? false;
+  // Empty state — drives whether to show centered Command Center vs bottom-pinned input
+  const isEmptyState = messages.length === 0 && !thinking && !sessionId;
   const addMessage = useChatStore((s) => s.addMessage);
   const insertAfterMessage = useChatStore((s) => s.insertAfterMessage);
   const setThinking = useChatStore((s) => s.setThinking);
@@ -137,6 +138,9 @@ function App() {
 
   // Initialize SSE connection for the session
   useSSEStream(sessionId);
+
+  // Ref to centered InputArea so empty-state suggestion chips can open the file picker
+  const centerInputRef = useRef(null);
 
   // ── Resizable panel split ──────────────────────────────────────────────
   // chatPct = percentage width of chat column (canvas gets the rest).
@@ -237,11 +241,11 @@ function App() {
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            background: '#3D2B1A',
-            color: '#F0EBE3',
-            border: 'none',
+            background: '#FFFFFF',
+            color: '#0F172A',
+            border: '1px solid #E2E8F0',
             borderRadius: 10,
-            boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
+            boxShadow: '0 2px 10px rgba(15,23,42,0.10)',
             cursor: 'pointer',
           }}
           aria-label="Open sidebar"
@@ -260,13 +264,13 @@ function App() {
             right: 16,
             zIndex: 10000,
             padding: '10px 16px',
-            background: '#111827',
-            color: '#F9FAFB',
+            backgroundImage: 'linear-gradient(135deg, #FB7185 0%, #FB923C 100%)',
+            color: '#FFFFFF',
             border: 'none',
             borderRadius: 24,
             fontSize: 13,
             fontWeight: 600,
-            boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+            boxShadow: '0 6px 16px rgba(251,113,133,0.35)',
             display: 'flex',
             alignItems: 'center',
             gap: 8,
@@ -302,7 +306,6 @@ function App() {
 
       <TopProgressBar />
       <Sidebar />
-      <HistoryPanel />
       <main
         ref={mainRef}
         className="flex-1 flex overflow-hidden bg-bg-page relative font-sans"
@@ -338,26 +341,57 @@ function App() {
                 const isEmpty = pipelineMessages.length === 0 && conversationMessages.length === 0 && !thinking;
 
                 if (isEmpty) {
+                  const FILE_TYPES = [
+                    { label: 'CSV',     accept: '.csv' },
+                    { label: 'XLSX',    accept: '.xlsx,.xls' },
+                    { label: 'JSON',    accept: '.json' },
+                    { label: 'JSONL',   accept: '.jsonl' },
+                    { label: 'Parquet', accept: '.parquet' },
+                  ];
                   return (
-                    <div className="flex-1 flex flex-col items-center justify-center text-center p-[48px_24px] min-h-[320px]">
-                      <div className="text-accent mb-6 opacity-60">
+                    <div className="flex-1 flex flex-col items-center justify-center text-center px-6 py-12 min-h-[420px]">
+                      <div className="text-accent mb-5 opacity-80">
                         <motion.div
-                          animate={{ rotate: [0, 10, -10, 0], scale: [1, 1.05, 1] }}
-                          transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+                          initial={{ opacity: 0, scale: 0.92 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          transition={{ duration: 0.45, ease: [0.165, 0.84, 0.44, 1] }}
                         >
-                          <svg width="48" height="48" viewBox="0 0 20 20" fill="none">
-                            <rect x="2" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.8" />
-                            <rect x="11" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
-                            <rect x="2" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.4" />
-                            <rect x="11" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.7" />
+                          <svg width="44" height="44" viewBox="0 0 20 20" fill="none">
+                            <rect x="2" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.85" />
+                            <rect x="11" y="2" width="7" height="7" rx="2" fill="currentColor" opacity="0.45" />
+                            <rect x="2" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.45" />
+                            <rect x="11" y="11" width="7" height="7" rx="2" fill="currentColor" opacity="0.75" />
                           </svg>
                         </motion.div>
                       </div>
-                      <h1 className="text-[28px] font-semibold text-text-primary mb-3 tracking-tight">What would you like to analyze?</h1>
-                      <p className="text-[16px] text-text-tertiary max-w-[400px] leading-relaxed mb-6 font-medium">Upload a data file to start a full multi-agent analysis pipeline.</p>
-                      <div className="flex gap-2 flex-wrap justify-center opacity-80">
-                        {['CSV', 'XLSX', 'JSON', 'JSONL', 'Parquet'].map(ext => (
-                          <span key={ext} className="font-mono text-[11px] font-bold text-text-muted bg-bg-surface border border-border-subtle px-2.5 py-1 rounded-md shadow-xs">{ext}</span>
+                      <h1 className="text-[30px] font-semibold text-text-primary mb-2 tracking-tight">
+                        What would you like to analyze?
+                      </h1>
+                      <p className="text-[15px] text-text-tertiary max-w-[440px] leading-relaxed mb-7 font-medium">
+                        Upload a data file to start a full multi-agent analysis pipeline.
+                      </p>
+
+                      {/* Command Center — centered floating input card */}
+                      <motion.div
+                        layoutId="command-center-input"
+                        className="w-full max-w-[640px]"
+                        transition={{ duration: 0.4, ease: [0.165, 0.84, 0.44, 1] }}
+                      >
+                        <InputArea ref={centerInputRef} variant="center" />
+                      </motion.div>
+
+                      {/* Interactive file-format suggestion chips */}
+                      <div className="flex gap-2 flex-wrap justify-center mt-4">
+                        {FILE_TYPES.map(({ label, accept }) => (
+                          <button
+                            key={label}
+                            onClick={() => centerInputRef.current?.openFilePicker(accept)}
+                            className="font-mono text-[11px] font-bold text-text-tertiary bg-white hover:bg-accent/10 hover:text-accent border border-border-subtle hover:border-accent/40 px-3 py-1.5 rounded-md shadow-xs transition-colors duration-150"
+                            type="button"
+                            title={`Upload ${label} file`}
+                          >
+                            {label}
+                          </button>
                         ))}
                       </div>
                     </div>
@@ -383,43 +417,43 @@ function App() {
                           alignItems: 'center',
                           gap: 10,
                           padding: '12px 16px',
-                          background: 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(99,102,241,0.02))',
-                          border: '1px solid rgba(99,102,241,0.18)',
+                          background: 'linear-gradient(135deg, rgba(251,113,133,0.06), rgba(251,146,60,0.03))',
+                          border: '1px solid rgba(251,113,133,0.20)',
                           borderRadius: 14,
                           cursor: 'pointer',
                           transition: 'all 0.2s ease',
                         }}
                         onMouseEnter={e => {
-                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(99,102,241,0.1), rgba(99,102,241,0.04))';
-                          e.currentTarget.style.borderColor = 'rgba(99,102,241,0.3)';
-                          e.currentTarget.style.boxShadow = '0 2px 8px rgba(99,102,241,0.1)';
+                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(251,113,133,0.10), rgba(251,146,60,0.05))';
+                          e.currentTarget.style.borderColor = 'rgba(251,113,133,0.32)';
+                          e.currentTarget.style.boxShadow = '0 2px 8px rgba(251,113,133,0.12)';
                         }}
                         onMouseLeave={e => {
-                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(99,102,241,0.06), rgba(99,102,241,0.02))';
-                          e.currentTarget.style.borderColor = 'rgba(99,102,241,0.18)';
+                          e.currentTarget.style.background = 'linear-gradient(135deg, rgba(251,113,133,0.06), rgba(251,146,60,0.03))';
+                          e.currentTarget.style.borderColor = 'rgba(251,113,133,0.20)';
                           e.currentTarget.style.boxShadow = 'none';
                         }}
                       >
                         <div style={{
                           width: 32, height: 32, borderRadius: 10,
-                          background: 'rgba(99,102,241,0.1)',
+                          background: 'rgba(251,113,133,0.12)',
                           display: 'flex', alignItems: 'center', justifyContent: 'center',
                           flexShrink: 0,
                         }}>
-                          <BookOpen size={16} style={{ color: '#6366F1' }} />
+                          <BookOpen size={16} style={{ color: '#FB7185' }} />
                         </div>
                         <div style={{ flex: 1, textAlign: 'left' }}>
-                          <div style={{ fontSize: 14, fontWeight: 600, color: '#111827', letterSpacing: '-0.01em' }}>
+                          <div style={{ fontSize: 14, fontWeight: 600, color: '#0F172A', letterSpacing: '-0.01em' }}>
                             View Full Report
                           </div>
-                          <div style={{ fontSize: 11.5, color: '#6B7280', marginTop: 1 }}>
+                          <div style={{ fontSize: 11.5, color: '#64748B', marginTop: 1 }}>
                             Open the analysis report panel
                           </div>
                         </div>
                         <ChevronRight
                           size={16}
-                          style={{ color: '#9CA3AF', transition: 'transform 0.2s ease, color 0.2s ease' }}
-                          className="group-hover:translate-x-0.5 group-hover:text-indigo-500"
+                          style={{ color: '#94A3B8', transition: 'transform 0.2s ease, color 0.2s ease' }}
+                          className="group-hover:translate-x-0.5 group-hover:text-accent"
                         />
                       </button>
                     )}
@@ -427,12 +461,12 @@ function App() {
                     {/* ── Separator — only when both zones have content ── */}
                     {pipelineMessages.length > 0 && (conversationMessages.length > 0 || thinking) && (
                       <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '2px 0' }}>
-                        <div style={{ flex: 1, height: 1, background: '#DDD7CC' }} />
+                        <div style={{ flex: 1, height: 1, background: '#E2E8F0' }} />
                         <span style={{
-                          fontSize: 10, fontWeight: 700, color: '#9C9590',
+                          fontSize: 10, fontWeight: 700, color: '#64748B',
                           letterSpacing: '0.08em', textTransform: 'uppercase',
                         }}>Chat</span>
-                        <div style={{ flex: 1, height: 1, background: '#DDD7CC' }} />
+                        <div style={{ flex: 1, height: 1, background: '#E2E8F0' }} />
                       </div>
                     )}
 
@@ -450,7 +484,14 @@ function App() {
           </div>
 
           <ProcessingStatus />
-          <InputArea />
+          {!isEmptyState && (
+            <motion.div
+              layoutId="command-center-input"
+              transition={{ duration: 0.4, ease: [0.165, 0.84, 0.44, 1] }}
+            >
+              <InputArea variant="bottom" />
+            </motion.div>
+          )}
         </div>
 
         {/* Drag handle — visible only when canvas is open */}

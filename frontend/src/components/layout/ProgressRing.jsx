@@ -69,14 +69,14 @@ export function ProgressRing() {
           transition={{ duration: 0.4, ease: "easeOut" }}
         >
           <div className="relative w-[52px] h-[52px]">
-            {/* Background Glow */}
+            {/* Subtle one-shot completion halo (no infinite loop) */}
             <AnimatePresence>
               {isComplete && (
-                <motion.div 
-                  className="absolute inset-0 rounded-full bg-status-success !bg-opacity-10 blur-md pointer-events-none"
-                  initial={{ opacity: 0, scale: 0.8 }}
-                  animate={{ opacity: 1, scale: 1.2 }}
-                  transition={{ duration: 1.5, repeat: Infinity, repeatType: "reverse" }}
+                <motion.div
+                  className="absolute inset-0 rounded-full bg-status-success/15 pointer-events-none"
+                  initial={{ opacity: 0, scale: 0.85 }}
+                  animate={{ opacity: 1, scale: 1.05 }}
+                  transition={{ duration: 0.4, ease: 'easeOut' }}
                 />
               )}
             </AnimatePresence>

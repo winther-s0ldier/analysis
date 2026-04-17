@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
 import { Paperclip, Send, X, FileUp } from 'lucide-react';
 import { usePipelineStore } from '../../store/pipelineStore';
 import { useChatStore } from '../../store/chatStore';
@@ -16,7 +16,20 @@ function formatSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + ['B', 'KB', 'MB', 'GB'][i];
 }
 
-export function InputArea() {
+/**
+ * InputArea
+ *
+ * Backend wiring (uploadFile / profileDataset / discoverMetrics / sendChatMessage,
+ * pipelineStore, chatStore, sseManager) is unchanged from the original.
+ *
+ * Only visual layer changes:
+ * - `variant="center"` renders a large floating card for the empty state.
+ * - `variant="bottom"` (default) renders the original bottom-pinned bar.
+ *
+ * Exposes `openFilePicker(accept?)` via ref so the centered empty-state can
+ * trigger the file picker from suggestion chips with a pre-narrowed accept list.
+ */
+export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, ref) {
   const sessionId = usePipelineStore((s) => s.currentSessionId);
   const setSession = usePipelineStore((s) => s.setSession);
   const setPhase = usePipelineStore((s) => s.setPhase);
@@ -36,19 +49,31 @@ export function InputArea() {
   const [textValue, setTextValue] = useState('');
   const [isHovering, setIsHovering] = useState(false);
   const fileInputRef = useRef(null);
+  const [acceptOverride, setAcceptOverride] = useState(null);
   const [parent] = useAutoAnimate();
+  const isCenter = variant === 'center';
 
   const textareaRef = useAutoResize(textValue);
+
+  // Imperative handle so parent (centered empty state) can open the picker
+  useImperativeHandle(ref, () => ({
+    openFilePicker: (accept) => {
+      setAcceptOverride(accept || null);
+      // setAcceptOverride is async; trigger click on next tick
+      setTimeout(() => fileInputRef.current?.click(), 0);
+    },
+    focus: () => textareaRef.current?.focus(),
+  }), [textareaRef]);
 
   // Consume pendingMessage (set by "Ask about this" buttons on cards)
   useEffect(() => {
     if (!pendingMessage) return;
     setTextValue(pendingMessage);
     setPendingMessage('');
-    // Focus the textarea so user can immediately send
     setTimeout(() => textareaRef.current?.focus(), 50);
   }, [pendingMessage]);
 
+  // ── Submit handler — backend behavior unchanged ─────────────────────────
   const onSubmit = async () => {
     const currentText = textValue.trim();
     if (!currentText && !file) return;
@@ -59,8 +84,6 @@ export function InputArea() {
       const currentFile = file;
       setFile(null);
 
-      // Show the file chip + text IMMEDIATELY in a temporary session so the
-      // user isn't staring at a blank screen during the upload.
       const tempId = `__uploading_${Date.now()}`;
       setSession(tempId, null);
       setPhase('uploading');
@@ -71,9 +94,6 @@ export function InputArea() {
         toast.info(`Uploading ${currentFile.name}...`);
         const uploadData = await uploadFile(currentFile);
 
-        // Atomically rename temp → real session in both stores.
-        // This preserves the file chip + text the user already sees,
-        // wipes any stale data for the real session ID, and sets outputFolder.
         const realId = uploadData.session_id;
         const realFolder = uploadData.output_folder || realId;
         // Kill any zombie SSE/polling for the real session ID before migrating
@@ -82,7 +102,6 @@ export function InputArea() {
         migrateSession(tempId, realId, realFolder);
         migrateChatSession(tempId, realId);
 
-        // Profile step — use inline cached data if available, otherwise call /profile
         let profileData;
         if (uploadData.profile_cached && uploadData.profile) {
           toast.success('Identical dataset — loading cached profile');
@@ -94,7 +113,6 @@ export function InputArea() {
         }
         addMessage('ai', 'profile', profileData);
 
-        // Discovery step — use inline cached DAG if available, otherwise call /discover
         let discoveryPayload;
         if (uploadData.dag_cached && uploadData.discovery) {
           toast.success('Loaded cached analysis plan');
@@ -110,7 +128,6 @@ export function InputArea() {
           setNodes(discoveryPayload.dag.map(n => ({ id: n.id, type: n.analysis_type, status: 'pending' })));
         }
 
-        // Pause here — let user review plan, add custom metrics, then click Run
         addMessage('ai', 'run_analysis', { sessionId: uploadData.session_id });
         toast.success('Review the plan and click Run when ready');
       } catch (err) {
@@ -147,6 +164,7 @@ export function InputArea() {
       toast.info(`Attached: ${f.name}`);
     }
     e.target.value = '';
+    setAcceptOverride(null);
   };
 
   const handleKeyDown = (e) => {
@@ -167,15 +185,21 @@ export function InputArea() {
 
   const canSend = Boolean(textValue.trim() || file);
 
+  // ── Layout ─────────────────────────────────────────────────────────────
   return (
     <div
-      className="shrink-0 px-4 py-3 bg-bg-page transition-all duration-300"
-      style={{
-        borderTop: '1px solid #F3F4F6',
+      className={cn(
+        'transition-all duration-300',
+        isCenter
+          ? 'w-full max-w-[640px] mx-auto'
+          : 'shrink-0 px-4 py-3 bg-bg-page'
+      )}
+      style={!isCenter ? {
+        borderTop: '1px solid #E2E8F0',
         paddingBottom: typeof window !== 'undefined' && window.innerWidth <= 768
           ? 'max(12px, env(safe-area-inset-bottom, 12px))'
-          : 12
-      }}
+          : 12,
+      } : {}}
       onDragOver={e => { e.preventDefault(); setIsHovering(true); }}
       onDragLeave={() => setIsHovering(false)}
       onDrop={handleDrop}
@@ -185,20 +209,20 @@ export function InputArea() {
         <div
           className="fixed inset-0 z-50 flex items-center justify-center"
           style={{
-            background: 'rgba(249,250,251,0.85)',
+            background: 'rgba(255,255,255,0.85)',
             backdropFilter: 'blur(6px)',
           }}
         >
           <div
             className="flex flex-col items-center gap-3 text-center"
             style={{
-              border: '2px dashed rgba(99,102,241,0.45)',
+              border: '2px dashed rgba(251,113,133,0.5)',
               borderRadius: 20,
               padding: '48px 64px',
-              background: 'rgba(99,102,241,0.04)',
+              background: 'rgba(251,113,133,0.05)',
             }}
           >
-            <FileUp size={40} strokeWidth={1.5} style={{ color: '#6366F1' }} />
+            <FileUp size={40} strokeWidth={1.5} style={{ color: '#FB7185' }} />
             <p className="text-[15px] font-semibold text-text-primary tracking-tight">
               Drop your data file here
             </p>
@@ -207,20 +231,19 @@ export function InputArea() {
         </div>
       )}
 
-      <div className="max-w-[720px] mx-auto w-full" ref={parent}>
+      <div
+        className={cn(
+          isCenter ? 'w-full' : 'max-w-[720px] mx-auto w-full'
+        )}
+        ref={parent}
+      >
         {/* File attachment chip */}
         {file && (
           <div
-            className="inline-flex items-center gap-2.5 mb-2.5 pl-3 pr-2 py-2 rounded-xl border transition-all duration-200"
-            style={{
-              background: '#FFFFFF',
-              borderColor: '#E5E7EB',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
-            }}
+            className="inline-flex items-center gap-2.5 mb-2.5 pl-3 pr-2 py-2 rounded-xl border bg-white border-border-subtle shadow-sm"
           >
             <div
-              className="w-6 h-6 rounded-md flex items-center justify-center shrink-0"
-              style={{ background: 'rgba(99,102,241,0.1)', color: '#6366F1' }}
+              className="w-6 h-6 rounded-md flex items-center justify-center shrink-0 bg-accent/10 text-accent"
             >
               <Paperclip size={13} strokeWidth={2} />
             </div>
@@ -230,10 +253,7 @@ export function InputArea() {
             </div>
             <button
               onClick={() => setFile(null)}
-              className="ml-1 w-5 h-5 flex items-center justify-center rounded-full transition-colors duration-150"
-              style={{ color: '#9CA3AF' }}
-              onMouseEnter={e => { e.currentTarget.style.color = '#EF4444'; e.currentTarget.style.background = 'rgba(239,68,68,0.08)'; }}
-              onMouseLeave={e => { e.currentTarget.style.color = '#9CA3AF'; e.currentTarget.style.background = 'transparent'; }}
+              className="ml-1 w-5 h-5 flex items-center justify-center rounded-full text-text-muted hover:text-status-error hover:bg-status-error/10 transition-colors duration-150"
             >
               <X size={12} strokeWidth={2.5} />
             </button>
@@ -242,32 +262,34 @@ export function InputArea() {
 
         {/* Input box */}
         <div
-          className="relative flex items-end rounded-2xl transition-all duration-200"
-          style={{
-            background: '#FFFFFF',
-            border: '1px solid #E5E7EB',
-            boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
-          }}
+          className={cn(
+            'relative flex items-end transition-all duration-200 bg-white',
+            isCenter
+              ? 'rounded-3xl shadow-md border border-border-subtle'
+              : 'rounded-2xl border border-border-subtle shadow-input'
+          )}
           onFocus={e => {
-            e.currentTarget.style.borderColor = 'rgba(99,102,241,0.5)';
-            e.currentTarget.style.boxShadow = '0 0 0 3px rgba(99,102,241,0.1), 0 1px 4px rgba(0,0,0,0.04)';
+            e.currentTarget.style.borderColor = 'rgba(251,113,133,0.55)';
+            e.currentTarget.style.boxShadow = '0 0 0 3px rgba(251,113,133,0.10), 0 4px 12px rgba(15,23,42,0.06)';
           }}
           onBlur={e => {
-            e.currentTarget.style.borderColor = '#E5E7EB';
-            e.currentTarget.style.boxShadow = '0 1px 4px rgba(0,0,0,0.04)';
+            e.currentTarget.style.borderColor = '#E2E8F0';
+            e.currentTarget.style.boxShadow = isCenter
+              ? '0 4px 12px rgba(15,23,42,0.06), 0 1px 3px rgba(15,23,42,0.04)'
+              : '0 1px 3px rgba(15,23,42,0.05), 0 1px 1px rgba(15,23,42,0.03)';
           }}
         >
           {/* Attach button */}
           <button
-            className="p-3 flex-shrink-0 transition-colors duration-150 rounded-bl-2xl"
-            style={{ color: '#9CA3AF' }}
-            onMouseEnter={e => e.currentTarget.style.color = '#6366F1'}
-            onMouseLeave={e => e.currentTarget.style.color = '#9CA3AF'}
-            onClick={() => fileInputRef.current?.click()}
+            className={cn(
+              'flex-shrink-0 transition-colors duration-150 text-text-muted hover:text-accent',
+              isCenter ? 'p-4' : 'p-3 rounded-bl-2xl'
+            )}
+            onClick={() => { setAcceptOverride(null); fileInputRef.current?.click(); }}
             title="Attach file"
             aria-label="Attach file"
           >
-            <Paperclip size={18} strokeWidth={2} />
+            <Paperclip size={isCenter ? 19 : 18} strokeWidth={2} />
           </button>
 
           {/* Textarea */}
@@ -279,33 +301,42 @@ export function InputArea() {
             placeholder={
               file
                 ? 'Add instructions (optional), then press Enter…'
-                : 'Upload a file to begin, or type a message…'
+                : isCenter
+                  ? 'Upload a data file or describe what to analyze…'
+                  : 'Upload a file to begin, or type a message…'
             }
-            className="flex-1 max-h-[160px] min-h-[46px] py-3 bg-transparent resize-none border-none outline-none text-[14.5px] text-text-primary leading-relaxed"
-            style={{ color: '#111827' }}
+            className={cn(
+              'flex-1 bg-transparent resize-none border-none outline-none text-text-primary leading-relaxed',
+              isCenter
+                ? 'max-h-[200px] min-h-[56px] py-4 text-[15.5px]'
+                : 'max-h-[160px] min-h-[46px] py-3 text-[14.5px]'
+            )}
             rows={1}
           />
 
           {/* Send button */}
           <button
             className={cn(
-              'p-2.5 m-1 flex-shrink-0 rounded-xl transition-all duration-200',
-              canSend
-                ? 'text-white'
-                : 'pointer-events-none',
+              'flex-shrink-0 rounded-xl transition-all duration-200',
+              isCenter ? 'p-3 m-1.5' : 'p-2.5 m-1',
+              canSend ? 'text-white shadow-brand' : 'pointer-events-none'
             )}
             style={
               canSend
-                ? { background: '#6366F1', boxShadow: '0 2px 8px rgba(99,102,241,0.35)' }
-                : { background: '#F3F4F6', color: '#D1D5DB' }
+                ? { backgroundImage: 'linear-gradient(135deg, #FB7185 0%, #FB923C 100%)' }
+                : { background: '#F1F5F9', color: '#CBD5E1' }
             }
-            onMouseEnter={e => { if (canSend) e.currentTarget.style.background = '#4F46E5'; }}
-            onMouseLeave={e => { if (canSend) e.currentTarget.style.background = '#6366F1'; }}
+            onMouseEnter={e => {
+              if (canSend) e.currentTarget.style.backgroundImage = 'linear-gradient(135deg, #F43F5E 0%, #F97316 100%)';
+            }}
+            onMouseLeave={e => {
+              if (canSend) e.currentTarget.style.backgroundImage = 'linear-gradient(135deg, #FB7185 0%, #FB923C 100%)';
+            }}
             onClick={onSubmit}
             aria-label="Send message"
           >
             <Send
-              size={16}
+              size={isCenter ? 17 : 16}
               strokeWidth={2.5}
               className={cn('transition-transform duration-200', canSend && 'rotate-45')}
             />
@@ -315,11 +346,11 @@ export function InputArea() {
             type="file"
             ref={fileInputRef}
             className="hidden"
-            accept=".csv,.xlsx,.xls,.json,.jsonl,.parquet"
+            accept={acceptOverride || '.csv,.xlsx,.xls,.json,.jsonl,.parquet'}
             onChange={handleAttach}
           />
         </div>
       </div>
     </div>
   );
-}
+});
