@@ -43,7 +43,9 @@ export function Sidebar() {
   const [error, setError] = useState('');
   const [restoring, setRestoring] = useState(null);
 
-  // Fetch history on mount and whenever a run completes
+  const historyVersion = usePipelineStore((s) => s.historyVersion);
+
+  // Fetch history on mount and whenever a run completes or a chat message lands
   const fetchHistory = useCallback(() => {
     setLoading(true);
     setError('');
@@ -55,10 +57,14 @@ export function Sidebar() {
 
   useEffect(() => { fetchHistory(); }, [fetchHistory]);
 
-  // Re-fetch when current pipeline transitions to complete
+  // Re-fetch when pipeline completes or after a chat message
   useEffect(() => {
     if (phase === 'complete') fetchHistory();
   }, [phase, fetchHistory]);
+
+  useEffect(() => {
+    if (historyVersion > 0) fetchHistory();
+  }, [historyVersion, fetchHistory]);
 
   const handleNewSession = useCallback(() => {
     reset();

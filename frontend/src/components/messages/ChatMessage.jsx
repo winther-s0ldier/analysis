@@ -13,6 +13,8 @@ import { PersonasCard } from './PersonasCard';
 import { InterventionsCard } from './InterventionsCard';
 import { CriticCard } from './CriticCard';
 import { ExecutiveSummaryCard, CrossConnectionsCard, NarrativeCard } from './ExecutiveSummaryCard';
+import { ChecksThatPassedCard, CaveatsCard } from './HonestySignalsCard';
+import { ReliabilityDashboardCard } from './ReliabilityDashboardCard';
 import { ReportEmbedCard } from './ReportEmbedCard';
 import { RerunSynthesisCard } from './RerunSynthesisCard';
 import { RunAnalysisCard } from './RunAnalysisCard';
@@ -144,6 +146,12 @@ export function ChatMessage({ message }) {
       return <InterventionsCard interventions={message.payload} />;
     case 'connections':
       return <CrossConnectionsCard connections={message.payload} />;
+    case 'checks_that_passed':
+      return <ChecksThatPassedCard checks={message.payload} />;
+    case 'caveats':
+      return <CaveatsCard items={message.payload} />;
+    case 'reliability_dashboard':
+      return <ReliabilityDashboardCard dashboard={message.payload} />;
     case 'summary':
       return <ExecutiveSummaryCard text={message.payload} />;
     case 'narrative':

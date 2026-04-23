@@ -32,12 +32,74 @@ _reasoning_store: dict = {}
 def get_synthesis_result(session_id: str) -> dict | None:
     return _synthesis_store.get(session_id)
 
+def _build_basis_line(result: dict) -> str:
+    """Construct a plain-English 'Based on ...' evidence line from node stats.
+
+    Pulls whatever statistical evidence is actually present (sample size,
+    p-values, effect sizes). Readers can judge the claim on its own merits
+    instead of trusting a single confidence number.
+    """
+    data = result.get("data") or {}
+    if not isinstance(data, dict):
+        return ""
+    parts: list[str] = []
+
+    n = (
+        data.get("n")
+        or data.get("total_sessions")
+        or data.get("total_users")
+        or data.get("total_entities")
+        or data.get("total_customers")
+        or data.get("total_entities_tracked")
+        or data.get("events_analyzed")
+        or data.get("total_unique_events")
+    )
+    if isinstance(n, (int, float)) and n > 0:
+        parts.append(f"n={int(n):,}")
+
+    p_candidates = [
+        data.get("p_value"),
+        (data.get("mann_kendall") or {}).get("p_value") if isinstance(data.get("mann_kendall"), dict) else None,
+        data.get("logrank_p_value"),
+        data.get("changepoint_p_value"),
+    ]
+    p_val = next((p for p in p_candidates if isinstance(p, (int, float))), None)
+    if p_val is not None:
+        if p_val < 0.001:
+            parts.append("p<0.001")
+        else:
+            parts.append(f"p={p_val:.3f}")
+
+    cramer_v = data.get("cramers_v") or data.get("cramer_v")
+    if isinstance(cramer_v, (int, float)):
+        parts.append(f"Cramér's V={cramer_v:.2f}")
+
+    cohens_d = data.get("cohens_d")
+    if isinstance(cohens_d, (int, float)):
+        parts.append(f"Cohen's d={cohens_d:.2f}")
+
+    rules = data.get("rules")
+    if isinstance(rules, list) and rules and isinstance(rules[0], dict):
+        lift = rules[0].get("lift")
+        if isinstance(lift, (int, float)):
+            parts.append(f"top lift={lift:.2f}")
+
+    notable = data.get("notable_correlations")
+    if isinstance(notable, list) and notable and isinstance(notable[0], dict):
+        r_val = notable[0].get("correlation") or notable[0].get("r")
+        if isinstance(r_val, (int, float)):
+            parts.append(f"r={r_val:.2f}")
+
+    return ", ".join(parts)
+
+
 def _extract_node_facts(node_id: str, analysis_id: str, result: dict) -> dict:
     atype = result.get("analysis_type", "unknown")
     status = result.get("status", "unknown")
     top_finding = result.get("top_finding", "")
     severity = result.get("severity", "info")
     confidence = result.get("confidence", 0.0)
+    reliability_label = result.get("reliability_label", "")
     data = result.get("data", {})
 
     _insight_summary = result.get("insight_summary") or {}
@@ -51,12 +113,15 @@ def _extract_node_facts(node_id: str, analysis_id: str, result: dict) -> dict:
         "top_finding": top_finding,
         "severity": severity,
         "confidence": confidence,
+        "reliability_label": reliability_label,
+        "basis": _build_basis_line(result),
 
         "decision_maker_takeaway": _dm_takeaway,
         "key_metrics": {},
     }
 
     if status not in ("success",):
+        facts["failure_reason"] = result.get("error") or result.get("reason") or top_finding or ""
         facts["key_metrics"] = {}
         return facts
 
@@ -512,6 +577,7 @@ def tool_submit_synthesis(
                 ) from _jde2
 
         _quality_failures = []
+        _soft_warnings: list[str] = []
 
         _syn_cfg = _get_config()["synthesis"]
         _exec = synthesis.get("executive_summary", {})
@@ -528,6 +594,7 @@ def tool_submit_synthesis(
         if len(_insights) == 0:
             _quality_failures.append("detailed_insights.insights is empty — must have one card per analysis node.")
         else:
+            _valid_reliability = {"strong", "suggestive", "tentative", "failed"}
             for _i, _ins in enumerate(_insights):
                 _summary = str(_ins.get("ai_summary", ""))
                 if len(_summary) < _syn_cfg["min_insight_summary_chars"]:
@@ -540,6 +607,18 @@ def tool_submit_synthesis(
                     _quality_failures.append(
                         f"detailed_insights.insights[{_i}].root_cause_hypothesis is too short ({len(_rc)} chars, minimum {_syn_cfg['min_insight_hypothesis_chars']}). "
                         "Must cite at least two node IDs in a causal chain."
+                    )
+                _rl = str(_ins.get("reliability_label", "")).strip().lower()
+                if _rl not in _valid_reliability:
+                    _soft_warnings.append(
+                        f"detailed_insights.insights[{_i}].reliability_label is missing or invalid "
+                        f"(got: {_ins.get('reliability_label')!r}). Should be one of: strong, suggestive, tentative, failed."
+                    )
+                _basis = str(_ins.get("basis_line", "")).strip()
+                if len(_basis) < 10:
+                    _soft_warnings.append(
+                        f"detailed_insights.insights[{_i}].basis_line is missing or too short "
+                        f"({len(_basis)} chars). Should start with 'Based on ...' and name n, p-value, or effect size."
                     )
 
         _conv = str(synthesis.get("conversational_report", ""))
@@ -556,6 +635,29 @@ def tool_submit_synthesis(
                 f"conversational_report is missing required section headers: {_missing_headers}. "
                 "The report MUST contain exactly these markdown headers: "
                 "'# Key Findings', '# Action Roadmap', '# Confidence Assessment'."
+            )
+
+        _checks = synthesis.get("checks_that_passed", {})
+        if not isinstance(_checks, dict) or not any(
+            isinstance(_checks.get(_b), list) and len(_checks.get(_b)) > 0
+            for _b in ("strong", "suggestive", "tentative")
+        ):
+            _soft_warnings.append(
+                "checks_that_passed is missing or empty — should bucket successful nodes by "
+                "reliability (strong/suggestive/tentative) with node_id, analysis_type, and a one_line description."
+            )
+
+        _caveats_raw = synthesis.get("caveats", {})
+        if isinstance(_caveats_raw, dict):
+            _caveat_items = _caveats_raw.get("items", [])
+        elif isinstance(_caveats_raw, list):
+            _caveat_items = _caveats_raw
+        else:
+            _caveat_items = []
+        if not _caveat_items:
+            _soft_warnings.append(
+                "caveats.items is empty — should call out at least one concrete limitation "
+                "(failed node, tentative label, small sample) citing specific node IDs or numbers."
             )
 
         _cmc_raw = synthesis.get("cross_metric_connections", {})
@@ -701,7 +803,16 @@ def tool_submit_synthesis(
             current_fact_sheet = {}
 
         validation = _validate_synthesis_grounding(synthesis, current_fact_sheet, session_id=session_id)
+        if _soft_warnings:
+            validation.setdefault("warnings", []).extend(_soft_warnings)
+            print(f"[Synthesis QA] {len(_soft_warnings)} honesty-signal warning(s) (non-blocking)")
         synthesis["_datalog_validation"] = validation
+
+        # reliability_dashboard is attached by the orchestrator after the
+        # synthesis A2A call returns. We don't do it here because agents run
+        # in separate processes — `from main import sessions` would hit a
+        # fresh empty dict and state.results would be unavailable. See
+        # orchestrator.py post-synthesis hydration block.
 
         _reasoning_store.pop(session_id, None)
 
@@ -749,6 +860,21 @@ def tool_submit_synthesis(
                 with open(_tmp, "w", encoding="utf-8") as _f:
                     json.dump(synthesis, _f)
                 print(f"INFO: synthesis cache written to {_tmp}")
+                try:
+                    from agent_servers import artifacts as _art
+                    _art.register_artifact(
+                        session_id=session_id,
+                        name="synthesis.json",
+                        mime_type="application/json",
+                        uri_path=_tmp,
+                        kind="synthesis",
+                        metadata={
+                            "node_count": len(current_fact_sheet),
+                            "insight_count": len(_insights),
+                        },
+                    )
+                except Exception as _art_err:
+                    print(f"WARNING: Could not register synthesis artifact: {_art_err}")
                 # Write per-agent synthesis trace for RM audit
                 try:
                     import time as _t

@@ -25,6 +25,7 @@ export default defineConfig({
       '/chart': 'http://127.0.0.1:8000',
       '/user-activity': 'http://127.0.0.1:8000',
       '/history': 'http://127.0.0.1:8000',
+      '/ga': 'http://127.0.0.1:8000',
     }
   }
 })

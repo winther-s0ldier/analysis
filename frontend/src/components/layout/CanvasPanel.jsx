@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Download, MessageSquare, Loader2, FileText, ArrowUp, List, ExternalLink, Link, Check } from 'lucide-react';
 import { marked } from 'marked';
@@ -316,21 +316,220 @@ function IframeAskPopover({ iframeRef, containerRef, onSubmit }) {
   );
 }
 
-// ── BuildingSkeleton ──────────────────────────────────────────────────────────
-function BuildingSkeleton() {
+// ── PhaseStatusBar ────────────────────────────────────────────────────────────
+// Live header showing *what* the backend is doing right now. Replaces the old
+// generic "Building report…" pulse so a 60-second wait feels like a process,
+// not a freeze.
+//   analyzing     → "Running analyses — X / Y complete" with progress bar
+//   synthesizing  → "Synthesizing insights…" (once chunks land) / "Critic reviewing…"
+//   building_report → "Polishing report…"
+function PhaseStatusBar({ phase, nodes, hasNarrative }) {
+  const total = nodes?.length || 0;
+  const done  = nodes?.filter(n => n.status === 'complete' || n.status === 'failed').length || 0;
+  const pct   = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  let label, sub;
+  if (phase === 'analyzing') {
+    label = 'Running analyses';
+    sub   = total > 0 ? `${done} of ${total} complete` : 'preparing…';
+  } else if (phase === 'synthesizing') {
+    label = hasNarrative ? 'Writing insights' : 'Synthesizing insights';
+    sub   = hasNarrative ? 'narrative streaming…' : 'LLM is reasoning over results…';
+  } else if (phase === 'building_report') {
+    label = 'Polishing report';
+    sub   = 'rendering final HTML…';
+  } else {
+    label = 'Working';
+    sub   = '';
+  }
+
   return (
-    <div className="flex flex-col gap-4 p-6 animate-pulse">
-      <div className="flex items-center gap-2 mb-2">
-        <Loader2 size={14} className="animate-spin" style={{ color: '#6366F1' }} />
-        <span className="text-[12px] font-semibold uppercase tracking-widest" style={{ color: '#9CA3AF' }}>Building report…</span>
+    <div style={{
+      padding: '18px 24px',
+      background: '#FAFAFA',
+      borderBottom: '1px solid #F3F4F6',
+      display: 'flex',
+      alignItems: 'center',
+      gap: 14,
+    }}>
+      <Loader2 size={16} className="animate-spin" style={{ color: '#6366F1', flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: '#111827' }}>
+          {label}{sub ? <span style={{ fontWeight: 500, color: '#6B7280' }}> — {sub}</span> : null}
+        </div>
+        {phase === 'analyzing' && total > 0 && (
+          <div style={{
+            marginTop: 8,
+            height: 4,
+            background: '#F3F4F6',
+            borderRadius: 9999,
+            overflow: 'hidden',
+          }}>
+            <div style={{
+              height: 4,
+              width: `${pct}%`,
+              background: '#6366F1',
+              borderRadius: 9999,
+              transition: 'width 0.4s ease',
+            }} />
+          </div>
+        )}
       </div>
-      {[100, 80, 90, 60, 75, 85, 50].map((w, i) => (
-        <div key={i} className="h-3 rounded-full" style={{ width: `${w}%`, background: '#F3F4F6' }} />
-      ))}
-      <div className="h-px my-2" style={{ background: '#F3F4F6' }} />
-      {[70, 85, 65, 90, 55].map((w, i) => (
-        <div key={i} className="h-3 rounded-full" style={{ width: `${w}%`, background: '#F3F4F6' }} />
-      ))}
+    </div>
+  );
+}
+
+// ── InlineStatCards ───────────────────────────────────────────────────────────
+// Renders the "headline" numbers from the synthesis JSON — reliability tier +
+// caveat count — the moment synthesis JSON lands, WITHOUT waiting for the
+// full HTML report to finish building. This is what the user sees 5-10s
+// before the iframe swap.
+function InlineStatCards({ synthesisData }) {
+  if (!synthesisData || typeof synthesisData !== 'object') return null;
+  const rd = synthesisData.reliability_dashboard;
+  if (!rd || typeof rd !== 'object') return null;
+
+  const pct       = rd.aggregate_pct ?? 0;
+  const label     = (rd.label || '').toLowerCase();
+  const strong    = rd.strong_nodes ?? 0;
+  const suggest   = rd.suggestive_nodes ?? 0;
+  const tentative = rd.tentative_nodes ?? 0;
+  const failed    = rd.failed_nodes ?? 0;
+
+  const colMap = {
+    strong:     '#059669',
+    suggestive: '#D97706',
+    tentative:  '#DC2626',
+    none:       '#9CA3AF',
+  };
+  const col = colMap[label] || '#6B7280';
+  const labelTxt = label ? label.charAt(0).toUpperCase() + label.slice(1) : '—';
+
+  // Caveat count
+  const caveatsRaw = synthesisData.caveats;
+  let caveatCount = 0;
+  if (Array.isArray(caveatsRaw)) caveatCount = caveatsRaw.length;
+  else if (caveatsRaw && typeof caveatsRaw === 'object' && Array.isArray(caveatsRaw.items)) caveatCount = caveatsRaw.items.length;
+
+  return (
+    <div style={{ padding: '20px 24px', borderBottom: '1px solid #F3F4F6', background: '#fff' }}>
+      <div style={{
+        fontSize: 10,
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: '0.08em',
+        color: '#9CA3AF',
+        marginBottom: 10,
+      }}>
+        Headline
+      </div>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{
+          flex: 1, minWidth: 140,
+          border: '1px solid #E5E7EB', borderTop: `3px solid ${col}`,
+          borderRadius: 10, padding: '12px 14px', background: '#fff',
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Reliability</div>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+            <span style={{ fontSize: 24, fontWeight: 800, color: col, lineHeight: 1 }}>{pct}%</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: col, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{labelTxt}</span>
+          </div>
+        </div>
+        <div style={{
+          flex: 1, minWidth: 140,
+          border: '1px solid #E5E7EB', borderRadius: 10, padding: '12px 14px', background: '#fff',
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Node Tiers</div>
+          <div style={{ display: 'flex', gap: 10, marginTop: 6, fontSize: 12, color: '#374151' }}>
+            <span><strong style={{ color: '#059669' }}>{strong}</strong> strong</span>
+            <span><strong style={{ color: '#D97706' }}>{suggest}</strong> sugg.</span>
+            <span><strong style={{ color: '#DC2626' }}>{tentative}</strong> tent.</span>
+            {failed > 0 && <span><strong style={{ color: '#7C2D12' }}>{failed}</strong> failed</span>}
+          </div>
+        </div>
+        {caveatCount > 0 && (
+          <div style={{
+            flex: 1, minWidth: 140,
+            border: '1px solid #FDE68A', borderRadius: 10, padding: '12px 14px', background: '#FFFBEB',
+          }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: '#92400E', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Limitations</div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+              <span style={{ fontSize: 24, fontWeight: 800, color: '#D97706', lineHeight: 1 }}>{caveatCount}</span>
+              <span style={{ fontSize: 11, color: '#92400E' }}>caveat{caveatCount !== 1 ? 's' : ''}</span>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── LiveChartGallery ──────────────────────────────────────────────────────────
+// Mini-tile grid of completed analyses shown while the narrative hasn't started
+// streaming yet. Keeps the canvas visually alive during the analyze phase:
+// each tile animates in as its node_complete event arrives. Deliberately
+// text-only (no chart images) so it doesn't compete with the chat column —
+// think of it as a "progress mini-map" rather than a second chart view.
+function LiveChartGallery({ chartMessages }) {
+  if (!chartMessages || chartMessages.length === 0) return null;
+
+  const sevCol = { critical: '#BE123C', high: '#B45309', medium: '#1E40AF', low: '#065F46', info: '#475569' };
+
+  return (
+    <div style={{ padding: '20px 24px' }}>
+      <div style={{
+        fontSize: 10,
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: '0.08em',
+        color: '#9CA3AF',
+        marginBottom: 10,
+      }}>
+        Completed so far ({chartMessages.length})
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))',
+        gap: 10,
+      }}>
+        {chartMessages.map((m) => {
+          const p = m.payload || {};
+          const sev = (p.severity || 'info').toLowerCase();
+          const col = sevCol[sev] || '#475569';
+          const conf = typeof p.confidence === 'number' ? Math.round(p.confidence * 100) : null;
+          const typeLabel = (p.analysisType || p.id || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+          return (
+            <div
+              key={m.id}
+              style={{
+                border: '1px solid #E5E7EB',
+                borderLeft: `3px solid ${col}`,
+                borderRadius: 8,
+                padding: '10px 12px',
+                background: '#fff',
+                animation: 'narrativeFadeIn 0.45s ease forwards',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: '#111827', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {typeLabel || 'Analysis'}
+                </span>
+                {conf !== null && (
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, color: col,
+                    background: '#F3F4F6', padding: '2px 6px', borderRadius: 9999, flexShrink: 0,
+                  }}>{conf}%</span>
+                )}
+              </div>
+              {p.finding && (
+                <div style={{ fontSize: 11.5, color: '#6B7280', marginTop: 6, lineHeight: 1.5, display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                  {p.finding}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -357,9 +556,21 @@ export function CanvasPanel({ onAsk }) {
   const canvasNarrative = currentSession?.canvasNarrative ?? null;
   const hasReport = currentSession?.hasReport ?? false;
   const phase = currentSession?.phase ?? 'idle';
+  const nodes = currentSession?.nodes ?? [];
+  const synthesisData = currentSession?.synthesisData ?? null;
   const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
   const addMessage = useChatStore((s) => s.addMessage);
   const setThinking = useChatStore((s) => s.setThinking);
+
+  // Charts from chat for the live gallery. Subscribe to the raw messages
+  // array (its ref only changes when chat state mutates) and filter via
+  // useMemo — NEVER filter inside the selector itself, because that returns
+  // a new array every render and triggers an infinite re-render loop.
+  const allMessages = useChatStore((s) => s.sessions[sessionId]?.messages);
+  const chartMessages = useMemo(
+    () => (allMessages || []).filter(m => m.type === 'chart'),
+    [allMessages]
+  );
   const contentRef = useRef(null);
   const narrativeRef = useRef(null);
   const iframeRef = useRef(null);
@@ -554,8 +765,19 @@ export function CanvasPanel({ onAsk }) {
   };
 
   const showReport    = hasReport && sessionId;
-  const showNarrative = !hasReport && canvasNarrative;
-  const showSkeleton  = !hasReport && !canvasNarrative && phase === 'synthesizing';
+  // Progressive view: while the final HTML report isn't ready yet, render
+  // (top-down) the phase bar, the inline stat cards (if synthesis JSON is in),
+  // the streaming narrative (if any), and a chart gallery mini-map (if no
+  // narrative yet but analyses have produced charts). This replaces the
+  // old "empty canvas until narrative streams" behavior.
+  const showProgressive = !hasReport && (
+    phase === 'analyzing' || phase === 'synthesizing' || phase === 'building_report' ||
+    canvasNarrative || (chartMessages && chartMessages.length > 0)
+  );
+  const showNarrative  = !hasReport && canvasNarrative;
+  const showStatCards  = !hasReport && synthesisData && synthesisData.reliability_dashboard;
+  const showGallery    = !hasReport && !canvasNarrative && chartMessages && chartMessages.length > 0;
+  const showPhaseBar   = !hasReport && (phase === 'analyzing' || phase === 'synthesizing' || phase === 'building_report');
 
   return (
     <AnimatePresence>
@@ -573,13 +795,6 @@ export function CanvasPanel({ onAsk }) {
             className="flex items-center gap-2 px-4 py-3 shrink-0"
             style={{ borderBottom: '1px solid #F3F4F6', background: '#FAFAFA' }}
           >
-            {/* Traffic lights */}
-            <div className="flex gap-1.5 mr-1">
-              <div className="w-2.5 h-2.5 rounded-full" style={{ background: '#EF4444' }} />
-              <div className="w-2.5 h-2.5 rounded-full" style={{ background: '#F59E0B' }} />
-              <div className="w-2.5 h-2.5 rounded-full" style={{ background: '#10B981' }} />
-            </div>
-
             <FileText size={13} strokeWidth={2} style={{ color: '#9CA3AF' }} />
             <span className="text-[13px] font-semibold flex-1 truncate" style={{ color: '#374151' }}>
               {showReport ? 'Analysis Report' : 'Narrative Summary'}
@@ -822,23 +1037,27 @@ export function CanvasPanel({ onAsk }) {
               </>
             )}
 
-            {/* Narrative: scrollable HTML with SelectionPopover overlay */}
-            {showNarrative && (
-              <div
-                className="relative w-full"
-                style={{ padding: '32px 40px' }}
-              >
-                <SelectionPopover containerRef={contentRef} onSubmit={handleSubmitQuestion} />
-                <div
-                  ref={narrativeRef}
-                  className="prose prose-sm max-w-none narrative-stream narrative-md"
-                  style={{ fontSize: 14, lineHeight: 1.75, color: '#374151' }}
-                  dangerouslySetInnerHTML={{ __html: _renderNarrative(canvasNarrative) }}
-                />
+            {/* Progressive view — phase bar, stat cards, narrative, gallery */}
+            {showProgressive && !showReport && (
+              <div className="relative w-full">
+                {showPhaseBar && (
+                  <PhaseStatusBar phase={phase} nodes={nodes} hasNarrative={!!canvasNarrative} />
+                )}
+                {showStatCards && <InlineStatCards synthesisData={synthesisData} />}
+                {showNarrative && (
+                  <div style={{ padding: '32px 40px', position: 'relative' }}>
+                    <SelectionPopover containerRef={contentRef} onSubmit={handleSubmitQuestion} />
+                    <div
+                      ref={narrativeRef}
+                      className="prose prose-sm max-w-none narrative-stream narrative-md"
+                      style={{ fontSize: 14, lineHeight: 1.75, color: '#374151' }}
+                      dangerouslySetInnerHTML={{ __html: _renderNarrative(canvasNarrative) }}
+                    />
+                  </div>
+                )}
+                {showGallery && <LiveChartGallery chartMessages={chartMessages} />}
               </div>
             )}
-
-            {showSkeleton && <BuildingSkeleton />}
           </div>
         </motion.div>
       )}

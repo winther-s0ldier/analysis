@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
-import { Paperclip, Send, X, FileUp } from 'lucide-react';
+import { Paperclip, Send, X, FileUp, Plus, Upload, BarChart3 } from 'lucide-react';
 import { usePipelineStore } from '../../store/pipelineStore';
 import { useChatStore } from '../../store/chatStore';
 import { useAutoResize } from '../../hooks/useAutoResize';
@@ -8,6 +8,7 @@ import { uploadFile, profileDataset, discoverMetrics, analyzeMetrics, sendChatMe
 import { closeConnection, resetSessionTracking } from '../../services/sseManager';
 import { toast } from 'sonner';
 import { cn } from '../ui/Badge';
+import { GASourcePicker } from './GASourcePicker';
 
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -35,6 +36,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
   const setPhase = usePipelineStore((s) => s.setPhase);
   const setNodes = usePipelineStore((s) => s.setNodes);
   const setHasReport = usePipelineStore((s) => s.setHasReport);
+  const bumpHistory = usePipelineStore((s) => s.bumpHistory);
   const setCanvasNarrative = usePipelineStore((s) => s.setCanvasNarrative);
   const setCanvasOpen = usePipelineStore((s) => s.setCanvasOpen);
   const migrateSession = usePipelineStore((s) => s.migrateSession);
@@ -52,6 +54,11 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
   const [acceptOverride, setAcceptOverride] = useState(null);
   const [parent] = useAutoAnimate();
   const isCenter = variant === 'center';
+  // "+" menu state
+  const [plusMenuOpen, setPlusMenuOpen] = useState(false);
+  // Inline GA picker visibility (opened from the "+" menu)
+  const [showGaPicker, setShowGaPicker] = useState(false);
+  const plusMenuRef = useRef(null);
 
   const textareaRef = useAutoResize(textValue);
 
@@ -73,6 +80,85 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
     setTimeout(() => textareaRef.current?.focus(), 50);
   }, [pendingMessage]);
 
+  // Close the "+" menu on outside click / Escape
+  useEffect(() => {
+    if (!plusMenuOpen) return;
+    const onDoc = (e) => {
+      if (plusMenuRef.current && !plusMenuRef.current.contains(e.target)) {
+        setPlusMenuOpen(false);
+      }
+    };
+    const onKey = (e) => { if (e.key === 'Escape') setPlusMenuOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [plusMenuOpen]);
+
+  // ── Post-session pipeline (shared by CSV upload and GA4 ingest) ────────
+  // Given the response envelope from /upload or /ga/ingest, run the standard
+  // profile → discover → render-run-button flow.
+  const runPostSessionFlow = async (uploadData, tempId) => {
+    const realId = uploadData.session_id;
+    const realFolder = uploadData.output_folder || realId;
+    closeConnection(tempId);
+    resetSessionTracking(tempId);
+    closeConnection(realId);
+    resetSessionTracking(realId);
+    migrateSession(tempId, realId, realFolder);
+    migrateChatSession(tempId, realId);
+
+    let profileData;
+    if (uploadData.profile_cached && uploadData.profile) {
+      toast.success('Identical dataset — loading cached profile');
+      profileData = uploadData.profile;
+    } else {
+      setPhase('profiling');
+      profileData = await profileDataset(realId);
+      toast.success('Profiling complete');
+    }
+    addMessage('ai', 'profile', profileData);
+
+    let discoveryPayload;
+    if (uploadData.dag_cached && uploadData.discovery) {
+      toast.success('Loaded cached analysis plan');
+      discoveryPayload = uploadData.discovery;
+    } else {
+      setPhase('discovering');
+      const discoverData = await discoverMetrics(realId);
+      discoveryPayload = discoverData.discovery;
+      toast.success('Analysis plan ready');
+    }
+    addMessage('ai', 'discovery', discoveryPayload);
+    if (discoveryPayload?.dag) {
+      setNodes(discoveryPayload.dag.map(n => ({ id: n.id, type: n.analysis_type, status: 'pending' })));
+    }
+
+    addMessage('ai', 'run_analysis', { sessionId: realId });
+    toast.success('Review the plan and click Run when ready');
+  };
+
+  // ── GA4 ingest handler — GASourcePicker calls this with the /ga/ingest response
+  const onGASessionReady = async (ingestData) => {
+    const tempId = `__ingesting_${Date.now()}`;
+    setSession(tempId, null);
+    setPhase('uploading');
+    addMessage('user', 'file', {
+      name: ingestData.filename || 'GA4 pull',
+      size: `${(ingestData.rows || 0).toLocaleString()} rows`,
+    });
+    setShowGaPicker(false);
+    try {
+      await runPostSessionFlow(ingestData, tempId);
+    } catch (err) {
+      toast.error(`Error: ${err.message}`);
+      addMessage('ai', 'text', `Sorry, something went wrong: ${err.message}`);
+      setPhase('error');
+    }
+  };
+
   // ── Submit handler — backend behavior unchanged ─────────────────────────
   const onSubmit = async () => {
     const currentText = textValue.trim();
@@ -93,43 +179,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
       try {
         toast.info(`Uploading ${currentFile.name}...`);
         const uploadData = await uploadFile(currentFile);
-
-        const realId = uploadData.session_id;
-        const realFolder = uploadData.output_folder || realId;
-        // Kill any zombie SSE/polling for the real session ID before migrating
-        closeConnection(realId);
-        resetSessionTracking(realId);
-        migrateSession(tempId, realId, realFolder);
-        migrateChatSession(tempId, realId);
-
-        let profileData;
-        if (uploadData.profile_cached && uploadData.profile) {
-          toast.success('Identical dataset — loading cached profile');
-          profileData = uploadData.profile;
-        } else {
-          setPhase('profiling');
-          profileData = await profileDataset(uploadData.session_id);
-          toast.success('Profiling complete');
-        }
-        addMessage('ai', 'profile', profileData);
-
-        let discoveryPayload;
-        if (uploadData.dag_cached && uploadData.discovery) {
-          toast.success('Loaded cached analysis plan');
-          discoveryPayload = uploadData.discovery;
-        } else {
-          setPhase('discovering');
-          const discoverData = await discoverMetrics(uploadData.session_id);
-          discoveryPayload = discoverData.discovery;
-          toast.success('Analysis plan ready');
-        }
-        addMessage('ai', 'discovery', discoveryPayload);
-        if (discoveryPayload?.dag) {
-          setNodes(discoveryPayload.dag.map(n => ({ id: n.id, type: n.analysis_type, status: 'pending' })));
-        }
-
-        addMessage('ai', 'run_analysis', { sessionId: uploadData.session_id });
-        toast.success('Review the plan and click Run when ready');
+        await runPostSessionFlow(uploadData, tempId);
       } catch (err) {
         toast.error(`Error: ${err.message}`);
         addMessage('ai', 'text', `Sorry, something went wrong: ${err.message}`);
@@ -145,6 +195,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
             addOrUpdateChart(res.chart);
           }
           insertAfterMessage(userMsgId, 'ai', 'text', res.response);
+          bumpHistory();
         }
       } catch {
         insertAfterMessage(userMsgId, 'ai', 'text', 'Sorry, could not reach the server.');
@@ -237,6 +288,21 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
         )}
         ref={parent}
       >
+        {/* Inline GA picker — opened from the "+" menu, dismissable */}
+        {showGaPicker && (
+          <div className="mb-3 relative">
+            <button
+              onClick={() => setShowGaPicker(false)}
+              className="absolute -top-2 -right-2 z-10 w-6 h-6 flex items-center justify-center rounded-full bg-white border border-border-subtle text-text-muted hover:text-status-error shadow-sm"
+              title="Close"
+              aria-label="Close GA picker"
+            >
+              <X size={12} strokeWidth={2.5} />
+            </button>
+            <GASourcePicker onSessionReady={onGASessionReady} />
+          </div>
+        )}
+
         {/* File attachment chip */}
         {file && (
           <div
@@ -279,18 +345,65 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
               : '0 1px 3px rgba(15,23,42,0.05), 0 1px 1px rgba(15,23,42,0.03)';
           }}
         >
-          {/* Attach button */}
-          <button
-            className={cn(
-              'flex-shrink-0 transition-colors duration-150 text-text-muted hover:text-accent',
-              isCenter ? 'p-4' : 'p-3 rounded-bl-2xl'
+          {/* "+" data-source menu */}
+          <div className="relative flex-shrink-0" ref={plusMenuRef}>
+            <button
+              className={cn(
+                'transition-colors duration-150 text-text-muted hover:text-accent',
+                isCenter ? 'p-4' : 'p-3 rounded-bl-2xl'
+              )}
+              onClick={() => setPlusMenuOpen(v => !v)}
+              title="Add data source"
+              aria-label="Add data source"
+              aria-haspopup="menu"
+              aria-expanded={plusMenuOpen}
+            >
+              <Plus
+                size={isCenter ? 20 : 19}
+                strokeWidth={2.25}
+                className={cn('transition-transform duration-200', plusMenuOpen && 'rotate-45')}
+              />
+            </button>
+
+            {plusMenuOpen && (
+              <div
+                role="menu"
+                className="absolute left-2 bottom-full mb-2 z-40 w-[220px] rounded-xl border bg-white py-1.5 shadow-lg"
+                style={{ borderColor: '#E2E8F0', boxShadow: '0 10px 25px rgba(15,23,42,0.10), 0 2px 6px rgba(15,23,42,0.05)' }}
+              >
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setPlusMenuOpen(false);
+                    setShowGaPicker(false);
+                    setAcceptOverride(null);
+                    fileInputRef.current?.click();
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-primary hover:bg-bg-page transition-colors"
+                >
+                  <Upload size={14} strokeWidth={2} className="text-text-muted" />
+                  <div className="flex flex-col items-start leading-tight">
+                    <span className="font-medium">Upload file</span>
+                    <span className="text-[11px] text-text-muted">CSV, XLSX, JSON, Parquet</span>
+                  </div>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setPlusMenuOpen(false);
+                    setShowGaPicker(true);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-primary hover:bg-bg-page transition-colors"
+                >
+                  <BarChart3 size={14} strokeWidth={2} className="text-text-muted" />
+                  <div className="flex flex-col items-start leading-tight">
+                    <span className="font-medium">Google Analytics</span>
+                    <span className="text-[11px] text-text-muted">Pull GA4 property data</span>
+                  </div>
+                </button>
+              </div>
             )}
-            onClick={() => { setAcceptOverride(null); fileInputRef.current?.click(); }}
-            title="Attach file"
-            aria-label="Attach file"
-          >
-            <Paperclip size={isCenter ? 19 : 18} strokeWidth={2} />
-          </button>
+          </div>
 
           {/* Textarea */}
           <textarea

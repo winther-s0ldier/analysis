@@ -303,6 +303,21 @@ def submit_result(
     result["analysis_id"] = analysis_id
     store_analysis_result(session_id, analysis_id, result)
 
+    _chart_path = result.get("chart_file_path")
+    if _chart_path and os.path.exists(_chart_path):
+        try:
+            from agent_servers import artifacts as _art
+            _art.register_artifact(
+                session_id=session_id,
+                name=f"{analysis_id}.png",
+                mime_type="image/png",
+                uri_path=_chart_path,
+                kind="chart",
+                metadata={"analysis_id": analysis_id, "analysis_type": analysis_type},
+            )
+        except Exception as _art_err:
+            logging.warning(f"Failed to register chart artifact for {analysis_id}: {_art_err}")
+
     try:
         from main import sessions
         from pipeline_types import create_message, Intent

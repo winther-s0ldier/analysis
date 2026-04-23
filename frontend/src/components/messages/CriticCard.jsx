@@ -7,7 +7,16 @@ const SEV_COLOR = { high: '#DC2626', medium: '#D97706', low: '#6B7280' };
 const SEV_BG    = { high: '#FEF2F2', medium: '#FFFBEB', low: '#F9FAFB' };
 
 export function CriticCard({ critic = {} }) {
-  const [expanded, setExpanded] = useState(false);
+  // Auto-expand by default when there is anything of substance to dissent about.
+  // Collapsing critic feedback buries the "what could be wrong" signal — keep it
+  // visible and let the user explicitly collapse if they want to dismiss it.
+  const _initialChallenges = (critic.challenges || []);
+  const _anyHigh = _initialChallenges.some(c =>
+    typeof c !== 'string' && (c.severity || '').toLowerCase() === 'high'
+  );
+  const [expanded, setExpanded] = useState(
+    _anyHigh || _initialChallenges.length >= 2
+  );
 
   // Handle both raw format: { approved, confidence_adjustment, challenges, overall_verdict }
   // and any partially-mapped format. approved is a bool; confidence_adjustment is 0.0–1.0.

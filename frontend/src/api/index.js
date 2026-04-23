@@ -92,3 +92,45 @@ export const restoreSession = async (sessionId) => {
   if (!res.ok) throw new Error('Failed to restore session');
   return res.json();
 };
+
+// ── Google Analytics (GA4) data-source API ─────────────────────────────────
+
+export const gaStatus = async () => {
+  const res = await fetch(`${API_BASE}/ga/status`);
+  if (!res.ok) throw new Error('GA status failed');
+  return res.json();
+};
+
+export const gaAuthStart = async () => {
+  const res = await fetch(`${API_BASE}/ga/auth/start`);
+  if (!res.ok) throw new Error('GA auth start failed');
+  return res.json();
+};
+
+export const gaDisconnect = async () => {
+  const res = await fetch(`${API_BASE}/ga/disconnect`, { method: 'POST' });
+  if (!res.ok) throw new Error('GA disconnect failed');
+  return res.json();
+};
+
+export const gaListProperties = async () => {
+  const res = await fetch(`${API_BASE}/ga/properties`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'GA properties failed');
+  }
+  return res.json();
+};
+
+export const gaIngest = async ({ property_id, start_date = '90daysAgo', end_date = 'today' }) => {
+  const res = await fetch(`${API_BASE}/ga/ingest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ property_id, start_date, end_date }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'GA ingest failed');
+  }
+  return res.json();
+};

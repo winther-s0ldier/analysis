@@ -20,7 +20,7 @@ You MAY propose a CUSTOM analysis_type not listed here if no library type captur
 - `correlation_matrix`: {} -- no extra args needed.
 - `anomaly_detection`: {"col": <numeric_column>} -- IQR + Z-score outlier detection.
 - `missing_data_analysis`: {} -- no extra args needed.
-- `pareto_analysis`: {"category_col": <category>, "value_col": <numeric>} -- 80/20 rule.
+- `pareto_analysis`: {"entity_col": <category>, "value_col": <numeric>} -- 80/20 rule.
 - `contribution_analysis`: {"group_col": <category>, "value_col": <numeric>} -- % contribution to total value.
 - `cross_tab_analysis`: {"col_a": <category>, "col_b": <category>} -- Chi-squared + Cramer's V categorical association.
 

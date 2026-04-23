@@ -2,10 +2,35 @@ import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Lightbulb, ChevronDown, ChevronUp, Clock, AlertTriangle, GitBranch, ArrowRight } from 'lucide-react';
 import { Badge } from '../ui/Badge';
+import { renderWithCitations } from './CitationLink';
 
 const PRIORITY_VARIANT = { critical: 'error', high: 'warning', medium: 'info', low: 'default' };
 const PRIORITY_COLOR   = { critical: '#DC2626', high: '#D97706', medium: '#2563EB', low: '#6B7280' };
 const PRIORITY_BG      = { critical: '#FEF2F2', high: '#FFFBEB', medium: '#EFF6FF', low: '#F9FAFB' };
+
+// Reliability badge — visible honesty signal per insight.
+// Matches the backend's _reliability_label() buckets exactly.
+const RELIABILITY_STYLE = {
+  strong:     { label: 'STRONG',     color: '#047857', bg: '#ECFDF5', border: '#6EE7B7' },
+  suggestive: { label: 'SUGGESTIVE', color: '#B45309', bg: '#FFFBEB', border: '#FCD34D' },
+  tentative:  { label: 'TENTATIVE',  color: '#B91C1C', bg: '#FEF2F2', border: '#FCA5A5' },
+  failed:     { label: 'FAILED',     color: '#6B7280', bg: '#F3F4F6', border: '#D1D5DB' },
+};
+
+function ReliabilityBadge({ label }) {
+  const key = String(label || '').toLowerCase();
+  const style = RELIABILITY_STYLE[key];
+  if (!style) return null;
+  return (
+    <span
+      className="inline-flex items-center px-1.5 py-0.5 rounded text-[9px] font-bold tracking-wider border"
+      style={{ color: style.color, background: style.bg, borderColor: style.border }}
+      title="Reliability of this finding, computed from sample size, p-value, and effect size"
+    >
+      {style.label}
+    </span>
+  );
+}
 
 // ── ImpactBar: thin progress bar showing impact_score / 10 ───────────────────
 function ImpactBar({ score, priority }) {
@@ -104,9 +129,12 @@ function SingleInsight({ insight, idx, criticChallenges = [] }) {
               {insight.title || insight.headline || 'Insight'}
             </h4>
           </div>
-          <Badge variant={PRIORITY_VARIANT[priority] || 'info'} className="shrink-0 text-[10px]">
-            {priority.toUpperCase()}
-          </Badge>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <ReliabilityBadge label={insight.reliability_label} />
+            <Badge variant={PRIORITY_VARIANT[priority] || 'info'} className="text-[10px]">
+              {priority.toUpperCase()}
+            </Badge>
+          </div>
         </div>
 
         {/* ── Impact bar + timeline bucket ── */}
@@ -120,9 +148,18 @@ function SingleInsight({ insight, idx, criticChallenges = [] }) {
           )}
         </div>
 
+        {/* ── Basis line — plain-English evidence snippet (n, p, effect size) ── */}
+        {insight.basis_line && (
+          <div className="ml-8 mb-2 pl-2.5 border-l-2 border-border-subtle">
+            <span className="text-[11.5px] italic text-text-muted leading-snug">
+              {renderWithCitations(insight.basis_line)}
+            </span>
+          </div>
+        )}
+
         {/* ── Summary ── */}
         <p className="text-[13px] text-text-secondary leading-relaxed ml-8 mb-3">
-          {insight.ai_summary || insight.description || ''}
+          {renderWithCitations(insight.ai_summary || insight.description || '')}
         </p>
 
         {/* ── Deep dive toggle (root cause, downstream, ux) ── */}
@@ -148,24 +185,24 @@ function SingleInsight({ insight, idx, criticChallenges = [] }) {
             >
               {insight.root_cause_hypothesis && (
                 <DetailSection label="Root Cause">
-                  {insight.root_cause_hypothesis}
+                  {renderWithCitations(insight.root_cause_hypothesis)}
                 </DetailSection>
               )}
               {insight.possible_causes?.length > 0 && (
                 <DetailSection label="Possible Causes">
                   <ul className="mt-0.5 space-y-0.5 list-disc list-inside text-[12px] text-text-secondary">
-                    {insight.possible_causes.map((c, i) => <li key={i}>{c}</li>)}
+                    {insight.possible_causes.map((c, i) => <li key={i}>{renderWithCitations(c)}</li>)}
                   </ul>
                 </DetailSection>
               )}
               {insight.downstream_implications && (
                 <DetailSection label="Downstream Impact">
-                  {insight.downstream_implications}
+                  {renderWithCitations(insight.downstream_implications)}
                 </DetailSection>
               )}
               {insight.ux_implications && (
                 <DetailSection label="UX Implications">
-                  {insight.ux_implications}
+                  {renderWithCitations(insight.ux_implications)}
                 </DetailSection>
               )}
             </motion.div>
@@ -185,7 +222,7 @@ function SingleInsight({ insight, idx, criticChallenges = [] }) {
                   >
                     {i + 1}
                   </span>
-                  {step}
+                  {renderWithCitations(step)}
                 </li>
               ))}
             </ol>

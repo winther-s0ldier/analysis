@@ -1,6 +1,7 @@
 import os
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+CHAT_MODEL  = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
 
 _AGENT_MODELS = {
     "orchestrator": MODEL,
@@ -9,7 +10,7 @@ _AGENT_MODELS = {
     "discovery":    MODEL,
     "synthesis":    MODEL,
     "dag_builder":  MODEL,
-    "chat":         MODEL,
+    "chat":         CHAT_MODEL,
     "critic":       MODEL,
 }
 

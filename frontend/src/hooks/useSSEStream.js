@@ -22,9 +22,13 @@ export function useSSEStream(sessionId) {
   useEffect(() => {
     if (!sessionId) return;
 
-    // Only open / keep a connection if the pipeline is actively running.
+    // Open / keep a connection if the pipeline is actively running OR a new
+    // run was just started. The pipelineRunId>0 guard catches the brief window
+    // between startPipelineRun() and setPhase('analyzing') so we never miss
+    // early node_started events.
     const isRunning = phase && !['idle', 'complete', 'error'].includes(phase);
-    if (isRunning) {
+    const runKicked = pipelineRunId > 0 && phase !== 'complete' && phase !== 'error';
+    if (isRunning || runKicked) {
       ensureConnection(sessionId, pipelineRunId);
       usePipelineStore.getState().setSseConnected(true, sessionId);
     }

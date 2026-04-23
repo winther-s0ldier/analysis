@@ -236,6 +236,8 @@ class SessionState:
         self.conversation_history: list = []
         self.clarification_request: dict = {}
         self.csv_hash: str = ""
+        self.data_source: str = "csv"  # "csv" | "ga4" | "bigquery"
+        self.data_source_meta: dict = {}  # e.g. {"property_id": "...", "date_range": [...]}
 
     def post_message(self, message) -> None:
         d = message.to_dict()
@@ -287,6 +289,8 @@ class SessionState:
             "conversation_history": self.conversation_history,
             "message_count":        len(self.message_log),
             "csv_hash":             self.csv_hash,
+            "data_source":          self.data_source,
+            "data_source_meta":     self.data_source_meta,
         }
 
     @classmethod
@@ -311,6 +315,8 @@ class SessionState:
         state.user_instructions    = d.get("user_instructions", "")
         state.conversation_history = d.get("conversation_history", [])
         state.csv_hash             = d.get("csv_hash", "")
+        state.data_source          = d.get("data_source", "csv")
+        state.data_source_meta     = d.get("data_source_meta", {})
         return state
 
 sessions: Dict[str, SessionState] = {}
@@ -349,6 +355,16 @@ async def _cleanup_stale_sessions() -> None:
                 _critic_store.pop(sid, None)
             except Exception as _evict_err:
                 print(f"WARNING: [Eviction] critic store cleanup failed for {sid}: {_evict_err}")
+            try:
+                from agent_servers import task_manager as _tm_evict
+                _tm_evict.purge_session(sid)
+            except Exception as _evict_err:
+                print(f"WARNING: [Eviction] task store cleanup failed for {sid}: {_evict_err}")
+            try:
+                from agent_servers import artifacts as _art_evict
+                _art_evict.purge_session(sid)
+            except Exception as _evict_err:
+                print(f"WARNING: [Eviction] artifact store cleanup failed for {sid}: {_evict_err}")
         if stale:
             print(f"INFO: [Eviction] Removed {len(stale)} stale session(s) from memory")
 
@@ -957,6 +973,170 @@ async def upload_csv(file: UploadFile = File(...)):
         "status":       "uploaded",
     }
 
+
+# ── Google Analytics (GA4) data-source endpoints — Phase 3 Step 1 ────────────
+
+@app.get("/ga/status")
+async def ga_status():
+    """Check whether the server has a cached GA OAuth token."""
+    from tools.ga4_connector import is_connected
+    return {"connected": is_connected()}
+
+
+@app.get("/ga/auth/start")
+async def ga_auth_start():
+    """Return the Google OAuth URL the frontend should open in a popup."""
+    try:
+        from tools.ga4_connector import build_auth_url
+        url, state = build_auth_url()
+        return {"auth_url": url, "state": state}
+    except Exception as e:
+        raise HTTPException(500, f"GA OAuth init failed: {e}")
+
+
+@app.get("/ga/auth/callback")
+async def ga_auth_callback(code: str = "", state: str = "", error: str = ""):
+    """OAuth redirect target. Exchanges `code` for a refresh token on disk."""
+    if error:
+        return HTMLResponse(
+            f"<h3>Google Analytics authorization failed</h3><p>{error}</p>",
+            status_code=400,
+        )
+    if not code:
+        raise HTTPException(400, "Missing ?code parameter")
+    try:
+        from tools.ga4_connector import exchange_code_for_token
+        exchange_code_for_token(code=code, user_key=state or "default")
+    except Exception as e:
+        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{e}</pre>", status_code=500)
+
+    # Tell the opener window we succeeded, then close the popup
+    html = (
+        "<!doctype html><html><body>"
+        "<h3>Google Analytics connected. You can close this window.</h3>"
+        "<script>"
+        "try { window.opener && window.opener.postMessage({type:'ga-oauth',ok:true},'*'); } catch(e){}"
+        "setTimeout(function(){ window.close(); }, 800);"
+        "</script></body></html>"
+    )
+    return HTMLResponse(html)
+
+
+@app.post("/ga/disconnect")
+async def ga_disconnect():
+    from tools.ga4_connector import disconnect
+    return {"disconnected": disconnect()}
+
+
+@app.get("/ga/properties")
+async def ga_list_properties():
+    """List GA4 properties the connected user can read."""
+    try:
+        from tools.ga4_connector import list_ga4_properties, is_connected
+        if not is_connected():
+            raise HTTPException(401, "Not connected to Google Analytics")
+        return {"properties": list_ga4_properties()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list GA properties: {e}")
+
+
+class GAIngestRequest(BaseModel):
+    property_id: str
+    start_date: str = "90daysAgo"
+    end_date: str = "today"
+    dimensions: Optional[List[str]] = None
+    metrics: Optional[List[str]] = None
+
+
+@app.post("/ga/ingest")
+async def ga_ingest(req: GAIngestRequest):
+    """Pull a GA4 report → write CSV → create SessionState.
+
+    Returns the same envelope as /upload so the frontend can treat it identically.
+    """
+    from tools.ga4_connector import (
+        is_connected,
+        ingest_to_session_csv,
+    )
+    if not is_connected():
+        raise HTTPException(401, "Not connected to Google Analytics")
+
+    session_id = str(uuid.uuid4())
+
+    safe_pid = re.sub(r"[^\w]", "_", req.property_id).strip("_")[:40] or "ga4"
+    output_folder_name = f"ga4_{safe_pid}_{session_id[:6]}"
+    output_folder = OUTPUT_DIR / output_folder_name
+    output_folder.mkdir(exist_ok=True)
+
+    try:
+        pull = await asyncio.to_thread(
+            ingest_to_session_csv,
+            property_id=req.property_id,
+            session_id=session_id,
+            output_dir=UPLOAD_DIR,
+            start_date=req.start_date,
+            end_date=req.end_date,
+            dimensions=req.dimensions,
+            metrics=req.metrics,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"GA4 fetch failed: {e}")
+
+    csv_path = pull["csv_path"]
+
+    # Hash the pulled CSV so the existing duplicate-detection logic has something to key on
+    import hashlib as _hashlib
+    csv_hash = _hashlib.sha256(Path(csv_path).read_bytes()).hexdigest()
+
+    from tools.data_gate import run_preflight_check
+    gate_result = run_preflight_check(csv_path, "ga4")
+
+    if gate_result["gate_result"] == "block":
+        raise HTTPException(
+            status_code=422,
+            detail="Data Quality Gate BLOCKED the GA4 pull:\n" + "\n".join(gate_result["errors"]),
+        )
+
+    state = SessionState(session_id)
+    state.csv_path = csv_path
+    state.csv_filename = pull["original_filename"]
+    state.output_folder = str(output_folder)
+    state.csv_hash = csv_hash
+    state.data_source = "ga4"
+    state.data_source_meta = {
+        "property_id": req.property_id,
+        "date_range": [req.start_date, req.end_date],
+        "dimensions": pull.get("columns", []),
+        "cached": pull.get("cached", False),
+    }
+    state.normalization = {
+        "original_filename": pull["original_filename"],
+        "original_format":   "ga4",
+        "warnings":          gate_result["warnings"],
+        "row_count":         gate_result["row_count"],
+        "col_count":         gate_result["col_count"],
+    }
+    state.gate_result = gate_result
+    sessions[session_id] = state
+
+    return {
+        "session_id": session_id,
+        "filename":   pull["original_filename"],
+        "format":     "ga4",
+        "rows":       gate_result["row_count"],
+        "columns":    gate_result["col_count"],
+        "Gate":       gate_result["gate_result"],
+        "warnings":   gate_result["warnings"],
+        "status":     "uploaded",
+        "data_source": "ga4",
+        "property_id": req.property_id,
+        "date_range":  [req.start_date, req.end_date],
+        "cached":      pull.get("cached", False),
+    }
+
+
 @app.post("/profile/{session_id}")
 async def profile_dataset(session_id: str):
     if session_id not in sessions:
@@ -1084,12 +1264,12 @@ def build_fallback_discovery(state: SessionState, session_id: str) -> dict:
     classification = state.semantic_map
     column_roles = classification.get("column_roles", {})
     dataset_type = classification.get("dataset_type", "tabular_generic")
-    recommended = classification.get("recommended_analyses", [
+    recommended = classification.get("recommended_analyses") or [
         "distribution_analysis",
         "categorical_analysis",
         "correlation_matrix",
         "missing_data_analysis",
-    ])
+    ]
     row_count = state.raw_profile.get("row_count", 0)
 
     print(f"INFO: Using fallback discovery for {session_id}")
@@ -1160,12 +1340,22 @@ async def discover_metrics(session_id: str):
         f"3. Call tool_submit_analysis_plan(session_id, dag_json_str) with your JSON result.\n"
     )
 
+    _discovery_timeout = 180.0
     try:
-        response = await run_agent_pipeline(
-            session_id, prompt,
-            agent_getter="discovery",
-            max_turns=get_config()["agents"]["max_turns"]["discovery"],
+        response = await asyncio.wait_for(
+            run_agent_pipeline(
+                session_id, prompt,
+                agent_getter="discovery",
+                max_turns=get_config()["agents"]["max_turns"]["discovery"],
+            ),
+            timeout=_discovery_timeout,
         )
+    except asyncio.TimeoutError:
+        print(
+            f"WARNING: Discovery agent timed out after {_discovery_timeout}s "
+            f"for {session_id}. Falling through to fallback."
+        )
+        response = ""
     except Exception as e:
         print(f"Discovery agent error: {e}")
         response = ""
@@ -1839,6 +2029,71 @@ async def get_status(session_id: str):
         ),
     }
 
+@app.get("/tasks/{task_id}")
+async def get_task(task_id: str):
+    """A2A-style tasks/get. Returns the TaskRecord as JSON."""
+    from agent_servers import task_manager as _tm
+    t = _tm.get_task(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return t.to_dict()
+
+
+@app.post("/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    """A2A-style tasks/cancel. Interrupts the in-flight asyncio.Task if any,
+    then transitions the record to `canceled`. Idempotent on terminal tasks."""
+    from agent_servers import task_manager as _tm
+    t, interrupted = _tm.cancel_task(task_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task": t.to_dict(), "interrupted": interrupted}
+
+
+@app.get("/sessions/{session_id}/tasks")
+async def list_session_tasks(session_id: str):
+    """Every task ever created for this session, in creation order."""
+    from agent_servers import task_manager as _tm
+    tasks = _tm.list_session_tasks(session_id)
+    return {"session_id": session_id, "tasks": [t.to_dict() for t in tasks]}
+
+
+@app.post("/sessions/{session_id}/cancel")
+async def cancel_session(session_id: str):
+    """Cancel every non-terminal task on a session. Used by the UI stop button."""
+    state = sessions.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    from agent_servers import task_manager as _tm
+    interrupted = _tm.cancel_all_for_session(session_id)
+    state.status = "canceled"
+    return {"session_id": session_id, "interrupted": interrupted, "status": state.status}
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str, download: bool = False):
+    """A2A artifact fetch. Streams the underlying file with its registered MIME type.
+    Pass ?download=1 to get a Content-Disposition attachment header."""
+    from agent_servers import artifacts as _art
+    rec = _art.get_artifact(artifact_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if not os.path.exists(rec.uri_path):
+        raise HTTPException(status_code=410, detail="Artifact file no longer present on disk")
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{rec.name}"'
+    return FileResponse(rec.uri_path, media_type=rec.mime_type, headers=headers)
+
+
+@app.get("/sessions/{session_id}/artifacts")
+async def list_session_artifacts(session_id: str):
+    """Every registered artifact for a session (charts, synthesis, report)."""
+    from agent_servers import artifacts as _art
+    recs = _art.list_session_artifacts(session_id)
+    return {"session_id": session_id, "artifacts": [r.to_dict() for r in recs]}
+
+
 @app.get("/stream/{session_id}")
 async def sse_stream(session_id: str, request: Request):
     async def event_generator():
@@ -2252,8 +2507,9 @@ async def chat(session_id: str, request: Request):
     synth = getattr(state, "synthesis", {}) or {}
     if synth:
         synth_parts = []
+        synth_dict = synth if isinstance(synth, dict) else {}
 
-        exec_sum = synth.get("executive_summary", {})
+        exec_sum = synth_dict.get("executive_summary", {})
         if exec_sum:
             synth_parts.append(
                 f"Executive Summary:\n"
@@ -2263,18 +2519,39 @@ async def chat(session_id: str, request: Request):
                 f"  Timeline: {exec_sum.get('timeline','')}"
             )
 
-        insights = synth.get("detailed_insights", {}).get("insights", [])
+        try:
+            if isinstance(synth, list):
+                insights = synth
+            elif isinstance(synth, dict):
+                _detailed = synth.get("detailed_insights", [])
+                if isinstance(_detailed, list):
+                    insights = _detailed
+                elif isinstance(_detailed, dict):
+                    insights = _detailed.get("insights", [])
+                else:
+                    insights = []
+            else:
+                insights = []
+        except Exception:
+            insights = []
+
         if insights:
-            ins_lines = [
-                f"  - {i.get('title','')} [{i.get('fix_priority','')}]: "
-                f"{i.get('ai_summary','')} | "
-                f"Root cause: {i.get('root_cause_hypothesis','')} | "
-                f"Fix: {'; '.join(i.get('how_to_fix', []))}"
-                for i in insights
-            ]
+            ins_lines = []
+
+            for i in insights:
+                if isinstance(i, dict):
+                    ins_lines.append(
+                        f"  - {i.get('title','')} [{i.get('fix_priority','')}]: "
+                        f"{i.get('ai_summary','')} | "
+                        f"Root cause: {i.get('root_cause_hypothesis','')} | "
+                        f"Fix: {'; '.join(i.get('how_to_fix', []))}"
+                    )
+                else:
+                    ins_lines.append(f"  - {str(i)}")
+
             synth_parts.append("Detailed Insights:\n" + "\n".join(ins_lines))
 
-        strategies = synth.get("intervention_strategies", {}).get("strategies", [])
+        strategies = synth_dict.get("intervention_strategies", {}).get("strategies", [])
         if strategies:
             strat_lines = [
                 f"  - [{s.get('severity','')}] {s.get('title','')}: "
@@ -2284,7 +2561,7 @@ async def chat(session_id: str, request: Request):
             ]
             synth_parts.append("Intervention Strategies:\n" + "\n".join(strat_lines))
 
-        personas = synth.get("personas", {}).get("personas", [])
+        personas = synth_dict.get("personas", {}).get("personas", [])
         if personas:
             p_lines = [
                 f"  - {p.get('name','')} ({p.get('priority_level','')}): "
@@ -2295,7 +2572,7 @@ async def chat(session_id: str, request: Request):
             ]
             synth_parts.append("User Profiles:\n" + "\n".join(p_lines))
 
-        connections = synth.get("cross_metric_connections", {}).get("connections", [])
+        connections = synth_dict.get("cross_metric_connections", {}).get("connections", [])
         if connections:
             cx_lines = [
                 f"  - {c.get('finding_a','')} × {c.get('finding_b','')} "
@@ -2304,7 +2581,7 @@ async def chat(session_id: str, request: Request):
             ]
             synth_parts.append("Cross-Metric Connections:\n" + "\n".join(cx_lines))
 
-        conv = synth.get("conversational_report", "")
+        conv = synth_dict.get("conversational_report", "")
         if conv:
             synth_parts.append(f"Narrative Report:\n{conv}")
 
@@ -2403,12 +2680,19 @@ async def chat(session_id: str, request: Request):
     full_context = separator.join(context_parts)
     prompt = f"{full_context}\n\n{'=' * 60}\nUSER QUESTION: {message}"
 
-    response = await run_agent_pipeline(
-        f"{session_id}_chat",
-        prompt,
-        agent_getter="chat",
-        max_turns=get_config()["agents"]["max_turns"]["chat"],
-    )
+    try:
+        response = await run_agent_pipeline(
+            f"{session_id}_chat",
+            prompt,
+            agent_getter="chat",
+            max_turns=get_config()["agents"]["max_turns"]["chat"],
+        )
+    except Exception as _chat_err:
+        print(f"WARNING: Chat agent error for {session_id}: {_chat_err}")
+        return {
+            "session_id": session_id,
+            "response": "I'm having trouble right now — the pipeline may be busy. Please try again in a moment.",
+        }
 
     if response:
         state.conversation_history.append((message, response, time.time()))

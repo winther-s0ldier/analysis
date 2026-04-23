@@ -5,10 +5,9 @@ import { motion } from 'framer-motion';
 
 // Tighten up react-terminal-ui's default spacing to fit the chat bubble
 const terminalOverrides = `
-  .react-terminal-wrapper { padding: 36px 16px 16px !important; font-size: 13px !important; border-radius: 0 !important; }
+  .react-terminal-wrapper { padding: 16px !important; font-size: 13px !important; border-radius: 0 !important; }
   .react-terminal-wrapper:after { font-size: 11px !important; top: 8px !important; letter-spacing: 0.06em; color: #6B7280 !important; }
-  .react-terminal-window-buttons { top: 10px !important; left: 12px !important; gap: 6px !important; }
-  .react-terminal-window-buttons button { width: 10px !important; height: 10px !important; }
+  .react-terminal-window-buttons { display: none !important; }
   .react-terminal-line { line-height: 1.7 !important; white-space: pre-wrap !important; }
 `;
 

@@ -9,6 +9,10 @@ const DEFAULT_SESSION = {
   sseConnected: false,
   canvasOpen: false,
   canvasNarrative: null,
+  // Full synthesis JSON once fetched. Populated by sseManager on
+  // synthesis_complete so the canvas can render inline stat cards
+  // (reliability breakdown, caveat count) *before* the iframe swaps in.
+  synthesisData: null,
   pipelineRunId: 0,
 };
 
@@ -38,6 +42,7 @@ export const usePipelineStore = create((set, get) => ({
   sidebarCollapsed: false,
   historyOpen: false,
   lastStartedPipelineSessionId: null, // persists across navigation
+  historyVersion: 0, // bumped after chat so Sidebar re-fetches
 
   // ── Session management ───────────────────────────────────────────────────
 
@@ -149,10 +154,16 @@ export const usePipelineStore = create((set, get) => ({
     return sid ? updateSession(state, sid, { canvasNarrative }) : {};
   }),
 
+  setSynthesisData: (synthesisData, targetSessionId) => set((state) => {
+    const sid = targetSessionId || state.currentSessionId;
+    return sid ? updateSession(state, sid, { synthesisData }) : {};
+  }),
+
   // ── UI-global setters ────────────────────────────────────────────────────
 
   setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
   setHistoryOpen: (historyOpen) => set({ historyOpen }),
+  bumpHistory: () => set((s) => ({ historyVersion: s.historyVersion + 1 })),
 
   // ── Pipeline run lifecycle ───────────────────────────────────────────────
 
@@ -170,6 +181,7 @@ export const usePipelineStore = create((set, get) => ({
           hasReport: false,
           canvasOpen: false,
           canvasNarrative: null,
+          synthesisData: null,
         },
       },
     };

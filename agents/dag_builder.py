@@ -235,6 +235,27 @@ def tool_build_report(
             state.post_message(msg)
     except Exception as _rpt_err:
         logging.warning(f"Failed to post REPORT_READY message: {_rpt_err}")
+
+    try:
+        from agent_servers import artifacts as _art
+        _art.register_artifact(
+            session_id=session_id,
+            name="report.html",
+            mime_type="text/html",
+            uri_path=report_path,
+            kind="report",
+            metadata={"chart_count": res["chart_count"], "has_synthesis": res["has_synthesis"]},
+        )
+        _art.register_artifact(
+            session_id=session_id,
+            name="synthesis.json",
+            mime_type="application/json",
+            uri_path=synthesis_path,
+            kind="synthesis",
+            metadata={"source": "dag_builder"},
+        )
+    except Exception as _art_err:
+        logging.warning(f"Failed to register report artifact: {_art_err}")
     return {"status": "success", **res}
 
 
@@ -328,12 +349,21 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         _cr_verdict    = _crit_rev.get("overall_verdict", "")
         _cr_challenges = _crit_rev.get("challenges", [])
 
-    _node_confs = [float(c.get("confidence", 0) or 0) for c in charts if float(c.get("confidence", 0) or 0) > 0.05]
-    if _node_confs:
-        _avg_node_conf = sum(_node_confs) / len(_node_confs)
-        _conf_pct = int(min(99, (_avg_node_conf * 0.70 + _cr_conf * 0.30) * 100))
+    # Prefer the synthesis reliability_dashboard (computed via
+    # compute_reliability_breakdown: 0.6·p25 + 0.4·mean × MC-penalty) so the
+    # cover KPI matches the number the synthesis narrative reasons about.
+    # Fall back to the old filtered-mean only when the dashboard isn't present.
+    _rd = synthesis.get("reliability_dashboard") or {}
+    _rd_pct = _rd.get("aggregate_pct") if isinstance(_rd, dict) else None
+    if isinstance(_rd_pct, (int, float)):
+        _conf_pct = int(min(99, max(0, _rd_pct)))
     else:
-        _conf_pct = int(min(99, _cr_conf * 75))
+        _node_confs = [float(c.get("confidence", 0) or 0) for c in charts if float(c.get("confidence", 0) or 0) > 0.05]
+        if _node_confs:
+            _avg_node_conf = sum(_node_confs) / len(_node_confs)
+            _conf_pct = int(min(99, (_avg_node_conf * 0.70 + _cr_conf * 0.30) * 100))
+        else:
+            _conf_pct = int(min(99, _cr_conf * 75))
 
     st = synthesis.get("recommendations", synthesis.get("intervention_strategies", {}))
     strategies_list = st if isinstance(st, list) else (st.get("strategies", []) if isinstance(st, dict) else [])
@@ -504,6 +534,151 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
             f'<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:20px;padding-top:20px;'
             f'border-top:1px solid #F3F4F6;">{priority_cards}</div>'
         )
+
+    # ── Confidence & Limitations ──────────────────────────────────────────────
+    # Renders the reliability-tier breakdown (strong/suggestive/tentative/failed
+    # /descriptive-capped) AND the synthesis-generated caveat list. Positioned
+    # right after Executive Summary so a decision-maker sees how much to trust
+    # the findings *before* reading them. The single "71% reliable" KPI on the
+    # cover is the headline; this section is the auditable explanation.
+    confidence_html = ""
+    _rb_dict = synthesis.get("reliability_dashboard") or {}
+    if isinstance(_rb_dict, dict) and _rb_dict:
+        _agg_pct   = int(_rb_dict.get("aggregate_pct", 0) or 0)
+        _agg_label = (_rb_dict.get("label") or "").lower()
+        _strong    = int(_rb_dict.get("strong_nodes", 0) or 0)
+        _suggest   = int(_rb_dict.get("suggestive_nodes", 0) or 0)
+        _tentative = int(_rb_dict.get("tentative_nodes", 0) or 0)
+        _failed    = int(_rb_dict.get("failed_nodes", 0) or 0)
+        _desc_cap  = int(_rb_dict.get("descriptive_capped_nodes", 0) or 0)
+        _n_nodes   = int(_rb_dict.get("node_count", 0) or 0)
+        _p25       = float(_rb_dict.get("weak_link_confidence_p25", 0) or 0)
+        _mean      = float(_rb_dict.get("mean_node_confidence", 0) or 0)
+        _sig_tests = int(_rb_dict.get("significance_tests_run", 0) or 0)
+        _mc_pen    = float(_rb_dict.get("multiple_comparisons_penalty", 1.0) or 1.0)
+        _formula   = _rb_dict.get("formula_note", "") or ""
+
+        _lbl_map = {
+            "strong":     ("#059669", "Strong"),
+            "suggestive": ("#D97706", "Suggestive"),
+            "tentative":  ("#DC2626", "Tentative"),
+            "none":       ("#9CA3AF", "No Data"),
+        }
+        _lbl_col, _lbl_txt = _lbl_map.get(_agg_label, ("#6B7280", _agg_label.title() or "—"))
+
+        # Tier rows — always show the 4 primary tiers; only render the
+        # descriptive-cap row when it actually applies (keeps the table
+        # honest but not cluttered for datasets where every node ran a test).
+        _tier_row_def = [
+            ("Strong",      _strong,    "p-value confirmed (≥ 0.80)",           "#059669", "#ECFDF5"),
+            ("Suggestive",  _suggest,   "effect supported (0.60–0.80)",         "#D97706", "#FFFBEB"),
+            ("Tentative",   _tentative, "exploratory only (< 0.60)",            "#DC2626", "#FEF2F2"),
+            ("Failed",      _failed,    "analysis errored — excluded",          "#7C2D12", "#FEF2F2"),
+        ]
+        _tier_rows = ""
+        for _tname, _tcount, _tdesc, _tcol, _tbg in _tier_row_def:
+            _tier_rows += (
+                f'<tr style="border-bottom:1px solid #F3F4F6;">'
+                f'<td style="padding:10px 16px;vertical-align:middle;width:150px;">'
+                f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.06em;color:{_tcol};'
+                f'background:{_tbg};padding:3px 10px;border-radius:9999px;">{_tname}</span></td>'
+                f'<td style="padding:10px 16px;text-align:center;vertical-align:middle;width:70px;">'
+                f'<span style="font-size:20px;font-weight:800;color:{_tcol};line-height:1;">{_tcount}</span></td>'
+                f'<td style="padding:10px 16px;color:#6B7280;font-size:13px;vertical-align:middle;">{_tdesc}</td>'
+                f'</tr>'
+            )
+        if _desc_cap > 0:
+            _tier_rows += (
+                f'<tr style="border-bottom:1px solid #F3F4F6;background:#F8FAFC;">'
+                f'<td style="padding:10px 16px;vertical-align:middle;width:150px;">'
+                f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.06em;color:#475569;'
+                f'background:#E2E8F0;padding:3px 10px;border-radius:9999px;">Descriptive-Cap</span></td>'
+                f'<td style="padding:10px 16px;text-align:center;vertical-align:middle;width:70px;">'
+                f'<span style="font-size:20px;font-weight:800;color:#475569;line-height:1;">{_desc_cap}</span></td>'
+                f'<td style="padding:10px 16px;color:#6B7280;font-size:13px;vertical-align:middle;">'
+                f'no significance test available — confidence capped at 0.65 so exploratory nodes '
+                f'cannot inflate the aggregate</td>'
+                f'</tr>'
+            )
+
+        _meta_bits = [
+            f'<strong>{_n_nodes}</strong> analysis node{"s" if _n_nodes != 1 else ""}',
+            f'<strong>{_sig_tests}</strong> significance test{"s" if _sig_tests != 1 else ""} run',
+            f'weak-link p25 = <strong>{_p25:.2f}</strong>',
+            f'mean = <strong>{_mean:.2f}</strong>',
+        ]
+        if _mc_pen < 1.0:
+            _meta_bits.append(f'MC penalty = <strong>{_mc_pen:.2f}</strong>')
+        _meta_line = " · ".join(_meta_bits)
+
+        _reliability_html = (
+            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;background:#fff;">'
+            f'<div style="padding:18px 22px;background:#FAFAFA;border-bottom:1px solid #F3F4F6;'
+            f'display:flex;align-items:center;gap:20px;flex-wrap:wrap;">'
+            f'<div>'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;'
+            f'color:#9CA3AF;margin-bottom:4px;">Aggregate Reliability</div>'
+            f'<div style="display:flex;align-items:baseline;gap:10px;">'
+            f'<span style="font-size:32px;font-weight:800;color:{_lbl_col};line-height:1;letter-spacing:-0.02em;">{_agg_pct}%</span>'
+            f'<span style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.08em;color:{_lbl_col};">{_lbl_txt}</span>'
+            f'</div>'
+            f'</div>'
+            f'<div style="flex:1;min-width:220px;font-size:12px;color:#6B7280;line-height:1.7;">{_meta_line}</div>'
+            f'</div>'
+            f'<table style="width:100%;border-collapse:collapse;">{_tier_rows}</table>'
+            + (f'<div style="padding:10px 22px;background:#FAFAFA;border-top:1px solid #F3F4F6;'
+               f'font-size:11.5px;color:#6B7280;line-height:1.6;font-style:italic;">{_formula}</div>'
+               if _formula else "")
+            + f'</div>'
+        )
+        confidence_html += _reliability_html
+
+    # Caveats — concrete limitations synthesis surfaced.
+    _caveats_raw = synthesis.get("caveats", {})
+    if isinstance(_caveats_raw, dict):
+        _caveat_items = _caveats_raw.get("items", [])
+    elif isinstance(_caveats_raw, list):
+        _caveat_items = _caveats_raw
+    else:
+        _caveat_items = []
+    _caveat_items = [c for c in _caveat_items if isinstance(c, str) and c.strip()]
+
+    if _caveat_items:
+        # Hyperlink [A1] / [C2] citations back to the chart anchors so a
+        # reader can trace every caveat to the node it refers to.
+        def _link_cites(_t):
+            return re.sub(
+                r'\[([AC]\d+)(?::\s*[^\]]+)?\]',
+                lambda m: (
+                    f'<a href="#chart-{m.group(1)}" style="color:#4F46E5;'
+                    f'text-decoration:none;font-weight:600;">[{m.group(1)}]</a>'
+                ),
+                _t,
+            )
+        _caveat_rows = "".join(
+            f'<li style="padding:10px 0;border-bottom:1px solid #FDE68A;color:#374151;'
+            f'font-size:13.5px;line-height:1.7;list-style:none;position:relative;padding-left:26px;">'
+            f'<span style="position:absolute;left:0;top:10px;color:#D97706;font-weight:800;'
+            f'font-size:14px;">!</span>{_link_cites(c)}</li>'
+            for c in _caveat_items
+        )
+        _caveats_html = (
+            f'<div style="border:1px solid #FDE68A;border-radius:10px;overflow:hidden;'
+            f'background:#FFFBEB;margin-top:20px;">'
+            f'<div style="padding:14px 22px;border-bottom:1px solid #FDE68A;'
+            f'display:flex;align-items:center;gap:12px;flex-wrap:wrap;">'
+            f'<span style="display:inline-block;font-size:10px;font-weight:700;'
+            f'text-transform:uppercase;letter-spacing:0.08em;color:#92400E;'
+            f'background:#FEF3C7;padding:3px 10px;border-radius:9999px;">Known Limitations</span>'
+            f'<span style="font-size:11.5px;color:#92400E;">'
+            f'Read these before acting on the findings below.</span>'
+            f'</div>'
+            f'<ul style="margin:0;padding:4px 22px 8px;">{_caveat_rows}</ul>'
+            f'</div>'
+        )
+        confidence_html += _caveats_html
 
     insight_cards = ""
     for idx, ins in enumerate(insights_sorted):
@@ -833,8 +1008,10 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
                 )
 
         charts_html += (
-            f'<div style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
-            f'background:#fff;margin-bottom:28px;">'
+            # id="chart-<a_id>" so caveats and the citation pills in the
+            # narrative can deep-link back to the figure they reference.
+            f'<div id="chart-{a_id}" style="border:1px solid #E5E7EB;border-radius:10px;overflow:hidden;'
+            f'background:#fff;margin-bottom:28px;scroll-margin-top:20px;">'
             f'<div style="display:flex;justify-content:space-between;align-items:center;'
             f'padding:12px 20px;background:#FAFAFA;border-bottom:1px solid #F3F4F6;">'
             f'<div>'
@@ -857,6 +1034,7 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
         return _sec_num[0]
 
     if exec_body:            _nav_items.append(("executive",       "Executive Summary"))
+    if confidence_html:      _nav_items.append(("confidence",      "Confidence & Limitations"))
     if conv_h:               _nav_items.append(("findings",        "Key Findings"))
     if insight_cards:        _nav_items.append(("insights",        "Findings"))
     if action_plan_html:     _nav_items.append(("action-plan",     "Action Plan"))
@@ -1058,8 +1236,9 @@ def _build_report_html(session_id: str, charts: list, synthesis: dict, dataset_t
   {toc_html}
 
   {section("executive", "Executive Summary", exec_body)}
-  {section("findings", "Key Findings", f'<div class="prose">{conv_h}</div>' if conv_h else "", divider=bool(exec_body))}
-  {section("insights", "Detailed Findings", sev_bar + insight_cards, divider=bool(conv_h or exec_body))}
+  {section("confidence", "Confidence & Limitations", confidence_html, divider=bool(exec_body))}
+  {section("findings", "Key Findings", f'<div class="prose">{conv_h}</div>' if conv_h else "", divider=bool(exec_body or confidence_html))}
+  {section("insights", "Detailed Findings", sev_bar + insight_cards, divider=bool(conv_h or exec_body or confidence_html))}
   {section("action-plan", "Action Plan", action_plan_html, divider=True)}
   {section("segments", "User Segments", segments_grid, divider=True)}
   {section("connections", "Cross-Metric Connections", connections_html, divider=True)}

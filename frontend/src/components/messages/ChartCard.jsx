@@ -113,7 +113,9 @@ export function ChartCard({ id, analysisType, finding, hasChart = true, severity
 
   return (
     <motion.div
-      className="w-full border border-border-default rounded-lg bg-bg-surface shadow-[0_4px_12px_rgba(0,0,0,0.06)] overflow-hidden mt-4 mb-2 flex flex-col"
+      id={id ? `chart-${id}` : undefined}
+      data-analysis-id={id || undefined}
+      className="w-full border border-border-default rounded-lg bg-bg-surface shadow-[0_4px_12px_rgba(0,0,0,0.06)] overflow-hidden mt-4 mb-2 flex flex-col scroll-mt-16"
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.3 }}

@@ -119,28 +119,30 @@ function handleSynthesisPayload(sessionId, synthesis) {
   const chatStore = useChatStore.getState();
   const pipelineStore = usePipelineStore.getState();
 
-  const insights = Array.isArray(synthesis.detailed_insights)
-    ? synthesis.detailed_insights
-    : synthesis.detailed_insights?.insights || [];
-  const criticChallenges = synthesis._critic_review?.challenges || [];
-  if (insights.length) chatStore.addMessage(sessionId, 'ai', 'insights', { insights, criticChallenges });
-  if (insights.length) chatStore.addMessage(sessionId, 'ai', 'action_plan', insights);
+  // Stash the whole synthesis JSON in the pipeline store so the canvas can
+  // render inline stat cards (reliability breakdown, caveat count) *before*
+  // the iframe swaps in. This gives the user a "headline" view 5–10s earlier
+  // than waiting for the polished HTML report.
+  if (synthesis && typeof synthesis === 'object') {
+    pipelineStore.setSynthesisData(synthesis, sessionId);
+  }
 
-  const _rawPersonas = synthesis.key_segments ?? synthesis.personas;
-  const segments = Array.isArray(_rawPersonas) ? _rawPersonas : _rawPersonas?.segments ?? _rawPersonas?.personas ?? [];
-  if (segments.length) chatStore.addMessage(sessionId, 'ai', 'personas', segments);
-
-  const _rawStrat = synthesis.recommendations ?? synthesis.intervention_strategies;
-  const strategies = Array.isArray(_rawStrat) ? _rawStrat : _rawStrat?.strategies ?? [];
-  if (strategies.length) chatStore.addMessage(sessionId, 'ai', 'interventions', strategies);
-
-  const _rawConns = synthesis.cross_metric_connections;
-  const connections = Array.isArray(_rawConns) ? _rawConns : _rawConns?.connections ?? [];
-  if (connections.length) chatStore.addMessage(sessionId, 'ai', 'connections', connections);
-
-  if (synthesis.conversational_report && !_canvasOpenedByChunk.get(sessionId)) {
-    chatStore.addMessage(sessionId, 'ai', 'narrative', synthesis.conversational_report);
+  // Chat is intentionally minimal — it should carry only the per-analysis
+  // charts and their findings (pushed from node_complete events). Everything
+  // synthesis produces (reliability dashboard, insights, personas,
+  // interventions, connections, checks-passed, caveats, full narrative) lives
+  // in the side-panel report. That's where the reader can read end-to-end
+  // without scroll-fighting the chat timeline.
+  //
+  // The narrative/conversational_report is still forwarded to the canvas so
+  // the report panel renders. If the user hasn't already seen streaming
+  // chunks, we also drop it in as a single narrative card so they notice the
+  // report is ready.
+  if (synthesis.conversational_report) {
     pipelineStore.setCanvasNarrative(synthesis.conversational_report, sessionId);
+    if (!_canvasOpenedByChunk.get(sessionId)) {
+      chatStore.addMessage(sessionId, 'ai', 'narrative', synthesis.conversational_report);
+    }
   }
 }
 
@@ -160,6 +162,17 @@ function handleSSEEvent(sessionId, e) {
       flushSync(() => {
         pipelineStore.updateNodeStatus(ev.data.node_id, 'running', null, sessionId);
         chatStore.addSkeleton(ev.data.node_id, ev.data.analysis_type || ev.data.node_id, sessionId);
+        // Open canvas as soon as analysis begins so the user sees a live
+        // progress view instead of an empty right-hand panel for 30-60s.
+        // `_canvasOpenedByChunk` stays false — it's specifically a "narrative
+        // already streamed" flag, not a "canvas is open" flag.
+        const sessionState = usePipelineStore.getState().sessions[sessionId];
+        if (sessionState && !sessionState.canvasOpen) {
+          pipelineStore.setCanvasOpen(true, sessionId);
+        }
+        if (sessionState && sessionState.phase !== 'analyzing') {
+          pipelineStore.setPhase('analyzing', sessionId);
+        }
       });
       break;
 
@@ -283,6 +296,13 @@ function handleSSEEvent(sessionId, e) {
           columns: ev.data?.columns || [],
         });
       }
+      break;
+
+    case 'task_update':
+      // A2A task state transition (submitted/working/completed/failed/canceled)
+      // for a specific agent call. Purely informational for now — we don't
+      // render it in the UI yet. Kept silent so the default-branch console.warn
+      // below doesn't spam.
       break;
 
     default:

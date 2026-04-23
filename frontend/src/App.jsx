@@ -1,6 +1,5 @@
 import React, { useEffect, useRef, useCallback, useState, Component } from 'react';
 import { Sidebar } from './components/layout/Sidebar';
-import { TopProgressBar } from './components/layout/TopProgressBar';
 import { ProgressRing } from './components/layout/ProgressRing';
 import { ProcessingStatus } from './components/layout/ProcessingStatus';
 import { InputArea } from './components/layout/InputArea';
@@ -10,7 +9,7 @@ import { ThinkingBubble } from './components/messages/AIMessage';
 import { useLenis } from './hooks/useLenis';
 import { usePipelineStore } from './store/pipelineStore';
 import { useChatStore } from './store/chatStore';
-import { fetchSynthesis, sendChatMessage } from './api';
+import { sendChatMessage } from './api';
 import { useSSEStream } from './hooks/useSSEStream';
 import { Toaster } from 'sonner';
 import { useAutoAnimate } from '@formkit/auto-animate/react';
@@ -181,46 +180,9 @@ function App() {
     }
   }, [conversationCount, thinking]);
 
-  // Fallback: if SSE missed synthesis_complete (e.g. page reload mid-pipeline),
-  // fetch synthesis once when pipeline reaches complete phase.
-  const synthesisFallbackRef = useRef(false);
-  useEffect(() => {
-    if (phase === 'complete' && sessionId && !synthesisFallbackRef.current) {
-      synthesisFallbackRef.current = true;
-      fetchSynthesis(sessionId)
-        .then(synthesis => {
-          if (!synthesis || Object.keys(synthesis).length === 0) return;
-          const insights = Array.isArray(synthesis.detailed_insights)
-            ? synthesis.detailed_insights
-            : synthesis.detailed_insights?.insights || [];
-          if (insights.length) addMessage('ai', 'insights', insights);
-
-          // Synthesis agent writes "personas" OR "key_segments" depending on dataset type
-          const _rawPersonas = synthesis.key_segments ?? synthesis.personas;
-          const segments = Array.isArray(_rawPersonas)
-            ? _rawPersonas
-            : _rawPersonas?.segments ?? _rawPersonas?.personas ?? [];
-          if (segments.length) addMessage('ai', 'personas', segments);
-
-          // Synthesis agent writes "intervention_strategies" OR "recommendations"
-          const _rawStrat = synthesis.recommendations ?? synthesis.intervention_strategies;
-          const strategies = Array.isArray(_rawStrat)
-            ? _rawStrat
-            : _rawStrat?.strategies ?? [];
-          if (strategies.length) addMessage('ai', 'interventions', strategies);
-
-          const _rawConns = synthesis.cross_metric_connections;
-          const connections = Array.isArray(_rawConns)
-            ? _rawConns
-            : _rawConns?.connections ?? [];
-          if (connections.length) addMessage('ai', 'connections', connections);
-          if (synthesis.executive_summary) addMessage('ai', 'summary', synthesis.executive_summary);
-          if (synthesis.conversational_report) addMessage('ai', 'narrative', synthesis.conversational_report);
-          if (synthesis._critic_review) addMessage('ai', 'critic', synthesis._critic_review);
-        })
-        .catch(() => { });
-    }
-  }, [phase, sessionId, addMessage]);
+  // Synthesis rendering is handled centrally in sseManager's
+  // handleSynthesisPayload (called from both the SSE path and the polling
+  // fallback). Duplicating that logic here caused cards to appear twice.
 
 
   return (
@@ -304,7 +266,6 @@ function App() {
         />
       )}
 
-      <TopProgressBar />
       <Sidebar />
       <main
         ref={mainRef}

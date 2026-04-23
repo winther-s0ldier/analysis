@@ -174,6 +174,117 @@ def get_post_dag_agent():
     )
     return _post_dag_agent_instance
 
+def compute_reliability_breakdown(results: dict) -> dict:
+    """Compute the reliability dashboard from raw node results.
+
+    Shared between orchestrator (prompt building) and synthesis
+    (attach to output) so the number the user sees matches the number
+    the synthesis agent was told to reason about.
+
+    Returns a dict with:
+      aggregate_pct, label, p25, mean, mc_penalty,
+      strong/suggestive/tentative/failed node counts, significance_tests_run,
+      formula_note (plain-English explanation for UI tooltip)
+    """
+    # ------------------------------------------------------------------
+    # Descriptive-only cap.
+    #
+    # A node can self-report confidence ≥ 0.80 without running any
+    # significance test (e.g. categorical_analysis, transition_analysis —
+    # they compute entropies and transition probabilities but do not test
+    # anything). Letting those nodes count as "strong" inflates the
+    # aggregate: the reader sees a report with eight green checkmarks when
+    # only, say, six of them are backed by an actual statistical test.
+    #
+    # Rule: if a node has no p-value / significance statistic in its data,
+    # cap its effective confidence at 0.65 (top of the "suggestive" band).
+    # The node is still counted — it just can't pretend to be strong.
+    # ------------------------------------------------------------------
+    DESCRIPTIVE_CAP = 0.65
+
+    def _has_significance(res_data) -> bool:
+        if not isinstance(res_data, dict):
+            return False
+        if "p_value" in res_data:
+            return True
+        mk = res_data.get("mann_kendall")
+        if isinstance(mk, dict) and mk.get("p_value") is not None:
+            return True
+        if res_data.get("logrank_p_value") is not None:
+            return True
+        if res_data.get("changepoint_p_value") is not None:
+            return True
+        return False
+
+    confs: list[float] = []
+    sig_tests = 0
+    strong = suggestive = tentative = failed = 0
+    descriptive_capped = 0
+    for res in (results or {}).values():
+        if not isinstance(res, dict):
+            continue
+        raw_c = float(res.get("confidence", 0) or 0)
+        data = res.get("data") or {}
+        has_sig = _has_significance(data)
+        if has_sig:
+            sig_tests += 1
+            c = raw_c
+        else:
+            c = min(raw_c, DESCRIPTIVE_CAP)
+            if raw_c > DESCRIPTIVE_CAP:
+                descriptive_capped += 1
+        confs.append(c)
+        status = res.get("status", "success")
+        if status != "success":
+            failed += 1
+        elif c >= 0.80:
+            strong += 1
+        elif c >= 0.60:
+            suggestive += 1
+        else:
+            tentative += 1
+
+    if confs:
+        s = sorted(confs)
+        p25 = s[max(0, int(len(s) * 0.25) - 1)] if len(s) >= 4 else s[0]
+        mean = sum(confs) / len(confs)
+        blended = 0.6 * p25 + 0.4 * mean
+        mc_penalty = 1.0 / (1.0 + 0.02 * max(0, sig_tests - 5))
+        reliability = max(0.0, min(0.99, blended * mc_penalty))
+    else:
+        reliability = p25 = mean = mc_penalty = 0.0
+
+    if reliability >= 0.80:   label = "strong"
+    elif reliability >= 0.60: label = "suggestive"
+    elif reliability > 0:     label = "tentative"
+    else:                     label = "none"
+
+    return {
+        "aggregate_pct":                int(reliability * 100),
+        "aggregate":                    round(reliability, 3),
+        "label":                        label,
+        "node_count":                   len(confs),
+        "strong_nodes":                 strong,
+        "suggestive_nodes":             suggestive,
+        "tentative_nodes":              tentative,
+        "failed_nodes":                 failed,
+        "descriptive_capped_nodes":     descriptive_capped,
+        "weak_link_confidence_p25":     round(p25, 3),
+        "mean_node_confidence":         round(mean, 3),
+        "significance_tests_run":       sig_tests,
+        "multiple_comparisons_penalty": round(mc_penalty, 3),
+        "formula_note": (
+            "Aggregate = 0.6 × p25(node confidence) + 0.4 × mean, "
+            "multiplied by a multiple-comparisons penalty. "
+            "Nodes without a significance test are capped at 0.65 "
+            "(top of the 'suggestive' band) so descriptive-only findings "
+            "cannot be rated as strong. The weak-link weighting means one "
+            "unreliable node pulls the score down more than its share; "
+            "failed nodes count as 0."
+        ),
+    }
+
+
 def build_synthesis_prompt(session_id: str, state, dag: list = None, output_folder: str = None, comparison_context: str = "") -> tuple:
     dag = dag or getattr(state, "dag", []) or []
 
@@ -192,10 +303,28 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
             n.get("analysis_type"): n.get("id")
             for n in dag if n.get("id") and n.get("analysis_type")
         }
-        _node_confs = [float(_res.get("confidence", 0) or 0) for _res in state.results.values()
-                       if isinstance(_res, dict) and float(_res.get("confidence", 0) or 0) > 0.05]
-        _avg_conf = sum(_node_confs) / len(_node_confs) if _node_confs else 0.75
-        _reliability_pct = int(min(99, _avg_conf * 100))
+        # ------------------------------------------------------------------
+        # Aggregate reliability — rewritten for honesty.
+        #
+        # Previous behaviour (why it was wrong):
+        #   - filtered out nodes with confidence <= 0.05, so errors *improved*
+        #     the mean instead of hurting it
+        #   - used a plain mean, so one weak load-bearing node was hidden by
+        #     many confident ones
+        #   - ignored multiple-comparisons inflation
+        #
+        # New behaviour:
+        #   - include every node (failures drag the score down, as they should)
+        #   - blend p25 (weak-link sensitivity, 0.6 weight) and mean (overall
+        #     quality, 0.4 weight) so one bad node caps the aggregate
+        #   - apply a multiplicative penalty when the DAG ran many significance
+        #     tests — scales roughly as Bonferroni intuition:
+        #       k=5 → no penalty, k=10 → ~10%, k=20 → ~23%
+        #   - expose component metrics to synthesis instead of a single %,
+        #     so the "# Data Confidence Assessment" section can be honest.
+        # ------------------------------------------------------------------
+        _rb = compute_reliability_breakdown(state.results)
+        _reliability_pct = _rb["aggregate_pct"]
 
         for _aid, _res in state.results.items():
             if not isinstance(_res, dict): continue
@@ -205,7 +334,8 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
 
         _fact_sheet["metadata"] = {
             "aggregate_data_reliability": f"{_reliability_pct}%",
-            "reliability_assessment_context": "Calculated across all analysis nodes. 100% is near-total certainty."
+            "reliability_breakdown": _rb,
+            "reliability_assessment_context": _rb["formula_note"],
         }
         _fact_json = json.dumps(_clean(_fact_sheet), indent=2)
     except Exception as _e:
@@ -288,8 +418,15 @@ def build_synthesis_prompt(session_id: str, state, dag: list = None, output_fold
         f"5. Use ACTION TITLES: All section headers MUST be complete sentences that state a finding (e.g., 'A1: 70% Bounce rate is a technical, not traffic, bottleneck' instead of 'Session analysis').\n"
         f"6. Strategic Opportunity Loss: For every major failure, attempt to calculate the 'estimated revenue leakage' or 'wasted user potential' using the fact sheet counts.\n"
         f"7. Build the synthesis JSON. conversational_report MUST contain '# Strategic Executive Summary', '# Key Strategic Findings', '# Prioritized Action Roadmap', '# Data Confidence Assessment', and '# Comparative Strategic Insights' (if applicable).\n"
-        f"8. In '# Data Confidence Assessment', EXPLAIN why the 'aggregate_data_reliability' is "
-        f"{_reliability_pct}% based on noisy/strong nodes.\n"
+        f"8. In '# Data Confidence Assessment', use the 'reliability_breakdown' metadata to write "
+        f"an honest, specific assessment. Do NOT just cite '{_reliability_pct}%' as a single number. "
+        f"Instead: (a) state how many nodes are strong/suggestive/tentative/failed, "
+        f"(b) call out the weak-link p25 value and what it means for the report's trustworthiness, "
+        f"(c) if 'significance_tests_run' > 5, explicitly note that the aggregate has been reduced "
+        f"for multiple-comparisons inflation, "
+        f"(d) identify which tentative/failed nodes (if any) should be treated cautiously when reading "
+        f"the findings above. Tone: a careful analyst stating what they do and don't trust — not a "
+        f"salesperson defending a score.\n"
         f"9. Call tool_submit_synthesis(session_id='{session_id}', synthesis_json_str=..., output_folder='{output_folder}') immediately after completion."
     )
 
@@ -632,11 +769,90 @@ async def run_full_pipeline(
             if _USE_A2A_MULTISERVER:
                 from agent_servers.a2a_client import (
                     call_synthesis as _a2a_synthesis,
+                    call_synthesis_stream as _a2a_synthesis_stream,
                     call_critic as _a2a_critic,
                     call_dag_builder as _a2a_dag_builder,
                 )
-                print(f"INFO: [{session_id}] Calling synthesis via A2A HTTP")
-                await _a2a_synthesis(session_id, output_folder, synthesis_prompt)
+
+                # Stream synthesis so the UI sees narrative chunks as they
+                # arrive instead of a 30-60s blank wait. Every streamed
+                # Message/Status event is forwarded to the session's SSE
+                # hook as `synthesis_partial`. On any streaming-side error
+                # (server doesn't support streaming, transport breaks mid-
+                # flight, etc.) we fall back to the one-shot call so the
+                # pipeline still completes.
+                _synth_hook = _pipeline_event_hooks.get(session_id)
+                _synth_chunk_count = {"n": 0}
+
+                def _on_synth_event(kind, payload):
+                    if _synth_hook is None:
+                        return
+                    try:
+                        if kind in ("message", "status"):
+                            _text = payload.get("text") or payload.get("message") or ""
+                            if _text:
+                                _synth_chunk_count["n"] += 1
+                                _synth_hook("synthesis_chunk", {
+                                    "session_id": session_id,
+                                    "chunk": _text,
+                                    "first": _synth_chunk_count["n"] == 1,
+                                })
+                        elif kind == "task":
+                            _synth_hook("task_update", {
+                                "session_id": session_id,
+                                "agent": "synthesis",
+                                "task_id": payload.get("task_id", ""),
+                                "state": payload.get("state", ""),
+                            })
+                    except Exception as _sf:
+                        logging.warning(f"[{session_id}] synth stream forward failed: {_sf}")
+
+                try:
+                    print(f"INFO: [{session_id}] Calling synthesis via A2A HTTP (streaming)")
+                    await _a2a_synthesis_stream(session_id, output_folder, synthesis_prompt, on_event=_on_synth_event)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _stream_err:
+                    print(f"WARNING: [{session_id}] streaming synthesis failed ({_stream_err}); retrying one-shot")
+                    await _a2a_synthesis(session_id, output_folder, synthesis_prompt)
+
+                # ------------------------------------------------------------------
+                # Post-synthesis hydration. Agents run in separate processes, so
+                # synthesis.py's `from main import sessions` returns an empty dict
+                # and its own attempt to attach reliability_dashboard / assign
+                # state.synthesis is a no-op. Do it here, in the main process,
+                # where state.results is actually populated. Also persist back to
+                # _synthesis_cache.json so dag_builder sees the dashboard too.
+                # ------------------------------------------------------------------
+                try:
+                    _cache_path = os.path.join(output_folder, "_synthesis_cache.json")
+                    if os.path.exists(_cache_path):
+                        with open(_cache_path, "r", encoding="utf-8") as _cf:
+                            _syn_cache = json.load(_cf)
+                        _mutated = False
+                        if state and getattr(state, "results", None) and "reliability_dashboard" not in _syn_cache:
+                            try:
+                                _syn_cache["reliability_dashboard"] = compute_reliability_breakdown(state.results)
+                                _mutated = True
+                            except Exception as _rb_err:
+                                print(f"WARNING: [{session_id}] reliability_dashboard compute failed: {_rb_err}")
+                        if _mutated:
+                            with open(_cache_path, "w", encoding="utf-8") as _cf:
+                                json.dump(_syn_cache, _cf)
+                        if state is not None:
+                            state.synthesis = _syn_cache
+                        # Also keep the in-process synthesis_store in sync so
+                        # get_synthesis_result() below returns the hydrated copy.
+                        try:
+                            from agents.synthesis import _synthesis_store as _ss_main
+                            _ss_main[session_id] = _syn_cache
+                        except Exception:
+                            pass
+                        print(f"INFO: [{session_id}] synthesis hydrated into main process "
+                              f"(reliability_dashboard={'present' if 'reliability_dashboard' in _syn_cache else 'absent'})")
+                except Exception as _hyd_err:
+                    print(f"WARNING: [{session_id}] post-synthesis hydration failed: {_hyd_err}")
+
                 print(f"INFO: [{session_id}] Calling critic via A2A HTTP")
                 await _a2a_critic(session_id)
                 print(f"INFO: [{session_id}] Calling dag_builder via A2A HTTP")
@@ -813,6 +1029,31 @@ async def run_full_pipeline(
             ),
         }
 
+    except asyncio.CancelledError:
+        # User or /sessions/{id}/cancel requested stop. Mark the session,
+        # cancel any still-running A2A tasks, flush SSE, and let the
+        # CancelledError propagate so asyncio unwinds cleanly.
+        print(f"INFO: [{session_id}] Pipeline canceled by user request")
+        try:
+            _update_session_status(state, "canceled")
+        except Exception:
+            pass
+        try:
+            from agent_servers import task_manager as _tm
+            _tm.cancel_all_for_session(session_id)
+        except Exception as _cerr:
+            logging.warning(f"[{session_id}] task cancel sweep failed: {_cerr}")
+        try:
+            _evt_hook = _pipeline_event_hooks.get(session_id)
+            if _evt_hook:
+                _evt_hook("stream_end", {"session_id": session_id, "status": "canceled"})
+        except Exception:
+            pass
+        finally:
+            _pipeline_event_hooks.pop(session_id, None)
+            _global_threads.pop(session_id, None)
+            _pipeline_store.pop(session_id, None)
+        raise
     except Exception as e:
         return {
             "status": "error",
@@ -888,7 +1129,14 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id}: chart={result.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
-            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path')), "analysis_type": result.get("analysis_type") or node.get("analysis_type"), "top_finding": result.get("top_finding", ""), "severity": result.get("severity", "info")})
+            _nc_payload = {"analysis_id": node_id, "retry": False, "chart": bool(result.get('chart_file_path')), "analysis_type": result.get("analysis_type") or node.get("analysis_type"), "top_finding": result.get("top_finding", ""), "severity": result.get("severity", "info")}
+            emit(session_id, "node_complete", _nc_payload)
+            try:
+                _evt_hook = _pipeline_event_hooks.get(session_id)
+                if _evt_hook:
+                    _evt_hook("node_complete", _nc_payload)
+            except Exception as _nc_err:
+                logging.warning(f"[{session_id}] node_complete SSE for {node_id} failed: {_nc_err}")
             return True
 
         last_error = result.get("error", "Unknown error")
@@ -933,7 +1181,14 @@ async def _execute_dag(
             msg = f"SUCCESS NODE {node_id} (retry): chart={retry.get('chart_file_path','NONE')}"
             print(msg)
             logging.info(msg)
-            emit(session_id, "node_complete", {"analysis_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path')), "analysis_type": retry.get("analysis_type") or node.get("analysis_type"), "top_finding": retry.get("top_finding", ""), "severity": retry.get("severity", "info")})
+            _nc_payload = {"analysis_id": node_id, "retry": True, "chart": bool(retry.get('chart_file_path')), "analysis_type": retry.get("analysis_type") or node.get("analysis_type"), "top_finding": retry.get("top_finding", ""), "severity": retry.get("severity", "info")}
+            emit(session_id, "node_complete", _nc_payload)
+            try:
+                _evt_hook = _pipeline_event_hooks.get(session_id)
+                if _evt_hook:
+                    _evt_hook("node_complete", _nc_payload)
+            except Exception as _nc_err:
+                logging.warning(f"[{session_id}] node_complete SSE (retry) for {node_id} failed: {_nc_err}")
             return True
         else:
             msg = (f"ERROR NODE {node_id}: Retry also failed: "
@@ -1165,7 +1420,6 @@ async def _execute_single_node(
                 agent_getter="coder",
             )
 
-        import re
         code_match = re.search(r"```(?:python)?\s*(.*?)\s*```", response, re.DOTALL | re.IGNORECASE)
         if code_match:
             code = code_match.group(1).strip()

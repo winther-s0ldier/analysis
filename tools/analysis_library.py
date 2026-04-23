@@ -138,7 +138,7 @@ LIBRARY_REGISTRY = {
     },
     "pareto_analysis": {
         "function":      "run_pareto_analysis",
-        "required_args": ["csv_path", "category_col", "value_col"],
+        "required_args": ["csv_path", "entity_col", "value_col"],
         "col_role":      "category_and_value",
         "description":   "80/20 Pareto analysis showing which categories drive the majority of a numeric value. Answers: which 20% of events account for 80% of drop-offs? Which product segments generate 80% of revenue? Directs engineering and product prioritisation.",
     },
@@ -216,6 +216,22 @@ LIBRARY_REGISTRY = {
     },
 }
 
+def _reliability_label(confidence: float, status: str = "success") -> str:
+    """Bucket a numeric confidence into a human-readable label.
+
+    The label is what the report shows as a badge — grounded in the same
+    computed number, but easier to read than a raw percentage and harder
+    to over-interpret as false precision.
+    """
+    if status != "success":
+        return "failed"
+    if confidence >= 0.80:
+        return "strong"
+    if confidence >= 0.60:
+        return "suggestive"
+    return "tentative"
+
+
 def _make_result(analysis_type: str, data: dict,
                   top_finding: str, severity: str,
                   confidence: float,
@@ -228,6 +244,7 @@ def _make_result(analysis_type: str, data: dict,
         "top_finding": top_finding,
         "severity": severity,
         "confidence": confidence,
+        "reliability_label": _reliability_label(confidence, "success"),
         "chart_ready_data": chart_ready_data,
         "enables": enables or [],
         "insight_summary": {
@@ -288,6 +305,7 @@ def _make_error_result(analysis_type: str, error: str, status: str = "error") ->
         "top_finding": error,
         "severity": "info",
         "confidence": 0.0,
+        "reliability_label": _reliability_label(0.0, status),
         "chart_ready_data": {},
         "enables": [],
         "insight_summary": {
@@ -623,6 +641,7 @@ def run_anomaly_detection(csv_path: str, col: str) -> dict:
         f"IsoForest={len(iso_set)}."
     )
 
+    _null_rate = (len(df[col]) - len(data)) / max(len(df[col]), 1)
     return _make_result(
         analysis_type="anomaly_detection",
         data={
@@ -642,7 +661,7 @@ def run_anomaly_detection(csv_path: str, col: str) -> dict:
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.88,
+        confidence=compute_confidence(n=len(data), null_rate=_null_rate, base=0.88),
         chart_ready_data={
             "type": "anomaly_scatter",
             "col": col,
@@ -701,7 +720,9 @@ def run_missing_data_analysis(csv_path: str) -> dict:
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=1.0,
+        # missing_data: reliability scales with total sample size, not a magic 1.0.
+        # null_rate is the finding itself, so it doesn't penalise confidence here.
+        confidence=compute_confidence(n=int(total_cells), null_rate=0.0, base=0.90),
         chart_ready_data={
             "type": "missing_bar",
             "columns": [s["column"] for s in missing_stats[:15]],
@@ -843,7 +864,13 @@ def run_trend_analysis(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.88,
+        # Prefer Mann-Kendall p as the trend's significance; fall back to
+        # the changepoint p if MK didn't fire.
+        confidence=compute_confidence(
+            n=len(df),
+            p_value=(mk_result["p_value"] if mk_result else changepoint_p),
+            base=0.88,
+        ),
         chart_ready_data={
             "type":       "trend_line",
             "time_col":   time_col,
@@ -957,7 +984,11 @@ def run_time_series_decomposition(
         top_finding=top_finding,
         severity="medium" if seasonality_strength > 0.5
                   else "low",
-        confidence=0.82 if decomp_success else 0.65,
+        # STL success → full prior; moving-average fallback → reduced base.
+        confidence=compute_confidence(
+            n=len(df),
+            base=(0.82 if decomp_success else 0.65),
+        ),
         chart_ready_data={
             "type":       "decomposition",
             "times":      [
@@ -1064,7 +1095,7 @@ def run_cohort_analysis(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.87,
+        confidence=compute_confidence(n=int(df[entity_col].nunique()), base=0.87),
         chart_ready_data={
             "type":         "cohort_heatmap",
             "cohort_data":  cohort_records,
@@ -1235,7 +1266,7 @@ def run_session_detection(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.95,
+        confidence=compute_confidence(n=total_sessions, base=0.95),
         chart_ready_data={
             "type": "session_length_histogram",
             "event_counts": session_stats[
@@ -1402,7 +1433,11 @@ def run_funnel_analysis(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.88,
+        # n = entities entering the top of the funnel; confidence scales with that.
+        confidence=compute_confidence(
+            n=int(funnel_metrics[0]["entity_count"]) if funnel_metrics else 0,
+            base=0.88,
+        ),
         chart_ready_data={
             "type":   "funnel_bar",
             "steps":  funnel_steps,
@@ -1548,7 +1583,7 @@ def run_friction_detection(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.91,
+        confidence=compute_confidence(n=int(event_counts[session_col].nunique()), base=0.91),
         chart_ready_data={
             "type":   "friction_heatmap",
             "events": [
@@ -1712,7 +1747,12 @@ def run_survival_analysis(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.93,
+        # log-rank p when the test ran; otherwise just n-weighted.
+        confidence=compute_confidence(
+            n=total_sessions,
+            p_value=(logrank_p if logrank_p is not None else None),
+            base=0.93,
+        ),
         chart_ready_data={
             "type":   "survival_curve",
             "steps":  [s["step"] for s in survival_curve],
@@ -1931,7 +1971,7 @@ def run_user_segmentation(
         },
         top_finding=top_finding,
         severity="medium",
-        confidence=0.82,
+        confidence=compute_confidence(n=len(entity_ids), base=0.82),
         chart_ready_data={
             "type":     "segment_donut",
             "segments": segments,
@@ -2108,7 +2148,14 @@ def run_sequential_pattern_mining(
         },
         top_finding=top_finding,
         severity="medium" if loops else "low",
-        confidence=0.87,
+        # Use the top-pattern's outcome correlation p-value if one was computed,
+        # else fall back to sample-size only.
+        confidence=compute_confidence(
+            n=total_seqs,
+            p_value=(outcome_correlations[0]["p_value"]
+                     if outcome_correlations else None),
+            base=0.87,
+        ),
         chart_ready_data={
             "type":     "sequence_bar",
             "patterns": [
@@ -2271,7 +2318,13 @@ def run_association_rules(
         },
         top_finding=top_finding,
         severity="high" if high_risk else "medium",
-        confidence=0.84,
+        # Use top-rule lift as a rough effect size proxy (log-scaled so lift≈3
+        # lands near 'large', lift≈1 near 'none').
+        confidence=compute_confidence(
+            n=total_sessions,
+            effect_size=(math.log(max(rules[0]["lift"], 1e-6)) if rules else None),
+            base=0.84,
+        ),
         chart_ready_data={
             "type":  "rules_card",
             "rules": rules[:10],
@@ -2404,7 +2457,7 @@ def run_rfm_analysis(
         },
         top_finding=top_finding,
         severity="medium" if declining_count > (len(rfm)*0.2) else "low",
-        confidence=0.92,
+        confidence=compute_confidence(n=len(rfm), base=0.92),
         chart_ready_data={
             "type": "rfm_scatter",
             "r_scores": rfm["r_score"].tolist()[:1000],
@@ -2464,7 +2517,7 @@ def run_pareto_analysis(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.98,
+        confidence=compute_confidence(n=len(entity_value), base=0.95),
         chart_ready_data={
             "type": "pareto_curve",
             "entity_pct": entity_value["cum_entity_pct"].tolist(),
@@ -2659,7 +2712,7 @@ def run_transition_analysis(
         },
         top_finding=top_finding,
         severity="high" if len(dead_ends) > 3 else "medium",
-        confidence=0.88,
+        confidence=compute_confidence(n=int(n_transitions), base=0.88),
         chart_ready_data={
             "type": "transition_heatmap",
             "events": top_events[:20],
@@ -2819,7 +2872,7 @@ def run_dropout_analysis(
         },
         top_finding=top_finding,
         severity="high" if early_pct > 30 else "medium",
-        confidence=0.86,
+        confidence=compute_confidence(n=int(total_sessions), base=0.86),
         chart_ready_data={
             "type": "dropout_bar",
             "events": [e for e, _ in top_last],
@@ -3003,7 +3056,13 @@ def run_event_taxonomy(
         },
         top_finding=top_finding,
         severity="info",
-        confidence=0.95,
+        # Effect size proxy: share of events that got a non-'other' category.
+        # 100% classified → strong signal; lots of 'other' → weaker signal.
+        confidence=compute_confidence(
+            n=int(total_events),
+            effect_size=(1.0 - (other_pct / 100.0)) if other_pct is not None else None,
+            base=0.92,
+        ),
         chart_ready_data={
             "type": "horizontal_bar",
             "labels": list(category_counts.keys()),
@@ -3067,7 +3126,7 @@ def run_user_journey_analysis(
         },
         top_finding=top_finding,
         severity="info",
-        confidence=0.90,
+        confidence=compute_confidence(n=len(journey_df), base=0.90),
         chart_ready_data={
             "type": "bar_chart",
             "labels": list(common_entries.keys()),
@@ -3121,7 +3180,13 @@ def run_contribution_analysis(csv_path: str, group_col: str, value_col: str) -> 
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.95,
+        # Effect size: Pareto concentration (top-20% share) indicates how
+        # decisive the grouping is — 80%+ is a strong finding, 30% is weak.
+        confidence=compute_confidence(
+            n=len(df),
+            effect_size=float(top_20_pct_contrib) / 100.0,
+            base=0.95,
+        ),
         chart_ready_data={
             "type": "pie_chart" if len(grouped) <= 10 else "bar_chart",
             "labels": grouped[group_col].astype(str).tolist()[:10],
@@ -3206,7 +3271,13 @@ def run_cross_tab_analysis(csv_path: str, col_a: str, col_b: str) -> dict:
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.95,
+        # Real p-value + Cramér's V (effect size) are both in-hand — use them.
+        confidence=compute_confidence(
+            n=int(n),
+            p_value=float(p_val),
+            effect_size=float(cramer_v),
+            base=0.90,
+        ),
         chart_ready_data={
             "type": "heatmap",
             "labels": {"x": list(contingency.columns)[:10], "y": list(contingency.index)[:10]},
@@ -3338,7 +3409,12 @@ def run_intervention_triggers(
         },
         top_finding=top_finding,
         severity="high" if high_risk else "medium",
-        confidence=0.88,
+        # Effect size proxy: top rule's dropout rate (how decisive the trigger is).
+        confidence=compute_confidence(
+            n=int(total_sessions),
+            effect_size=(float(rules[0]["dropout_rate"]) if rules else None),
+            base=0.88,
+        ),
         chart_ready_data={
             "type": "intervention_bar",
             "triggers": [r["trigger_sequence"][0] for r in rules[:10]],
@@ -3498,7 +3574,7 @@ def run_session_classification(
         },
         top_finding=top_finding,
         severity=severity,
-        confidence=0.82,
+        confidence=compute_confidence(n=int(total_users), base=0.82),
         chart_ready_data={
             "type": "persona_donut",
             "personas": [p["persona"] for p in persona_breakdown],

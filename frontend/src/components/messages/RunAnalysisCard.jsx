@@ -60,6 +60,11 @@ export function RunAnalysisCard({ sessionId }) {
     setRunning(true);
     try {
       startPipelineRun(); // increment pipelineRunId → triggers SSE reconnection
+      // Flip phase BEFORE the await so useSSEStream opens the EventStream
+      // connection immediately — otherwise early node_started events can fire
+      // on the backend before the browser has subscribed, leaving nodes stuck
+      // at "waiting" in the UI.
+      setPhase('analyzing');
       addMessage('ai', 'terminal', []);
       // Pass full structured node specs — backend appends them to state.dag
       await analyzeMetrics(
@@ -74,7 +79,6 @@ export function RunAnalysisCard({ sessionId }) {
           priority:      n.priority || 'medium',
         }))
       );
-      setPhase('analyzing');
       toast.success('Analysis started');
       setDone(true);
     } catch (err) {

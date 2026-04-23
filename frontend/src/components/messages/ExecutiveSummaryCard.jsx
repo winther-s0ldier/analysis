@@ -2,6 +2,7 @@ import React from 'react';
 import { ClipboardList, Network, ArrowRight } from 'lucide-react';
 import { AIMessage } from './AIMessage';
 import { marked } from 'marked';
+import { renderWithCitations } from './CitationLink';
 
 // ── ExecutiveSummaryCard ───────────────────────────────────────────────────────
 export function ExecutiveSummaryCard({ text }) {
@@ -198,14 +199,14 @@ export function CrossConnectionsCard({ connections = [] }) {
             <div key={idx} className="rounded-lg border border-border-subtle bg-bg-surface overflow-hidden">
               {/* Connection pair */}
               <div className="flex items-center gap-2 px-4 py-3 bg-bg-elevated flex-wrap">
-                <span className="text-[12px] font-medium text-text-primary bg-accent-dim px-2 py-0.5 rounded">{fa}</span>
+                <span className="text-[12px] font-medium text-text-primary bg-accent-dim px-2 py-0.5 rounded">{renderWithCitations(fa)}</span>
                 <ArrowRight size={14} className="text-text-muted shrink-0" />
-                <span className="text-[12px] font-medium text-text-primary bg-accent-dim px-2 py-0.5 rounded">{fb}</span>
+                <span className="text-[12px] font-medium text-text-primary bg-accent-dim px-2 py-0.5 rounded">{renderWithCitations(fb)}</span>
               </div>
               {/* Meaning */}
               {meaning && (
                 <div className="px-4 py-2.5 text-[12.5px] text-text-secondary leading-relaxed border-t border-border-subtle">
-                  {meaning}
+                  {renderWithCitations(meaning)}
                 </div>
               )}
             </div>

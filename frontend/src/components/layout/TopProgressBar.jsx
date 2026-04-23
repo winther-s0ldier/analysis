@@ -2,17 +2,16 @@ import React, { useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { usePipelineStore } from '../../store/pipelineStore';
 import {
-  Database, Search, Activity, Cpu, FileText, Check,
+  Database, Search, Activity, Cpu, Check,
 } from 'lucide-react';
 
 // Phases mapped to their segment index. Upload is folded in implicitly:
 // the bar appears the moment we leave 'idle'.
 const SEGMENTS = [
-  { key: 'profiling',       label: 'Profile',     Icon: Database },
-  { key: 'discovering',     label: 'Discover',    Icon: Search },
-  { key: 'analyzing',       label: 'Analyze',     Icon: Activity },
-  { key: 'synthesizing',    label: 'Synthesize',  Icon: Cpu },
-  { key: 'building_report', label: 'Report',      Icon: FileText },
+  { key: 'profiling',    label: 'Profile',    Icon: Database },
+  { key: 'discovering',  label: 'Discover',   Icon: Search },
+  { key: 'analyzing',    label: 'Analyze',    Icon: Activity },
+  { key: 'synthesizing', label: 'Synthesize', Icon: Cpu },
 ];
 
 const PHASE_ORDER = [

@@ -19,9 +19,13 @@ jobs:
             set -e
             cd /home/ubuntu/analysis
 
-            # Pull latest code (stash any local changes)
-            git stash || true
-            git pull origin main
+            # Force server tree to match origin/main exactly.
+            # Using fetch + reset --hard (instead of git pull) so force-pushes
+            # don't leave the server stuck on "divergent branches" — the server
+            # is a deploy target, not a place where local edits should survive.
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
 
             # Ensure required runtime dirs exist
             mkdir -p logs output uploads data
