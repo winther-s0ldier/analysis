@@ -1137,6 +1137,186 @@ async def ga_ingest(req: GAIngestRequest):
     }
 
 
+# ── BigQuery data-source endpoints ───────────────────────────────────────────
+
+@app.get("/bq/status")
+async def bq_status():
+    from tools.bigquery_connector import is_connected
+    return {"connected": is_connected()}
+
+
+@app.get("/bq/auth/start")
+async def bq_auth_start():
+    try:
+        from tools.bigquery_connector import build_auth_url
+        url, state = build_auth_url()
+        return {"auth_url": url, "state": state}
+    except Exception as e:
+        raise HTTPException(500, f"BQ OAuth init failed: {e}")
+
+
+@app.get("/bq/auth/callback")
+async def bq_auth_callback(code: str = "", state: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(
+            f"<h3>BigQuery authorization failed</h3><p>{error}</p>",
+            status_code=400,
+        )
+    if not code:
+        raise HTTPException(400, "Missing ?code parameter")
+    try:
+        from tools.bigquery_connector import exchange_code_for_token
+        exchange_code_for_token(code=code, user_key=state or "default")
+    except Exception as e:
+        return HTMLResponse(f"<h3>Token exchange failed</h3><pre>{e}</pre>", status_code=500)
+
+    html = (
+        "<!doctype html><html><body>"
+        "<h3>BigQuery connected. You can close this window.</h3>"
+        "<script>"
+        "try { window.opener && window.opener.postMessage({type:'bq-oauth',ok:true},'*'); } catch(e){}"
+        "setTimeout(function(){ window.close(); }, 800);"
+        "</script></body></html>"
+    )
+    return HTMLResponse(html)
+
+
+@app.post("/bq/disconnect")
+async def bq_disconnect():
+    from tools.bigquery_connector import disconnect
+    return {"disconnected": disconnect()}
+
+
+@app.get("/bq/projects")
+async def bq_list_projects():
+    try:
+        from tools.bigquery_connector import list_projects, is_connected
+        if not is_connected():
+            raise HTTPException(401, "Not connected to BigQuery")
+        return {"projects": list_projects()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list projects: {e}")
+
+
+@app.get("/bq/datasets")
+async def bq_list_datasets(project_id: str):
+    try:
+        from tools.bigquery_connector import list_datasets, is_connected
+        if not is_connected():
+            raise HTTPException(401, "Not connected to BigQuery")
+        return {"datasets": list_datasets(project_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list datasets: {e}")
+
+
+@app.get("/bq/tables")
+async def bq_list_tables(project_id: str, dataset_id: str):
+    try:
+        from tools.bigquery_connector import list_tables, is_connected
+        if not is_connected():
+            raise HTTPException(401, "Not connected to BigQuery")
+        return {"tables": list_tables(project_id, dataset_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to list tables: {e}")
+
+
+class BQIngestRequest(BaseModel):
+    project_id: str
+    dataset_id: str
+    table_id: str
+    row_limit: int = 50_000
+
+
+@app.post("/bq/ingest")
+async def bq_ingest(req: BQIngestRequest):
+    """Pull a BigQuery table → write CSV → create SessionState.
+
+    Returns the same envelope as /upload so the frontend can treat it identically.
+    """
+    from tools.bigquery_connector import is_connected, ingest_to_session_csv
+    if not is_connected():
+        raise HTTPException(401, "Not connected to BigQuery")
+
+    session_id = str(uuid.uuid4())
+
+    safe_tbl = re.sub(r"[^\w]", "_", req.table_id).strip("_")[:40] or "bq"
+    output_folder_name = f"bq_{safe_tbl}_{session_id[:6]}"
+    output_folder = OUTPUT_DIR / output_folder_name
+    output_folder.mkdir(exist_ok=True)
+
+    try:
+        pull = await asyncio.to_thread(
+            ingest_to_session_csv,
+            project_id=req.project_id,
+            dataset_id=req.dataset_id,
+            table_id=req.table_id,
+            session_id=session_id,
+            output_dir=UPLOAD_DIR,
+            row_limit=req.row_limit,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"BigQuery fetch failed: {e}")
+
+    csv_path = pull["csv_path"]
+
+    import hashlib as _hashlib
+    csv_hash = _hashlib.sha256(Path(csv_path).read_bytes()).hexdigest()
+
+    from tools.data_gate import run_preflight_check
+    gate_result = run_preflight_check(csv_path, "bigquery")
+
+    if gate_result["gate_result"] == "block":
+        raise HTTPException(
+            status_code=422,
+            detail="Data Quality Gate BLOCKED the BigQuery pull:\n" + "\n".join(gate_result["errors"]),
+        )
+
+    state = SessionState(session_id)
+    state.csv_path = csv_path
+    state.csv_filename = pull["original_filename"]
+    state.output_folder = str(output_folder)
+    state.csv_hash = csv_hash
+    state.data_source = "bigquery"
+    state.data_source_meta = {
+        "project_id": req.project_id,
+        "dataset_id": req.dataset_id,
+        "table_id": req.table_id,
+        "row_limit": req.row_limit,
+        "cached": pull.get("cached", False),
+    }
+    state.normalization = {
+        "original_filename": pull["original_filename"],
+        "original_format":   "bigquery",
+        "warnings":          gate_result["warnings"],
+        "row_count":         gate_result["row_count"],
+        "col_count":         gate_result["col_count"],
+    }
+    state.gate_result = gate_result
+    sessions[session_id] = state
+
+    return {
+        "session_id":  session_id,
+        "filename":    pull["original_filename"],
+        "format":      "bigquery",
+        "rows":        gate_result["row_count"],
+        "columns":     gate_result["col_count"],
+        "Gate":        gate_result["gate_result"],
+        "warnings":    gate_result["warnings"],
+        "status":      "uploaded",
+        "data_source": "bigquery",
+        "project_id":  req.project_id,
+        "dataset_id":  req.dataset_id,
+        "table_id":    req.table_id,
+        "cached":      pull.get("cached", False),
+    }
+
+
 @app.post("/profile/{session_id}")
 async def profile_dataset(session_id: str):
     if session_id not in sessions:

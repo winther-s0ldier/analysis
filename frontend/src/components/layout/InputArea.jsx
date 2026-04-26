@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useImperativeHandle, forwardRef } from 'react';
-import { Paperclip, Send, X, FileUp, Plus, Upload, BarChart3 } from 'lucide-react';
+import { Paperclip, Send, X, FileUp, Plus, Upload, BarChart3, Database } from 'lucide-react';
 import { usePipelineStore } from '../../store/pipelineStore';
 import { useChatStore } from '../../store/chatStore';
 import { useAutoResize } from '../../hooks/useAutoResize';
@@ -9,6 +9,7 @@ import { closeConnection, resetSessionTracking } from '../../services/sseManager
 import { toast } from 'sonner';
 import { cn } from '../ui/Badge';
 import { GASourcePicker } from './GASourcePicker';
+import { BQSourcePicker } from './BQSourcePicker';
 
 function formatSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -56,8 +57,8 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
   const isCenter = variant === 'center';
   // "+" menu state
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
-  // Inline GA picker visibility (opened from the "+" menu)
   const [showGaPicker, setShowGaPicker] = useState(false);
+  const [showBqPicker, setShowBqPicker] = useState(false);
   const plusMenuRef = useRef(null);
 
   const textareaRef = useAutoResize(textValue);
@@ -140,7 +141,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
     toast.success('Review the plan and click Run when ready');
   };
 
-  // ── GA4 ingest handler — GASourcePicker calls this with the /ga/ingest response
+  // ── GA4 ingest handler
   const onGASessionReady = async (ingestData) => {
     const tempId = `__ingesting_${Date.now()}`;
     setSession(tempId, null);
@@ -150,6 +151,25 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
       size: `${(ingestData.rows || 0).toLocaleString()} rows`,
     });
     setShowGaPicker(false);
+    try {
+      await runPostSessionFlow(ingestData, tempId);
+    } catch (err) {
+      toast.error(`Error: ${err.message}`);
+      addMessage('ai', 'text', `Sorry, something went wrong: ${err.message}`);
+      setPhase('error');
+    }
+  };
+
+  // ── BigQuery ingest handler
+  const onBQSessionReady = async (ingestData) => {
+    const tempId = `__ingesting_${Date.now()}`;
+    setSession(tempId, null);
+    setPhase('uploading');
+    addMessage('user', 'file', {
+      name: ingestData.filename || 'BigQuery pull',
+      size: `${(ingestData.rows || 0).toLocaleString()} rows`,
+    });
+    setShowBqPicker(false);
     try {
       await runPostSessionFlow(ingestData, tempId);
     } catch (err) {
@@ -288,7 +308,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
         )}
         ref={parent}
       >
-        {/* Inline GA picker — opened from the "+" menu, dismissable */}
+        {/* Inline GA picker */}
         {showGaPicker && (
           <div className="mb-3 relative">
             <button
@@ -300,6 +320,21 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
               <X size={12} strokeWidth={2.5} />
             </button>
             <GASourcePicker onSessionReady={onGASessionReady} />
+          </div>
+        )}
+
+        {/* Inline BQ picker */}
+        {showBqPicker && (
+          <div className="mb-3 relative">
+            <button
+              onClick={() => setShowBqPicker(false)}
+              className="absolute -top-2 -right-2 z-10 w-6 h-6 flex items-center justify-center rounded-full bg-white border border-border-subtle text-text-muted hover:text-status-error shadow-sm"
+              title="Close"
+              aria-label="Close BQ picker"
+            >
+              <X size={12} strokeWidth={2.5} />
+            </button>
+            <BQSourcePicker onSessionReady={onBQSessionReady} />
           </div>
         )}
 
@@ -376,6 +411,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
                   onClick={() => {
                     setPlusMenuOpen(false);
                     setShowGaPicker(false);
+                    setShowBqPicker(false);
                     setAcceptOverride(null);
                     fileInputRef.current?.click();
                   }}
@@ -391,6 +427,7 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
                   role="menuitem"
                   onClick={() => {
                     setPlusMenuOpen(false);
+                    setShowBqPicker(false);
                     setShowGaPicker(true);
                   }}
                   className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-primary hover:bg-bg-page transition-colors"
@@ -399,6 +436,21 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
                   <div className="flex flex-col items-start leading-tight">
                     <span className="font-medium">Google Analytics</span>
                     <span className="text-[11px] text-text-muted">Pull GA4 property data</span>
+                  </div>
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    setPlusMenuOpen(false);
+                    setShowGaPicker(false);
+                    setShowBqPicker(true);
+                  }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-primary hover:bg-bg-page transition-colors"
+                >
+                  <Database size={14} strokeWidth={2} className="text-text-muted" />
+                  <div className="flex flex-col items-start leading-tight">
+                    <span className="font-medium">BigQuery</span>
+                    <span className="text-[11px] text-text-muted">Import a table from BigQuery</span>
                   </div>
                 </button>
               </div>

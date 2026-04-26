@@ -134,3 +134,65 @@ export const gaIngest = async ({ property_id, start_date = '90daysAgo', end_date
   }
   return res.json();
 };
+
+// ── BigQuery data-source API ───────────────────────────────────────────────
+
+export const bqStatus = async () => {
+  const res = await fetch(`${API_BASE}/bq/status`);
+  if (!res.ok) throw new Error('BQ status failed');
+  return res.json();
+};
+
+export const bqAuthStart = async () => {
+  const res = await fetch(`${API_BASE}/bq/auth/start`);
+  if (!res.ok) throw new Error('BQ auth start failed');
+  return res.json();
+};
+
+export const bqDisconnect = async () => {
+  const res = await fetch(`${API_BASE}/bq/disconnect`, { method: 'POST' });
+  if (!res.ok) throw new Error('BQ disconnect failed');
+  return res.json();
+};
+
+export const bqListProjects = async () => {
+  const res = await fetch(`${API_BASE}/bq/projects`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'BQ projects failed');
+  }
+  return res.json();
+};
+
+export const bqListDatasets = async (project_id) => {
+  const res = await fetch(`${API_BASE}/bq/datasets?project_id=${encodeURIComponent(project_id)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'BQ datasets failed');
+  }
+  return res.json();
+};
+
+export const bqListTables = async (project_id, dataset_id) => {
+  const res = await fetch(
+    `${API_BASE}/bq/tables?project_id=${encodeURIComponent(project_id)}&dataset_id=${encodeURIComponent(dataset_id)}`
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'BQ tables failed');
+  }
+  return res.json();
+};
+
+export const bqIngest = async ({ project_id, dataset_id, table_id, row_limit = 50000 }) => {
+  const res = await fetch(`${API_BASE}/bq/ingest`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id, dataset_id, table_id, row_limit }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => null);
+    throw new Error(err?.detail || 'BQ ingest failed');
+  }
+  return res.json();
+};
