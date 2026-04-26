@@ -57,9 +57,12 @@ export function Sidebar() {
 
   useEffect(() => { fetchHistory(); }, [fetchHistory]);
 
-  // Re-fetch when pipeline completes or after a chat message
+  // Re-fetch when pipeline completes — delay so backend _save_to_history finishes first
   useEffect(() => {
-    if (phase === 'complete') fetchHistory();
+    if (phase === 'complete') {
+      const t = setTimeout(() => fetchHistory(), 1500);
+      return () => clearTimeout(t);
+    }
   }, [phase, fetchHistory]);
 
   useEffect(() => {
