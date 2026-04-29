@@ -29,7 +29,25 @@ def tool_profile_and_classify(
     csv_path: str,
     session_id: str,
 ) -> dict:
-    raw_profile = profile_csv(csv_path)
+    # Load companion schema_map sidecar if the upload endpoint persisted
+    # one. The profiler runs in a separate process from the FastAPI app,
+    # so we read it from the session's output folder rather than from the
+    # in-memory SessionState. Best-effort — missing/malformed sidecar
+    # silently means "no schema" and the profile runs as before.
+    schema_map: dict | None = None
+    try:
+        from agent_servers.a2a_client import lookup_session as _lookup
+        _of = _lookup(session_id)
+        if _of:
+            import pathlib as _pl
+            _sp = _pl.Path(_of) / "_schema_map.json"
+            if _sp.exists():
+                schema_map = json.loads(_sp.read_text(encoding="utf-8"))
+    except Exception as _se:
+        print(f"WARNING: schema_map sidecar read failed: {_se}")
+        schema_map = None
+
+    raw_profile = profile_csv(csv_path, schema_map=schema_map)
     if "error" in raw_profile:
         return {"error": raw_profile["error"]}
 

@@ -21,6 +21,7 @@ import json
 import re
 import asyncio
 import traceback
+import pandas as pd
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
@@ -212,6 +213,14 @@ class SessionState:
         self.csv_filename: str = ""
         self.output_folder: str = ""
         self.status: str = "uploaded"
+
+        # Optional companion data-dictionary / schema file (workaround for
+        # single-file upload constraint). schema_path points at the saved CSV
+        # in UPLOAD_DIR; schema_map is the parsed {event_name_lower: description}
+        # dict consumed by the profiler so downstream agents see semantic
+        # descriptions for event_name values instead of guessing from strings.
+        self.schema_path: str = ""
+        self.schema_map: dict = {}
 
         self.raw_profile: dict = {}
         self.semantic_map: dict = {}
@@ -778,8 +787,30 @@ async def index():
 # Mount the Vite assets folder so JS and CSS load properly
 app.mount("/assets", StaticFiles(directory=str(BASE_DIR / "frontend" / "dist" / "assets")), name="assets")
 
+def _persist_schema_sidecar(output_folder: str, schema_map: dict) -> None:
+    """Write schema_map to <output_folder>/_schema_map.json so the profiler
+    agent (which runs in a separate process) can read it via lookup_session.
+
+    Best-effort — failures are logged, never raised.
+    """
+    if not schema_map:
+        return
+    try:
+        out_path = Path(output_folder) / "_schema_map.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(schema_map, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as _e:
+        print(f"WARNING: schema sidecar write failed: {_e}")
+
+
 @app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)):
+async def upload_csv(
+    file: UploadFile = File(...),
+    schema_file: UploadFile | None = File(None),
+):
     if not is_supported(file.filename):
         raise HTTPException(
             status_code=415,
@@ -801,11 +832,93 @@ async def upload_csv(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
     saved_file_path = UPLOAD_DIR / f"{output_folder}{ext}"
 
-    content = await file.read()
+    # ── Optional companion schema / data-dictionary upload ────────────────────
+    # Workaround for the single-file constraint: callers may attach a small
+    # CSV that maps event_name → description. We stream it to disk, cap the
+    # size, and parse it into a dict that the profiler will consume. A bad
+    # schema is NEVER fatal — we degrade gracefully to "no schema" and let
+    # the upload succeed so the user isn't blocked.
+    saved_schema_path: Path | None = None
+    schema_map: dict[str, str] = {}
+    if schema_file is not None and schema_file.filename:
+        schema_ext = Path(schema_file.filename).suffix.lower()
+        if schema_ext != ".csv":
+            raise HTTPException(
+                status_code=415,
+                detail="Schema file must be a .csv data dictionary.",
+            )
+        SCHEMA_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — real dictionaries are kilobytes
+        saved_schema_path = UPLOAD_DIR / f"{output_folder}__schema.csv"
+        schema_tmp = saved_schema_path.with_suffix(".tmp")
+        try:
+            written = 0
+            with open(schema_tmp, "wb") as _sf:
+                while True:
+                    chunk = await schema_file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > SCHEMA_MAX_BYTES:
+                        _sf.close()
+                        schema_tmp.unlink(missing_ok=True)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                "Schema file too large (>5 MB). Real data "
+                                "dictionaries are typically <100 KB — you may "
+                                "have swapped the data and schema slots."
+                            ),
+                        )
+                    _sf.write(chunk)
+            schema_tmp.rename(saved_schema_path)
+        except HTTPException:
+            raise
+        except Exception as _se:
+            schema_tmp.unlink(missing_ok=True)
+            print(f"WARNING: schema upload write failed: {_se}")
+            saved_schema_path = None
 
-    # Compute hash before writing so we can detect duplicate uploads
+        # Parse into {event_name_lower: description}. Tolerant of malformed
+        # files — on any parse error we keep the saved file (in case a later
+        # step wants to inspect it) but leave schema_map empty.
+        if saved_schema_path is not None:
+            try:
+                _sdf = pd.read_csv(saved_schema_path, low_memory=False)
+                # Be flexible about header casing/whitespace
+                _cols_norm = {c.strip().lower(): c for c in _sdf.columns}
+                _name_col = _cols_norm.get("event name") or _cols_norm.get("event_name")
+                _desc_col = _cols_norm.get("description") or _cols_norm.get("desc")
+                if _name_col and _desc_col:
+                    for _n, _d in zip(_sdf[_name_col], _sdf[_desc_col]):
+                        if pd.isna(_n) or pd.isna(_d):
+                            continue
+                        _key = str(_n).strip().lower()
+                        if _key:
+                            schema_map[_key] = str(_d).strip()
+                else:
+                    print(
+                        "WARNING: schema CSV missing 'Event Name' / 'Description' "
+                        f"columns; got {list(_sdf.columns)}"
+                    )
+            except Exception as _pe:
+                print(f"WARNING: schema parse failed ({_pe}); proceeding without schema_map")
+
     import hashlib as _hashlib
-    csv_hash = _hashlib.sha256(content).hexdigest()
+    hasher = _hashlib.sha256()
+    tmp_path = saved_file_path.with_suffix(".tmp")
+    try:
+        with open(tmp_path, "wb") as _f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                hasher.update(chunk)
+                _f.write(chunk)
+        csv_hash = hasher.hexdigest()
+        tmp_path.rename(saved_file_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     cached_entry = _find_cached_session(csv_hash)
     if cached_entry:
         # Same CSV detected — create a brand-new session but pre-load profile + DAG
@@ -854,12 +967,6 @@ async def upload_csv(file: UploadFile = File(...)):
             except Exception:
                 pass
 
-        # Write the CSV to uploads so the new session has a valid csv_path
-        def _write_cached():
-            with open(saved_file_path, "wb") as f:
-                f.write(content)
-        await asyncio.to_thread(_write_cached)
-
         norm_result = normalize_file(str(saved_file_path.resolve()))
         new_csv_path = norm_result.get("csv_path", str(saved_file_path))
 
@@ -871,6 +978,10 @@ async def upload_csv(file: UploadFile = File(...)):
         new_state.csv_filename = cached_entry.get("csv_filename", file.filename)
         new_state.output_folder = str(OUTPUT_DIR / new_output_folder)
         new_state.csv_hash = csv_hash
+        if saved_schema_path is not None:
+            new_state.schema_path = str(saved_schema_path)
+            new_state.schema_map = schema_map
+            _persist_schema_sidecar(new_state.output_folder, schema_map)
 
         if _profile_data:
             _raw2 = _profile_data.get("profile", {})
@@ -910,11 +1021,6 @@ async def upload_csv(file: UploadFile = File(...)):
             "discovery":        _discovery_data if _discovery_data else None,
         }
 
-    def _write_upload():
-        with open(saved_file_path, "wb") as f:
-            f.write(content)
-    await asyncio.to_thread(_write_upload)
-
     norm_result = normalize_file(str(saved_file_path.resolve()))
 
     if norm_result["status"] == "unsupported":
@@ -952,6 +1058,10 @@ async def upload_csv(file: UploadFile = File(...)):
     state.csv_filename = norm_result["original_filename"]
     state.output_folder = str(OUTPUT_DIR / output_folder)
     state.csv_hash = csv_hash
+    if saved_schema_path is not None:
+        state.schema_path = str(saved_schema_path)
+        state.schema_map = schema_map
+        _persist_schema_sidecar(state.output_folder, schema_map)
     state.normalization = {
         "original_filename": norm_result["original_filename"],
         "original_format":   norm_result["original_format"],

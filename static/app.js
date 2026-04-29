@@ -17,6 +17,7 @@ const chatContainer = $('#chat-container');
 const welcomeState = $('#welcome-state');
 const chatInput = $('#chat-input');
 const sendBtn = $('#send-btn');
+const stopBtn = $('#stop-btn');
 const progressRing = $('#progress-ring');
 const ringFill = $('#ring-fill');
 const ringLabel = $('#ring-label');
@@ -193,6 +194,11 @@ function startProcessingStatus(phase) {
     processingStatus.classList.remove('hidden');
     processingText.textContent = _rotatingMsgPool[0];
 
+    if (phase !== 'upload') {
+        sendBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
+    }
+
     clearInterval(_rotatingInterval);
     _rotatingInterval = setInterval(() => {
         _rotatingMsgIndex = (_rotatingMsgIndex + 1) % _rotatingMsgPool.length;
@@ -279,7 +285,23 @@ async function submitClarification() {
 function stopProcessingStatus() {
     clearInterval(_rotatingInterval);
     processingStatus.classList.add('hidden');
+    stopBtn.classList.add('hidden');
+    sendBtn.classList.remove('hidden');
 }
+
+stopBtn.addEventListener('click', async () => {
+    if (!sessionId) return;
+    stopBtn.disabled = true;
+    try {
+        await fetch(`/sessions/${sessionId}/cancel`, { method: 'POST' });
+        addAIMessage('Pipeline stopped. You can upload a new file or continue.');
+    } catch (err) {
+        addAIMessage(`Failed to stop pipeline: ${escapeHtml(String(err))}`);
+    } finally {
+        stopBtn.disabled = false;
+        stopProcessingStatus();
+    }
+});
 
 function setProgress(pct) {
     topProgress.classList.add('active');
@@ -1217,8 +1239,11 @@ function addChartMessage(result) {
     if (iframe) {
         iframe.addEventListener('load', function () {
             try {
-                const h = this.contentDocument.documentElement.scrollHeight;
-                if (h > 100) this.style.height = h + 'px';
+                const el = this;
+                requestAnimationFrame(() => {
+                    const h = el.contentDocument.documentElement.scrollHeight;
+                    if (h > 100) el.style.height = h + 'px';
+                });
             } catch (e) { /* cross-origin fallback  —  keep CSS default */ }
         });
     }
@@ -1771,10 +1796,12 @@ function escapeHtml(text) {
 
 function scrollToBottom() {
     requestAnimationFrame(() => {
+        const last = chatMessages.lastElementChild;
+        if (!last) return;
         if (lenis) {
-            lenis.scrollTo(chatScroll.scrollHeight, { duration: 0.6 });
+            lenis.scrollTo(last, { offset: 9999, duration: 0.6 });
         } else {
-            chatScroll.scrollTop = chatScroll.scrollHeight;
+            last.scrollIntoView({ block: 'end' });
         }
     });
 }

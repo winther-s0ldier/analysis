@@ -49,9 +49,16 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
   const pendingMessage = useChatStore((s) => s.pendingMessage);
   const setPendingMessage = useChatStore((s) => s.setPendingMessage);
   const [file, setFile] = useState(null);
+  // Optional companion data-dictionary / schema CSV. Workaround for the
+  // single-file upload constraint: when the user attaches a data file
+  // they can also attach a small CSV that maps event_name → description,
+  // which the backend persists alongside the data and feeds to the
+  // profiler. Leaving this null preserves the original single-file flow.
+  const [schemaFile, setSchemaFile] = useState(null);
   const [textValue, setTextValue] = useState('');
   const [isHovering, setIsHovering] = useState(false);
   const fileInputRef = useRef(null);
+  const schemaInputRef = useRef(null);
   const [acceptOverride, setAcceptOverride] = useState(null);
   const [parent] = useAutoAnimate();
   const isCenter = variant === 'center';
@@ -188,17 +195,25 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
 
     if (file) {
       const currentFile = file;
+      const currentSchema = schemaFile;
       setFile(null);
+      setSchemaFile(null);
 
       const tempId = `__uploading_${Date.now()}`;
       setSession(tempId, null);
       setPhase('uploading');
       if (currentText) addMessage('user', 'text', currentText);
       addMessage('user', 'file', { name: currentFile.name, size: formatSize(currentFile.size) });
+      if (currentSchema) {
+        addMessage('user', 'file', {
+          name: `${currentSchema.name} (data dictionary)`,
+          size: formatSize(currentSchema.size),
+        });
+      }
 
       try {
         toast.info(`Uploading ${currentFile.name}...`);
-        const uploadData = await uploadFile(currentFile);
+        const uploadData = await uploadFile(currentFile, currentSchema);
         await runPostSessionFlow(uploadData, tempId);
       } catch (err) {
         toast.error(`Error: ${err.message}`);
@@ -236,6 +251,24 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
     }
     e.target.value = '';
     setAcceptOverride(null);
+  };
+
+  // Companion data-dictionary picker. Validated lightly client-side; the
+  // backend re-validates extension and size and degrades gracefully on
+  // malformed content, so this is just a UX guard.
+  const handleAttachSchema = (e) => {
+    const f = e.target.files?.[0];
+    if (f) {
+      if (!/\.csv$/i.test(f.name)) {
+        toast.error('Data dictionary must be a .csv file.');
+      } else if (f.size > 5 * 1024 * 1024) {
+        toast.error('Data dictionary too large (>5 MB).');
+      } else {
+        setSchemaFile(f);
+        toast.info(`Schema attached: ${f.name}`);
+      }
+    }
+    e.target.value = '';
   };
 
   const handleKeyDown = (e) => {
@@ -340,24 +373,63 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
 
         {/* File attachment chip */}
         {file && (
-          <div
-            className="inline-flex items-center gap-2.5 mb-2.5 pl-3 pr-2 py-2 rounded-xl border bg-white border-border-subtle shadow-sm"
-          >
+          <div className="flex flex-wrap items-center gap-2 mb-2.5">
             <div
-              className="w-6 h-6 rounded-md flex items-center justify-center shrink-0 bg-accent/10 text-accent"
+              className="inline-flex items-center gap-2.5 pl-3 pr-2 py-2 rounded-xl border bg-white border-border-subtle shadow-sm"
             >
-              <Paperclip size={13} strokeWidth={2} />
+              <div
+                className="w-6 h-6 rounded-md flex items-center justify-center shrink-0 bg-accent/10 text-accent"
+              >
+                <Paperclip size={13} strokeWidth={2} />
+              </div>
+              <div className="flex flex-col leading-none">
+                <span className="text-[12.5px] font-semibold text-text-primary">{file.name}</span>
+                <span className="text-[11px] font-mono text-text-muted mt-0.5">{formatSize(file.size)}</span>
+              </div>
+              <button
+                onClick={() => setFile(null)}
+                className="ml-1 w-5 h-5 flex items-center justify-center rounded-full text-text-muted hover:text-status-error hover:bg-status-error/10 transition-colors duration-150"
+              >
+                <X size={12} strokeWidth={2.5} />
+              </button>
             </div>
-            <div className="flex flex-col leading-none">
-              <span className="text-[12.5px] font-semibold text-text-primary">{file.name}</span>
-              <span className="text-[11px] font-mono text-text-muted mt-0.5">{formatSize(file.size)}</span>
-            </div>
-            <button
-              onClick={() => setFile(null)}
-              className="ml-1 w-5 h-5 flex items-center justify-center rounded-full text-text-muted hover:text-status-error hover:bg-status-error/10 transition-colors duration-150"
-            >
-              <X size={12} strokeWidth={2.5} />
-            </button>
+
+            {/* Optional schema / data-dictionary attachment */}
+            {schemaFile ? (
+              <div
+                className="inline-flex items-center gap-2.5 pl-3 pr-2 py-2 rounded-xl border bg-white border-border-subtle shadow-sm"
+                title="Companion data dictionary (event_name → description)"
+              >
+                <div className="w-6 h-6 rounded-md flex items-center justify-center shrink-0 bg-emerald-500/10 text-emerald-600">
+                  <Paperclip size={13} strokeWidth={2} />
+                </div>
+                <div className="flex flex-col leading-none">
+                  <span className="text-[12.5px] font-semibold text-text-primary">
+                    {schemaFile.name}
+                  </span>
+                  <span className="text-[11px] font-mono text-text-muted mt-0.5">
+                    schema · {formatSize(schemaFile.size)}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setSchemaFile(null)}
+                  className="ml-1 w-5 h-5 flex items-center justify-center rounded-full text-text-muted hover:text-status-error hover:bg-status-error/10 transition-colors duration-150"
+                  aria-label="Remove schema file"
+                >
+                  <X size={12} strokeWidth={2.5} />
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => schemaInputRef.current?.click()}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium text-text-muted hover:text-accent hover:bg-accent/5 border border-dashed border-border-subtle transition-colors"
+                title="Optional: attach a data dictionary CSV (Event Name, Description)"
+              >
+                <Plus size={12} strokeWidth={2.5} />
+                Add data dictionary (optional)
+              </button>
+            )}
           </div>
         )}
 
@@ -513,6 +585,13 @@ export const InputArea = forwardRef(function InputArea({ variant = 'bottom' }, r
             className="hidden"
             accept={acceptOverride || '.csv,.xlsx,.xls,.json,.jsonl,.parquet'}
             onChange={handleAttach}
+          />
+          <input
+            type="file"
+            ref={schemaInputRef}
+            className="hidden"
+            accept=".csv"
+            onChange={handleAttachSchema}
           />
         </div>
       </div>

@@ -11,7 +11,7 @@ retry:
   max_attempts: 3              # orchestrator.py LLM retry count
   backoff_base: 15.0           # orchestrator.py backoff multiplier (seconds)
   llm_timeout: 900.0           # orchestrator.py synthesis/pipeline timeout
-  node_timeout: 120.0          # orchestrator.py single-node execution timeout
+  node_timeout: 240.0          # orchestrator.py single-node execution timeout
 
 agents:
   # Single source of truth for A2A server bind + client connect.

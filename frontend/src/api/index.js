@@ -1,9 +1,13 @@
 // src/api/index.js
 const API_BASE = '';
 
-export const uploadFile = async (file) => {
+export const uploadFile = async (file, schemaFile = null) => {
   const formData = new FormData();
   formData.append('file', file);
+  // Optional companion data-dictionary / schema CSV. Backend treats it
+  // as additive metadata — leave null and the upload behaves exactly
+  // as before.
+  if (schemaFile) formData.append('schema_file', schemaFile);
   const res = await fetch(`${API_BASE}/upload`, {
     method: 'POST',
     body: formData,

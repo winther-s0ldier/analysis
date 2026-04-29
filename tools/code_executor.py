@@ -3,10 +3,95 @@ import sys
 import ast
 import json
 import logging
+import threading
 import traceback
+from collections import OrderedDict
 from typing import Optional
 
 _result_store: dict = {}
+
+# ── Shared DataFrame cache for analysis nodes ────────────────────────────────
+# The orchestrator runs each DAG node by exec()ing LLM-generated `analyze()`
+# code which typically does `pd.read_csv(csv_path)` inside. For a 208 MB,
+# 1.4M-row CSV that cold read alone burns 5–15 s, and across 30+ nodes that's
+# minutes of wasted wallclock — enough to push some nodes past their
+# `retry.node_timeout`. We monkey-patch pandas.read_csv ONCE here with a
+# wrapper that caches the parsed DataFrame keyed by (abspath, mtime), and
+# only when the caller is using read_csv in its "no surprises" form (no
+# parse_dates / dtype / usecols / nrows etc). Any kwarg that could change
+# the resulting DataFrame's shape, dtypes, or values bypasses the cache and
+# reads fresh — so this is purely a latency optimization, never a correctness
+# risk. Each cache hit returns a deep copy, so generated code is free to
+# mutate its DataFrame without leaking changes back into the cache.
+import pandas as _pd
+_DF_CACHE_MAX = 4  # most recent N (path, mtime) entries
+_df_cache_lock = threading.Lock()
+_df_cache: "OrderedDict[tuple, _pd.DataFrame]" = OrderedDict()
+
+# Kwargs that provably don't alter the resulting DataFrame's shape, dtypes,
+# or values. Anything else → bypass cache and call the original read_csv.
+_SAFE_READ_CSV_KWARGS = frozenset({"low_memory", "memory_map"})
+
+_orig_read_csv = _pd.read_csv
+
+
+def _cached_read_csv(filepath_or_buffer, *args, **kwargs):
+    """Drop-in replacement for pandas.read_csv that memoizes plain reads.
+
+    Bypasses the cache (and behaves identically to the original) whenever
+    the caller passes positional args, a non-string path, or any kwarg
+    outside _SAFE_READ_CSV_KWARGS. On any unexpected error during cache
+    bookkeeping, also falls through to the original — better to be slow
+    than wrong.
+    """
+    cache_eligible = (
+        not args
+        and isinstance(filepath_or_buffer, (str, os.PathLike))
+        and all(k in _SAFE_READ_CSV_KWARGS for k in kwargs)
+    )
+    if not cache_eligible:
+        return _orig_read_csv(filepath_or_buffer, *args, **kwargs)
+
+    try:
+        abspath = os.path.abspath(str(filepath_or_buffer))
+        mtime = os.path.getmtime(abspath)
+        key = (abspath, mtime)
+
+        with _df_cache_lock:
+            hit = _df_cache.get(key)
+            if hit is not None:
+                # Touch for LRU-ish ordering
+                _df_cache.move_to_end(key)
+
+        if hit is None:
+            # Cache miss — read once, then store. We deliberately read OUTSIDE
+            # the lock so concurrent nodes for different files don't serialize.
+            fresh = _orig_read_csv(filepath_or_buffer, **kwargs)
+            with _df_cache_lock:
+                _df_cache[key] = fresh
+                _df_cache.move_to_end(key)
+                while len(_df_cache) > _DF_CACHE_MAX:
+                    _df_cache.popitem(last=False)
+                hit = fresh
+
+        # Always hand out a deep copy so generated code can mutate freely
+        # (e.g. `df['x'].fillna(0, inplace=True)`) without poisoning the
+        # cached DataFrame.
+        return hit.copy(deep=True)
+    except Exception as _ce:
+        # Cache path crashed — fall through to a normal read. Never let a
+        # caching bug break analysis correctness.
+        logging.warning(f"_cached_read_csv fell through to original read: {_ce}")
+        return _orig_read_csv(filepath_or_buffer, **kwargs)
+
+
+# Install the monkey-patch once at module import. Any module that does
+# `import pandas as pd; pd.read_csv(...)` after this point picks it up,
+# including LLM-generated analysis code that's exec()'d inside
+# execute_analysis. Modules that did `from pandas import read_csv` BEFORE
+# this point keep their original binding — that's fine, those are internal
+# helpers, not the hot path.
+_pd.read_csv = _cached_read_csv
 
 def get_analysis_result(
     session_id: str,

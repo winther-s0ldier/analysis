@@ -29,7 +29,18 @@ def clear_df_cache(csv_path: str) -> None:
     _df_cache.pop(csv_path, None)
 
 
-def profile_csv(csv_path: str) -> dict:
+def profile_csv(csv_path: str, schema_map: dict | None = None) -> dict:
+    """Profile a CSV file.
+
+    Optional ``schema_map`` is a ``{event_name_lower: description}`` dict
+    sourced from a companion data-dictionary CSV uploaded alongside the
+    data file (workaround for the single-file upload constraint). When
+    provided AND the data has an ``event_name`` column, the result will
+    include an ``event_name_descriptions`` map covering only the event
+    values that actually appear in the data, plus a ``schema_coverage``
+    ratio. The dict is metadata only — never used to rename columns or
+    mutate data.
+    """
     try:
         df = _load_df(csv_path)
     except Exception as e:
@@ -126,6 +137,28 @@ def profile_csv(csv_path: str) -> dict:
         "correlations": correlations,
         "memory_mb": round(df.memory_usage(deep=True).sum() / 1024 / 1024, 2),
     }
+
+    # Attach companion data-dictionary descriptions, if available. We only
+    # surface descriptions for event_name values that actually appear in
+    # the data, capped at 500, to keep downstream prompts focused.
+    if schema_map and "event_name" in df.columns:
+        try:
+            distinct_vals = (
+                df["event_name"].dropna().astype(str).unique().tolist()
+            )
+            distinct_vals = distinct_vals[:500]
+            descriptions: dict[str, str] = {}
+            for val in distinct_vals:
+                key = val.strip().lower()
+                if key in schema_map:
+                    descriptions[val] = schema_map[key]
+            if distinct_vals:
+                result["event_name_descriptions"] = descriptions
+                result["schema_coverage"] = round(
+                    len(descriptions) / max(len(distinct_vals), 1), 4
+                )
+        except Exception as _se:
+            print(f"WARNING: schema description attach failed: {_se}")
 
     return result
 
